@@ -20,6 +20,7 @@ globs over one. Scheme: <bench>-<substrate>-<mode><k>[-s<seed>][-<tag>].
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import random
@@ -33,6 +34,7 @@ from pathlib import Path
 from typing import Mapping, Sequence
 
 from . import library, memory, recursion, runmark, selection
+from . import recall as recall_block
 from . import tree as harness_tree
 from .proposer import Proposer
 from .spec import BenchmarkAdapter, RunView
@@ -243,6 +245,7 @@ class TaskResult:
     base: list[str] = field(default_factory=list)
     errors: list[str] = field(default_factory=list)
     memory_meta: Mapping[str, str] | None = None
+    memory_recall: dict = field(default_factory=dict)
 
     def to_dict(self) -> dict:
         out = {
@@ -259,6 +262,8 @@ class TaskResult:
         if self.memory_meta is not None:
             out["memory_connector"] = str(self.memory_meta.get("memory_connector", ""))
             out["memory_scope"] = str(self.memory_meta.get("memory_scope", ""))
+        if self.memory_recall:
+            out["memory_recall"] = {mode: dict(rec) for mode, rec in self.memory_recall.items()}
         return out
 
 
@@ -312,6 +317,10 @@ def _write_summary(summary_path: Path, res: TaskResult) -> None:
                     prev = _modes_of(old) if key == "modes" else dict(old.get(key) or {})
                     prev.update(merged.get(key) or {})
                     merged[key] = prev
+                prev_recall = dict(old.get("memory_recall") or {})
+                prev_recall.update(merged.get("memory_recall") or {})
+                if prev_recall:
+                    merged["memory_recall"] = prev_recall
 
                 merged["errors"] = list(merged.get("errors") or [])
                 seen = {json.dumps(e, sort_keys=True, default=str) for e in merged["errors"]}
@@ -425,6 +434,7 @@ def _resume(
     res.modes = cached_modes
     res.selections = cached_sels
     res.errors = got.get("errors", [])
+    res.memory_recall = dict(got.get("memory_recall") or {})
     _restore_libraries(task_id, k, adapter, runs_root, modes, seed, tag, mode_libs, res.selections)
     return True
 
@@ -483,6 +493,40 @@ def _roll_bases(
     width = min(len(pending), ROLLOUT_PARALLEL)
     with ThreadPoolExecutor(max_workers=max(1, width)) as pool_r:
         return {rv.label: rv for rv in pool_r.map(_one, pending)}
+
+
+def _sha256(text: str) -> str:
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def _recall_tree(
+    mode: str,
+    task_id: str,
+    *,
+    surface,
+    base_tree: harness_tree.Tree,
+    mode_lib: memory.MemoryConnector,
+    recorded: Mapping | None,
+    res: TaskResult,
+) -> harness_tree.Tree:
+    """`base_tree` with this mode's recall block injected, recording the text on `res`.
+
+    A text recorded on an earlier summary is reused (its sha256 checked) instead of recalling
+    again, so a re-run starts from the same tree.
+    """
+    if isinstance(recorded, Mapping) and "text" in recorded:
+        text = str(recorded.get("text") or "")
+        if _sha256(text) != recorded.get("sha256"):
+            raise ValueError(f"recorded memory_recall text for {mode} does not match its sha256")
+    else:
+        text = memory.recall(mode_lib, task_id, recall_block.room(surface, base_tree))
+    tree = recall_block.inject(surface, base_tree, text)
+    res.memory_recall[mode] = {
+        "file": recall_block.target_file(surface),
+        "text": text,
+        "sha256": _sha256(text),
+    }
+    return tree
 
 
 def _run_one_mode(
@@ -587,6 +631,7 @@ def run_task(
     selector_prop: Proposer | None = None,
     pool_policy: str = "finals",
     memory_meta: Mapping[str, str] | None = None,
+    memory_recall: bool = False,
 ) -> TaskResult:
     """k shared reference executions -> every mode -> blind selection per mode -> summary.json.
 
@@ -596,6 +641,8 @@ def run_task(
     only so the cost claim at k=1 (no selector session) stays legible at the call site.
     `memory_meta`, when given, is written to the summary as `memory_connector` and
     `memory_scope`; None (the default setting) adds no keys.
+    `memory_recall` True injects each mode's library recall into that mode's starting tree
+    and records the text on the summary as `memory_recall`; a re-run reuses the recorded text.
     """
     if int(k) < 1:
         raise ValueError(f"k must be positive, got {k!r}")
@@ -633,6 +680,9 @@ def run_task(
 
     surface = adapter.substrate.surface()
     base_tree = harness_tree.read_tree(surface, adapter.base_harness())
+    recorded_recall = {}
+    if memory_recall and summary_path.is_file():
+        recorded_recall = dict(_load_old(summary_path).get("memory_recall") or {})
 
     labels = [f"base{i}" for i in range(1, k + 1)]
     run_ids = [base_ns.run_id(task_id, label) for label in labels]
@@ -653,6 +703,18 @@ def run_task(
     for mode in modes:
         n = Namespace(bench, sub, mode, k, seed, tag)
         try:
+            mode_lib = mode_libs.get(mode)
+            mode_tree = base_tree
+            if memory_recall and mode_lib is not None:
+                mode_tree = _recall_tree(
+                    mode,
+                    task_id,
+                    surface=surface,
+                    base_tree=base_tree,
+                    mode_lib=mode_lib,
+                    recorded=recorded_recall.get(mode),
+                    res=res,
+                )
             _run_one_mode(
                 mode,
                 task_id,
@@ -663,8 +725,8 @@ def run_task(
                 selector=selector,
                 n=n,
                 runs_root=runs_root,
-                mode_lib=mode_libs.get(mode),
-                base_tree=base_tree,
+                mode_lib=mode_lib,
+                base_tree=mode_tree,
                 surface=surface,
                 pool_policy=pool_policy,
                 res=res,
@@ -699,6 +761,7 @@ def run_domain(
     selector_prop: Proposer | None = None,
     pool_policy: str = "finals",
     memory_scope: str = "",
+    memory_recall: bool = False,
 ) -> dict:
     """Every task in one domain, in `stream_order()` order, threading the library forward.
 
@@ -742,6 +805,7 @@ def run_domain(
                 selector_prop=selector_prop,
                 pool_policy=pool_policy,
                 memory_meta=memory_meta,
+                memory_recall=memory_recall,
             )
             if r.status in ("ok", "skipped"):
                 out["done"] += 1
@@ -825,6 +889,7 @@ def run_sweep(
     max_tasks: int | None = None,
     only_tasks: Sequence[str] = (),
     memory_scope: str = "",
+    memory_recall: bool = False,
 ) -> dict:
     """Run domains concurrently, preserving task order after stream filters are applied."""
     ordered_tasks = task_stream(
@@ -857,6 +922,7 @@ def run_sweep(
                 selector_prop=selector,
                 pool_policy=pool_policy,
                 memory_scope=memory_scope,
+                memory_recall=memory_recall,
             ): d
             for d in order
         }
