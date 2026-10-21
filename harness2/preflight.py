@@ -76,9 +76,13 @@ def check(adapter, *, judge=False) -> list[str]:
     if not (config.OPENCODE_DIR / "node_modules").is_dir():
         errors.append(f"OpenCode dependencies missing; run harness2-setup {bench}")
 
-    if any(
-        m.startswith("google-vertex") for m in (config.SOLVER_MODEL_OC, config.IMPROVER_MODEL)
-    ) or (judge and (bench == "wb" or config.JUDGE_MODEL.startswith(("claude", "gemini")))):
+    executor = config.route("executor.oc").model
+    improver = config.route("improver.opencode").model
+    # The bare judge ID (judge.jb and judge.lab carry it with a provider prefix).
+    judge_model = config.route("judge.wb").model
+    if any(m.startswith("google-vertex") for m in (executor, improver)) or (
+        judge and (bench == "wb" or judge_model.startswith(("claude", "gemini")))
+    ):
         probe(
             "Google Application Default Credentials",
             ["gcloud", "auth", "application-default", "print-access-token"],
@@ -101,15 +105,11 @@ def check(adapter, *, judge=False) -> list[str]:
                 "import pandas, openpyxl, docx, mammoth, pdfplumber, pptx, openai",
             ],
         )
-        if not config.JB_JUDGE_API_BASE:
+        if not config.route("judge.jb").endpoint:
             errors.append(
                 "Set GOOGLE_CLOUD_PROJECT or HARNESS2_JUDGE_BASE_URL for JobBench judging"
             )
-        if (
-            config.JUDGE_MODEL
-            and not config.JB_JUDGE_API_KEY
-            and not config.JUDGE_MODEL.startswith("gemini")
-        ):
+        if judge_model and not config.JB_JUDGE_API_KEY and not judge_model.startswith("gemini"):
             errors.append(
                 "A non-Gemini JobBench judge requires HARNESS2_JUDGE_BASE_URL and HARNESS2_JUDGE_API_KEY"
             )
@@ -132,8 +132,8 @@ def check(adapter, *, judge=False) -> list[str]:
             cwd=repo,
         )
         for role, expected in (
-            ("solver", config.SOLVER_MODEL_OC.removeprefix("google-vertex/")),
-            ("judge", config.JUDGE_MODEL),
+            ("solver", executor.removeprefix("google-vertex/")),
+            ("judge", judge_model),
         ):
             path = repo / "configs/models/harness2" / f"{role}.yaml"
             try:

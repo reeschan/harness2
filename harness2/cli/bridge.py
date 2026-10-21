@@ -63,7 +63,9 @@ def _endpoint(path: Path, host: str, port: int) -> dict:
 
 def main(argv=None):
     p = argparse.ArgumentParser(description=__doc__)
-    p.add_argument("--model", default=config.SOLVER_MODEL_CX, help="Vertex model ID to serve")
+    p.add_argument(
+        "--model", default=config.route("executor.cx").model, help="Vertex model ID to serve"
+    )
     p.add_argument(
         "--host",
         default="127.0.0.1",

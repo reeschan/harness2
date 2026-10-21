@@ -229,15 +229,17 @@ def _memory_warning(connector: str, scope: str, recall: bool = False) -> str | N
 
 def _check_identity(adapter, args, namespace_dir: Path) -> None:
     """Prevent a resumed run or library from silently mixing models or task partitions."""
+    executor = config.route("executor.oc" if args.substrate == "oc" else "executor.cx")
     identity = {
         "method_version": config.METHOD_VERSION,
-        "executor": config.SOLVER_MODEL_OC if args.substrate == "oc" else config.SOLVER_MODEL_CX,
-        "improver": config.IMPROVER_MODEL,
-        "judge": config.JUDGE_MODEL,
+        "executor": executor.model,
+        "improver": config.route("improver.opencode").model,
+        # The bare judge ID: judge.wb carries it unprefixed (judge.jb / judge.lab add one).
+        "judge": config.route("judge.wb").model,
         "project": config.VERTEX_PROJECT,
         "location": config.VERTEX_REGION,
-        "judge_endpoint": config.JB_JUDGE_API_BASE,
-        "endpoint": config.CODEX_BASE_URL if args.substrate == "cx" else "",
+        "judge_endpoint": config.route("judge.jb").endpoint,
+        "endpoint": config.route("executor.cx").endpoint if args.substrate == "cx" else "",
         "split": args.split,
         "tasks": _stream_for(adapter, args)[1],
         "max_tasks": args.max_tasks,
