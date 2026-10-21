@@ -55,6 +55,41 @@ def _spend_and_fallbacks(ns_dir: Path, modes: tuple[str, ...], k: int) -> tuple[
     return fell_back, usd
 
 
+def _memory_settings(ns_dir: Path) -> set[tuple[str, str]]:
+    """(connector, scope) pairs the summaries recorded; empty when every run used the defaults.
+
+    A summary carries ``memory_connector`` / ``memory_scope`` only when the sweep ran with a
+    non-default connector or a shared scope; a missing half falls back to ``"file"`` / ``""``.
+    """
+    settings: set[tuple[str, str]] = set()
+    for summary_path in sorted(ns_dir.glob("*/summary.json")):
+        try:
+            summary = json.loads(summary_path.read_text())
+        except (OSError, json.JSONDecodeError):
+            continue
+        if not isinstance(summary, dict):
+            continue
+        if "memory_connector" not in summary and "memory_scope" not in summary:
+            continue
+        connector = summary.get("memory_connector")
+        scope = summary.get("memory_scope")
+        settings.add(
+            (
+                "file" if connector is None else str(connector),
+                "" if scope is None else str(scope),
+            )
+        )
+    return settings
+
+
+def _memory_line(settings: set[tuple[str, str]]) -> str:
+    """One ``memory:`` line naming each (connector, scope) pair; an empty scope reads (per run)."""
+    return "memory: " + "; ".join(
+        f"connector={connector} scope={scope or '(per run)'}"
+        for connector, scope in sorted(settings)
+    )
+
+
 def main(argv: list[str] | None = None) -> int:
     p = argparse.ArgumentParser(
         prog="harness2.cli.report", description=__doc__, formatter_class=C.HelpFormatter
@@ -80,6 +115,7 @@ def main(argv: list[str] | None = None) -> int:
 
     adapter = C.make_adapter(args.bench, args.subset, args.substrate)
     rows, fell_back, usd = [], {}, {}
+    memory_settings: set[tuple[str, str]] = set()
     for k in ks:
         ns_dir = C.runs_root_for(adapter) / C.summary_namespace(adapter, k, seed=args.seed)
         judged = ns_dir / "judged.json"
@@ -91,6 +127,7 @@ def main(argv: list[str] | None = None) -> int:
         fb, sp = _spend_and_fallbacks(ns_dir, modes, k)
         fell_back.update(fb)
         usd.update(sp)
+        memory_settings |= _memory_settings(ns_dir)
     if not rows:
         raise SystemExit("nothing to report")
 
@@ -101,6 +138,8 @@ def main(argv: list[str] | None = None) -> int:
     )
     summaries = R.summarise(rows, fell_back=fell_back, usd=usd)
     print(R.render(summaries, title=title, bench=adapter.spec.name))
+    if memory_settings:
+        print(f"\n  {_memory_line(memory_settings)}")
     spend = sum(s.usd for s in summaries)
     if spend:
         print(
