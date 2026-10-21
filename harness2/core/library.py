@@ -151,6 +151,16 @@ class Library:
         self.rebuild_index()
         return d
 
+    def recall(self, task_id: str, limit_chars: int) -> str:
+        """A short summary of the visible entries' cue / lesson / evidence, cut to
+        `limit_chars`; "" when there are no entries or no room.
+        """
+        items = []
+        for name in self.entries():
+            path = self.dir / "harnesses" / name / "EXPERIENCE.md"
+            items.append((name, {f: _field(path, f) for f in RECALL_FIELDS}))
+        return recall_summary(items, limit_chars)
+
     def rebuild_index(self) -> Path:
         """Regenerate INDEX.md from what is on disk."""
         rows = [
@@ -201,6 +211,26 @@ def _inventory(surface: SurfaceSpec, tree: harness_tree.Tree) -> str:
     on = len(harness_tree.always_on_text(surface, tree))
     bits = [f"{v} {k}" for k, v in st.items() if v] or ["always-on edits only"]
     return f"{', '.join(bits)}; {on:,} always-on chars"
+
+
+RECALL_FIELDS = ("cue", "lesson", "evidence")
+
+
+def recall_summary(items: Sequence[tuple[str, dict]], limit_chars: int) -> str:
+    """`## <entry>` plus `- <field>: <value>` lines per (entry, experience) pair, skipping
+    empty values, the whole cut to `limit_chars` characters.
+    """
+    if limit_chars <= 0:
+        return ""
+    blocks = []
+    for name, exp in items:
+        lines = [f"## {name}"]
+        for f in RECALL_FIELDS:
+            value = " ".join(str(exp.get(f) or "").split())
+            if value:
+                lines.append(f"- {f}: {value}")
+        blocks.append("\n".join(lines))
+    return "\n\n".join(blocks)[:limit_chars]
 
 
 def _field(path: Path, name: str) -> str:

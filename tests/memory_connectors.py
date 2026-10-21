@@ -85,6 +85,11 @@ class InMemoryConnector:
     def context_dir(self) -> Path | None:
         return None
 
+    def recall(self, task_id: str, limit_chars: int) -> str:
+        entries = self._entries()
+        items = [(name, entries[name]["experience"]) for name in sorted(entries)]
+        return library.recall_summary(items, limit_chars)
+
 
 def not_a_connector(**_kwargs) -> object:
     """A factory whose result is not a MemoryConnector."""
