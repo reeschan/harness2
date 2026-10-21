@@ -16,11 +16,14 @@
 
 import json
 import os
+import shutil
+import stat
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
-from harness2.core import intake
+from harness2.core import intake, intake_local
 from harness2.core.intake_local import LocalFileConnector
 
 
@@ -185,6 +188,19 @@ class LocalFileConnectorTest(unittest.TestCase):
         self.assertEqual((dest / "a.txt").read_text(encoding="utf-8"), "a")
         self.assertEqual((dest / "s" / "b.txt").read_text(encoding="utf-8"), "b")
 
+    def test_fetch_files_keeps_the_mode_and_the_modification_time(self) -> None:
+        folder = self._task("g3", **{"task.md": "# g\n", "files__run.sh": "echo\n"})
+        src = folder / "files" / "run.sh"
+        os.chmod(src, 0o750)
+        os.utime(src, ns=(1_600_000_000_000_000_000, 1_600_000_000_123_456_789))
+        (raw,) = self.conn.poll()
+        dest = self.base / "dest"
+        self.conn.fetch_files(raw, dest)
+        st = os.stat(dest / "run.sh")
+        self.assertEqual(stat.S_IMODE(st.st_mode), 0o750)
+        self.assertEqual(st.st_mtime_ns, os.stat(src).st_mtime_ns)
+        self.assertEqual((dest / "run.sh").read_text(encoding="utf-8"), "echo\n")
+
     def test_fetch_files_without_files_does_nothing(self) -> None:
         self._task("g2", **{"task.md": "# g\n"})
         (raw,) = self.conn.poll()
@@ -208,6 +224,52 @@ class LocalFileConnectorTest(unittest.TestCase):
         dest = self.base / "dest"
         self.conn.fetch_files(raw, dest)
         self.assertEqual(sorted(p.name for p in dest.iterdir()), ["real.txt"])
+
+    @unittest.skipUnless(hasattr(os, "symlink"), "needs symbolic links")
+    def test_fetch_files_does_not_follow_a_directory_swapped_for_a_link(self) -> None:
+        folder = self._task("w1", **{"task.md": "# w\n", "files__sub__a.txt": "inside"})
+        outside = self.base / "outside"
+        outside.mkdir()
+        (outside / "a.txt").write_text("PASSWORD-7d1f", encoding="utf-8")
+        sub = folder / "files" / "sub"
+        try:
+            os.symlink(outside, self.base / "probe", target_is_directory=True)
+        except OSError as exc:  # pragma: no cover - platforms without symlink rights
+            self.skipTest(f"cannot create symbolic links: {exc}")
+        swapped = []
+
+        def swap() -> None:
+            if not swapped:
+                swapped.append(True)
+                shutil.rmtree(sub)
+                os.symlink(outside, sub, target_is_directory=True)
+
+        real_list = intake_local._regular_files
+        real_open_dir = getattr(intake_local, "_open_dir", None)
+
+        def list_then_swap(top):  # a path-based fetch_files: swap after the listing
+            out = real_list(top)
+            swap()
+            return out
+
+        def swap_then_open(name, dir_fd):  # the fd walk: swap right before opening `sub`
+            if name == "sub":
+                swap()
+            return real_open_dir(name, dir_fd)
+
+        (raw,) = self.conn.poll()
+        dest = self.base / "dest"
+        # create=True lets the same test run against a fetch_files without `_open_dir`.
+        with (
+            mock.patch.object(intake_local, "_regular_files", list_then_swap),
+            mock.patch.object(intake_local, "_open_dir", swap_then_open, create=True),
+        ):
+            self.conn.fetch_files(raw, dest)
+        self.assertTrue(swapped)
+        copied = [p for p in dest.rglob("*") if p.is_file()] if dest.exists() else []
+        for path in copied:
+            with self.subTest(path=str(path)):
+                self.assertNotIn("PASSWORD-7d1f", path.read_text(encoding="utf-8"))
 
     def test_broken_task_json_is_failed_and_others_are_polled(self) -> None:
         self._task("a", **{"task.json": json.dumps({"title": "ok", "body": "x"})})

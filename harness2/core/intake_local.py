@@ -34,11 +34,13 @@ task.md) cannot be read is recorded as failed by `poll` and skipped, so one brok
 does not stop the others; a task.json or task.md that is a symbolic link (or not a regular
 file) counts as unreadable, and a task.json that cannot be read never falls back to task.md.
 Symbolic links are never followed or copied, neither from `files/` nor from a deliverable
-directory.
+directory. `fetch_files` walks `files/` by directory fds opened without following links, so
+a folder swapped for a link between `poll` and the copy never lets a file outside be read.
 """
 
 from __future__ import annotations
 
+import errno
 import json
 import os
 import re
@@ -79,6 +81,71 @@ def _regular_files(top: Path) -> list[str]:
                 continue
             out.append(path.relative_to(top).as_posix())
     return sorted(out)
+
+
+_DIR_FLAGS = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+_FILE_FLAGS = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
+# What opening a name with O_NOFOLLOW (and O_DIRECTORY) gives when the name is a symbolic
+# link, is not a directory, or has gone away: the entry is skipped, not an error.
+_SKIP_ERRNOS = {errno.ELOOP, errno.ENOTDIR, errno.ENOENT, errno.EMLINK}  # EMLINK: BSD
+
+
+def _open_dir(name: str, dir_fd: int) -> int | None:
+    """An fd of the real directory `name` inside `dir_fd`, or None when it is a symbolic
+    link, not a directory, or missing. The link is never followed, at any level.
+    """
+    try:
+        return os.open(name, _DIR_FLAGS, dir_fd=dir_fd)
+    except OSError as exc:
+        if exc.errno in _SKIP_ERRNOS:
+            return None
+        raise
+
+
+def _copy_file(name: str, dir_fd: int, target: Path) -> None:
+    """Copy the regular file `name` inside `dir_fd` to `target`, with its permission bits
+    and modification time; a symbolic link or anything else is skipped.
+    """
+    try:
+        if not stat.S_ISREG(os.stat(name, dir_fd=dir_fd, follow_symlinks=False).st_mode):
+            return
+        fd = os.open(name, _FILE_FLAGS, dir_fd=dir_fd)
+    except OSError as exc:
+        if exc.errno in _SKIP_ERRNOS:
+            return
+        raise
+    with os.fdopen(fd, "rb") as source:
+        st = os.fstat(source.fileno())
+        if not stat.S_ISREG(st.st_mode):
+            return
+        target.parent.mkdir(parents=True, exist_ok=True)
+        with open(target, "wb") as out:
+            shutil.copyfileobj(source, out)
+    os.chmod(target, stat.S_IMODE(st.st_mode))
+    os.utime(target, ns=(st.st_atime_ns, st.st_mtime_ns))
+
+
+def _copy_tree(dir_fd: int, dest: Path) -> None:
+    """Copy the regular files under the directory `dir_fd` to `dest`, walking by fd.
+
+    Each subdirectory is opened from its parent's fd without following links, and each file
+    from its directory's fd, so swapping a directory for a link mid-copy reads nothing outside.
+    """
+    for name in sorted(os.listdir(dir_fd)):
+        try:
+            mode = os.stat(name, dir_fd=dir_fd, follow_symlinks=False).st_mode
+        except FileNotFoundError:
+            continue
+        if stat.S_ISDIR(mode):
+            sub_fd = _open_dir(name, dir_fd)
+            if sub_fd is None:
+                continue
+            try:
+                _copy_tree(sub_fd, dest / name)
+            finally:
+                os.close(sub_fd)
+        elif stat.S_ISREG(mode):
+            _copy_file(name, dir_fd, dest / name)
 
 
 def _skip_links(directory: str, names: list[str]) -> list[str]:
@@ -202,13 +269,37 @@ class LocalFileConnector:
         return tasks
 
     def fetch_files(self, raw: RawTask, dest: Path) -> None:
-        """Copy the task's `files/` tree under `dest`, skipping symbolic links."""
-        src = self.inbox / _check_id(raw.id) / "files"
+        """Copy the task's `files/` tree under `dest`, skipping symbolic links.
+
+        The copy walks by directory fds opened without following links (`<id>`, `files` and
+        every folder below), so a folder swapped for a link after polling, at any level, is
+        skipped and no file outside the inbox is read. Permission bits and modification times
+        are kept, as with `shutil.copy2`.
+        """
+        task_id = _check_id(raw.id)
         dest = Path(dest)
-        for rel in _regular_files(src):
-            target = dest / rel
-            target.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(src / rel, target, follow_symlinks=False)
+        try:
+            inbox_fd = os.open(self.inbox, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+        except OSError as exc:
+            if exc.errno in _SKIP_ERRNOS:
+                return
+            raise
+        try:
+            task_fd = _open_dir(task_id, inbox_fd)
+            if task_fd is None:
+                return
+            try:
+                files_fd = _open_dir("files", task_fd)
+                if files_fd is None:
+                    return
+                try:
+                    _copy_tree(files_fd, dest)
+                finally:
+                    os.close(files_fd)
+            finally:
+                os.close(task_fd)
+        finally:
+            os.close(inbox_fd)
 
     def deliver(self, task_id: str, deliverable_dir: Path, summary: Mapping) -> None:
         """Replace `outbox/<task_id>/` with a copy of `deliverable_dir` plus `summary.json`.
