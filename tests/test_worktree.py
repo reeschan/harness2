@@ -231,8 +231,48 @@ class CollectTest(WorktreeTestBase):
         super().setUp()
         self.base = wt.prepare_worktree(self.src, self.wt)
 
+    def stale_diff(self):
+        """Leave an old diff where an earlier run would have written one."""
+        self.diff.parent.mkdir(parents=True, exist_ok=True)
+        self.diff.write_bytes(b"stale diff\n")
+
+    def symlink_diff(self):
+        """Point the output path at another file; return that file."""
+        target = self.tmp / "elsewhere.diff"
+        target.write_bytes(b"elsewhere\n")
+        self.diff.parent.mkdir(parents=True, exist_ok=True)
+        self.diff.symlink_to(target)
+        return target
+
     def test_no_change_writes_nothing(self):
         self.assertEqual(wt.collect_diff(self.wt, self.base, self.diff), [])
+        self.assertFalse(self.diff.exists())
+
+    def test_no_change_removes_a_stale_diff(self):
+        self.stale_diff()
+        self.assertEqual(wt.collect_diff(self.wt, self.base, self.diff), [])
+        self.assertFalse(self.diff.exists())
+
+    def test_no_change_removes_a_stale_diff_symlink(self):
+        target = self.symlink_diff()
+        self.assertEqual(wt.collect_diff(self.wt, self.base, self.diff), [])
+        self.assertFalse(self.diff.is_symlink())
+        self.assertFalse(self.diff.exists())
+        self.assertEqual(target.read_bytes(), b"elsewhere\n")
+
+    def test_change_replaces_a_diff_symlink(self):
+        target = self.symlink_diff()
+        (self.wt / "a.txt").write_text("alpha by agent\n")
+        names = wt.collect_diff(self.wt, self.base, self.diff)
+        self.assertEqual(names, ["a.txt"])
+        self.assertFalse(self.diff.is_symlink())
+        self.assertIn("alpha by agent", self.diff.read_bytes().decode("utf-8", "replace"))
+        self.assertEqual(target.read_bytes(), b"elsewhere\n")
+
+    def test_only_excluded_change_removes_a_stale_diff(self):
+        self.stale_diff()
+        (self.wt / "scratch/x.txt").write_text("edited\n")
+        self.assertEqual(wt.collect_diff(self.wt, self.base, self.diff, exclude=("scratch",)), [])
         self.assertFalse(self.diff.exists())
 
     def test_change_new_delete_and_binary(self):

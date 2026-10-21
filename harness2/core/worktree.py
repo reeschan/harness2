@@ -206,17 +206,22 @@ def collect_diff(
 
     `exclude` holds paths relative to the worktree root (files or directories); changes under
     them are not in the diff. By default every change is. Returns the changed paths, sorted.
-    When nothing changed, `out` is not written and the result is `[]`.
+    When nothing changed, any existing `out` (a symlink included) is removed and the result is
+    `[]`. A symlink at `out` is replaced, never written through.
     """
+    out = Path(out)
     wt = str(worktree)
     spec = _pathspec(exclude)
     with _no_hooks() as no_hooks:
         _git(*no_hooks, "-C", wt, "add", "-A")
     diff = _git_bytes("-C", wt, "diff", "--cached", "--binary", base_rev, *spec)
     if not diff:
+        if out.is_symlink() or out.exists():
+            out.unlink()
         return []
-    out = Path(out)
     out.parent.mkdir(parents=True, exist_ok=True)
+    if out.is_symlink():
+        out.unlink()
     out.write_bytes(diff)
     names = _git("-C", wt, "diff", "--cached", "--name-only", "-z", base_rev, *spec)
     return _z_names(names)
