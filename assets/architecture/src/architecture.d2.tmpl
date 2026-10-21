@@ -96,6 +96,10 @@ core: "harness2.core  ·  the method (benchmark-independent)" {
       shape: cylinder
     }
     selection: "selection\nblind pick of a final\n+ reflection" {class: box}
+    routes: "model connector  ·  config.ROLES\nrole → route table\nexecutor: oc · cx\nimprover: opencode · claude_cli\njudge: jb · lab · wb" {
+      class: box
+      width: 290
+    }
   }
 
   impls: "" {
@@ -224,3 +228,5 @@ core -> exec: "rollouts ·\nimprover calls" {style.stroke-width: 3}
 exec.bench -> exec.substrate: "launch rollout"
 exec.substrate -> exec.models: "model calls"
 exec.models -> exec.runs: "outputs"
+core.outputs.routes -> exec.substrate.oc: {style.stroke-dash: 4}
+core.outputs.routes -> exec.models: {style.stroke-dash: 4}
