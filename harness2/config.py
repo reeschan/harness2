@@ -147,6 +147,8 @@ def _build_roles() -> dict[str, ModelRoute]:
         else judge
     )
     lab_judge = "vertex/" + judge if judge.startswith(("claude", "gemini")) else judge
+    # Empty: the normalizer route stays empty (passthrough normalization).
+    normalizer = env("HARNESS2_NORMALIZER_MODEL", "")
     routes = (
         ModelRoute("executor.oc", _opencode_provider(solver_oc), solver_oc),
         ModelRoute(
@@ -168,7 +170,7 @@ def _build_roles() -> dict[str, ModelRoute]:
         ModelRoute("judge.lab", _opencode_provider(lab_judge), lab_judge),
         # The bare judge ID; the WorkBuddy routes file prefixes it with google/.
         ModelRoute("judge.wb", "workbuddy", judge),
-        ModelRoute("normalizer", "", ""),
+        ModelRoute("normalizer", _opencode_provider(normalizer), normalizer),
     )
     return {r.role: r for r in routes}
 

@@ -31,6 +31,7 @@ CLEARED = (
     "HARNESS2_CODEX_MODEL",
     "HARNESS2_IMPROVER_MODEL",
     "HARNESS2_JUDGE_MODEL",
+    "HARNESS2_NORMALIZER_MODEL",
     "HARNESS2_JUDGE_BASE_URL",
     "HARNESS2_JUDGE_API_KEY",
     "HARNESS2_CODEX_BASE_URL",
@@ -192,6 +193,16 @@ class ModelRouteTests(unittest.TestCase):
             with self.subTest(combo=name):
                 self.assertTrue(snap["missing"].startswith("ValueError: "), snap["missing"])
                 self.assertIn("normalizer", snap["missing"])
+
+    def test_normalizer_route_empty_without_env(self):
+        roles = self.snaps["empty"]["roles"]
+        self.assertEqual(roles["normalizer"]["provider"], "")
+        self.assertEqual(roles["normalizer"]["model"], "")
+
+    def test_normalizer_route_from_env(self):
+        roles = load({"HARNESS2_NORMALIZER_MODEL": "dummy/normalizer-x"})["roles"]
+        self.assertEqual(roles["normalizer"]["provider"], "dummy")
+        self.assertEqual(roles["normalizer"]["model"], "dummy/normalizer-x")
 
 
 if __name__ == "__main__":
