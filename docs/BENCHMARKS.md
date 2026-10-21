@@ -216,3 +216,114 @@ run_dir, timeout)` method: it runs the agent in `workspace`, leaves the
 deliverables in `workspace/output/`, and writes `run_dir/trajectory.md`. `prop`
 is the improver's `Proposer`. A launcher that starts rollouts on a real
 substrate will be added in a later release.
+
+## Taking PBIs from jev-mcp
+
+`harness2-intake` (`harness2/cli/intake.py`, also `python3 -m harness2.cli.intake`)
+runs the queued PBIs of one git repository through Harness². It claims every
+queued task from a jev-mcp server, runs each one with OpenCode in git worktrees
+of that repository (`run_intake`), applies only the chosen run's diff back to
+the repository, and prints the five-line report jev-mcp wrote for every task it
+took up. The connector is registered as `jev-mcp` and uses the `passthrough`
+normalizer: each claimed task already carries its `TaskSpec`, so no model writes
+the spec.
+
+### Starting jev-mcp
+
+jev-mcp is not installed as a command: it is the pbi-orchestration-jev skill's
+`jev_mcp.py`, started with `python`. It takes three arguments:
+
+| Argument | Default | Meaning |
+|---|---|---|
+| `--root <dir>` | — | A directory jev-mcp may work in; repeatable, or pass the list in the `PBI_MCP_ROOTS` environment variable |
+| `--http` | off (stdio) | Serve Streamable HTTP at `127.0.0.1:<port>/mcp` instead of stdio |
+| `--port` | `7830` | The HTTP port |
+
+jev-mcp does not touch paths outside its `--root` directories, so both the
+`--repo` work tree and the `--work-root` must lie under a `--root` (give one
+`--root` for each, or one directory that covers both). `verify` also requires
+its working directory to lie under a `--root`. Run jev-mcp and the harness with
+the same view of the file system: the harness passes paths to jev-mcp. On
+Windows, run both in WSL.
+
+```bash
+# jev-mcp over HTTP; the --root directories cover the repo and the work root
+python <path-to>/jev_mcp.py --http --port 7830 \
+  --root /home/me/proj --root /home/me/jev
+
+harness2-intake --repo /home/me/proj --work-root /home/me/jev/h2 \
+  --mcp-url http://127.0.0.1:7830/mcp
+
+# or let harness2-intake start jev-mcp on stdio
+harness2-intake --repo /home/me/proj --work-root /home/me/jev/h2 \
+  --mcp-command "python <path-to>/jev_mcp.py --root /home/me/proj --root /home/me/jev"
+```
+
+### Arguments
+
+| Argument | Default | Meaning |
+|---|---|---|
+| `--repo` | required | Absolute path of the root of the git work tree the PBIs change; under a jev-mcp `--root` |
+| `--mcp-url` | — | jev-mcp over HTTP, e.g. a `/mcp` URL (loopback hosts only) |
+| `--mcp-command` | — | The command that starts jev-mcp on stdio (shlex-split) |
+| `--work-root` | required | The intake adapter's root: under jev-mcp's `--root`, outside the `--repo` work tree |
+| `--runs-root` | `<work-root>/runs` | Scheduler state |
+| `--k` | `1` | Task-level recursion budget (`R = 4k` rollouts per task) |
+| `--modes` | `agg` | `parallel` or `sequential` (`agg` / `seq` are the on-disk tokens), or a comma list; the report follows the first mode |
+| `--seed`, `--tag` | none, empty | Enter the run namespace |
+| `--model` | `config.SOLVER_MODEL_OC` | The OpenCode model of the agent |
+| `--timeout` | `3600` | Seconds for one jev-mcp call (`verify` runs the PBI's commands) and for the improver channel |
+
+Give exactly one of `--mcp-url` and `--mcp-command`. Argument errors, including a
+`--work-root` inside the `--repo` work tree or a `--repo` that is not the root
+of its work tree, exit with status 2 before any task is claimed. A run-time
+failure prints one `error:` line and exits with status 1.
+
+### Worktrees and what goes back to the source
+
+Each rollout gets its own detached git worktree at
+`<work-root>/executions/<run_id>/worktree/`. Its base commit is the source HEAD
+plus the tracked uncommitted changes and the untracked, not ignored files
+(including `docs/pbi/`), committed once inside the worktree, so the PBI's
+verification tools work there. The agent works in the worktree; its deliverable
+is `workspace/output/changes.diff`, the `git diff --binary` from the base commit
+without `docs/pbi/`. A rollout that changed nothing writes no diff and has no
+deliverable.
+
+Only the diff of the chosen run goes back to `--repo`. Before it is applied, the
+source's `docs/pbi/tools/unchanged.py check <PBI>` runs against the worktree with
+the source's record, so the PBI's untouched files are confirmed unchanged; then
+the diff is applied with `git apply --binary`. A failed check or apply leaves the
+source as it was and the task is failed as `BLOCKED`. The source's index and
+commits are never touched, and the worktrees are removed when the run ends.
+
+### The report
+
+jev-mcp writes the five-line report to `<repo>/docs/pbi/mcp/<task>.last.md`, and
+`harness2-intake` prints it for each task taken up in this run. The first line,
+`状態: <status>`, is one of:
+
+| Status | When |
+|---|---|
+| `DONE` | The chosen run has a deliverable and no error was recorded |
+| `DONE_WITH_CONCERNS` | The chosen run has a deliverable but errors were recorded, or the task ran but the chosen run left no deliverable |
+| `BLOCKED` | Every base rollout failed, or the task failed (for example, the untouched-files check or the apply failed) |
+
+The other lines give the passed verification commands, the changed files, what
+is unresolved, and the path of the details file. The details include the
+verification results, the path of `summary.json`, the chosen label and the
+selection's reasoning, and the location of the adopted harness. The command
+exits with status 0 only when every task taken up is `DONE`.
+
+### Verification and selection
+
+jev-mcp's `verify` runs the PBI's verification commands only after selection:
+once on the chosen run when it is delivered, and as the judge for post-hoc
+scoring (`IntakeAdapter.score`). Selection never looks at verification results
+or scores.
+
+### The Jev API key
+
+The Jev API key (`TYPESAFE_API_KEY`) is not given to the harness. The harness
+code never reads it, and it is removed from the environment of the agent's
+child process.
