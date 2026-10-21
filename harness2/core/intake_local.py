@@ -31,8 +31,10 @@ A task id must match `^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$`. Inbox folders with ot
 skipped, and `deliver` and `fail` refuse such ids, so nothing is written outside the root. A
 task with an outbox folder or a failed record is not polled again. A task whose task.json (or
 task.md) cannot be read is recorded as failed by `poll` and skipped, so one broken folder
-does not stop the others. Symbolic links are never followed or copied, neither from
-`files/` nor from a deliverable directory.
+does not stop the others; a task.json or task.md that is a symbolic link (or not a regular
+file) counts as unreadable, and a task.json that cannot be read never falls back to task.md.
+Symbolic links are never followed or copied, neither from `files/` nor from a deliverable
+directory.
 """
 
 from __future__ import annotations
@@ -41,6 +43,7 @@ import json
 import os
 import re
 import shutil
+import stat
 from pathlib import Path
 from typing import Any, Iterable, Mapping
 
@@ -92,6 +95,33 @@ class _BadTask(ValueError):
     """A task folder whose task file cannot be read; `poll` records it as failed."""
 
 
+def _read_task_file(path: Path) -> str:
+    """The UTF-8 text of a task file (task.json or task.md) that must be a regular file.
+
+    A symbolic link or anything other than a regular file, an unreadable file, or text that
+    is not UTF-8 raises `_BadTask` with the file name in the reason. The file is opened
+    without following links, so a link swapped in after the check is refused too.
+    """
+    name = path.name
+    try:
+        st = os.lstat(path)
+        if stat.S_ISLNK(st.st_mode):
+            raise _BadTask(f"{name}: is a symbolic link")
+        if not (stat.S_ISREG(st.st_mode) or stat.S_ISDIR(st.st_mode)):
+            raise _BadTask(f"{name}: not a regular file")
+        fd = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+        with os.fdopen(fd, "rb") as handle:
+            if not stat.S_ISREG(os.fstat(handle.fileno()).st_mode):
+                raise IsADirectoryError(f"{name} is not a regular file")
+            data = handle.read()
+    except OSError as exc:
+        raise _BadTask(f"{name}: cannot read: {type(exc).__name__}: {exc}") from exc
+    try:
+        return data.decode("utf-8")
+    except ValueError as exc:  # UnicodeDecodeError
+        raise _BadTask(f"{name}: not valid UTF-8: {exc}") from exc
+
+
 def _title_from_markdown(text: str, default: str) -> str:
     for line in text.splitlines():
         if line.startswith("# "):
@@ -125,10 +155,11 @@ class LocalFileConnector:
     def _read(self, task_id: str, folder: Path) -> RawTask:
         title, body, meta = task_id, "", {}
         json_path, md_path = folder / "task.json", folder / "task.md"
-        if json_path.is_file():
+        if os.path.lexists(json_path):
+            text = _read_task_file(json_path)
             try:
-                data = json.loads(json_path.read_text(encoding="utf-8"))
-            except ValueError as exc:  # includes UnicodeDecodeError
+                data = json.loads(text)
+            except ValueError as exc:
                 raise _BadTask(f"task.json: not valid JSON: {exc}") from exc
             if not isinstance(data, Mapping):
                 raise _BadTask("task.json: must hold a JSON object")
@@ -141,11 +172,8 @@ class LocalFileConnector:
                 raise _BadTask("task.json: 'body' must be a string")
             if not isinstance(meta, Mapping):
                 raise _BadTask("task.json: 'meta' must be an object")
-        elif md_path.is_file():
-            try:
-                body = md_path.read_text(encoding="utf-8")
-            except ValueError as exc:  # UnicodeDecodeError
-                raise _BadTask(f"task.md: not valid UTF-8: {exc}") from exc
+        elif os.path.lexists(md_path):
+            body = _read_task_file(md_path)
             title = _title_from_markdown(body, task_id)
         files = tuple(_regular_files(folder / "files"))
         return RawTask(id=task_id, title=title, body=body, files=files, meta=dict(meta))
@@ -153,9 +181,10 @@ class LocalFileConnector:
     def poll(self) -> Iterable[RawTask]:
         """The inbox tasks in name order that are neither delivered nor failed.
 
-        A folder whose task.json is malformed (or whose task.md is not UTF-8) is recorded
-        with `fail` (the reason names the file and the problem) and skipped; polling goes on
-        with the other folders.
+        A folder whose task.json or task.md cannot be used (a symbolic link or not a regular
+        file, unreadable, not UTF-8, or a malformed task.json) is recorded with `fail` (the
+        reason names the file and the problem) and skipped; polling goes on with the other
+        folders.
         """
         if not self.inbox.is_dir():
             return []

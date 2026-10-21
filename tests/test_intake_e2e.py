@@ -182,10 +182,10 @@ class IntakeEndToEndTest(unittest.TestCase):
             encoding="utf-8",
         )
 
-    def _adapter(self, launcher, judge=None) -> IntakeAdapter:
+    def _adapter(self, launcher, judge=None, connector=None) -> IntakeAdapter:
         return IntakeAdapter(
             self.root,
-            LocalFileConnector(self.inbox_root),
+            connector if connector is not None else LocalFileConnector(self.inbox_root),
             PassthroughNormalizer(),
             launcher=launcher,
             channel=CHANNEL,
@@ -255,11 +255,15 @@ class IntakeEndToEndTest(unittest.TestCase):
         self.assertEqual((launcher.calls, len(improver._calls)), (calls, proposals))
         self.assertEqual((outbox / "summary.json").stat().st_mtime_ns, delivered_at)
 
-        # a fresh adapter (a new process) over the same root resumes from summary.json
+        # a fresh adapter (a new process) over the same root skips the marked task
+        self.assertEqual(
+            (self.root / "tasks" / "ledger-1" / ".handled").read_text(encoding="utf-8"),
+            "delivered",
+        )
         again = self._adapter(launcher)
-        resumed = run_intake(again, improver, **kwargs)
-        self.assertEqual([r.task_id for r in resumed], ["ledger-1"])
+        self.assertEqual(run_intake(again, improver, **kwargs), [])
         self.assertEqual((launcher.calls, len(improver._calls)), (calls, proposals))
+        self.assertEqual((outbox / "summary.json").stat().st_mtime_ns, delivered_at)
         self._assert_no_secret(_texts_under(self.root, skip=self.root / "private"))
         self._assert_no_secret(_texts_under(self.runs_root))
 
@@ -307,6 +311,75 @@ class IntakeEndToEndTest(unittest.TestCase):
             (self.inbox_root / "failed" / "ledger-1.json").read_text(encoding="utf-8")
         )["reason"]
         self.assertIn("symbolic link", reason)
+
+    def test_handled_marks_survive_a_new_adapter(self) -> None:
+        self._add_ledger_2()
+        connector = LocalFileConnector(self.inbox_root)
+        launcher = FakeLauncher()
+        improver = FakeImprover(CHANNEL)
+        real = schedule.run_task
+
+        def flaky(task_id, k, **kwargs):
+            if task_id == "ledger-1":
+                raise RuntimeError("boom")
+            return real(task_id, k, **kwargs)
+
+        with patch.object(intake_mod.schedule, "run_task", side_effect=flaky):
+            first = run_intake(
+                self._adapter(launcher, connector=connector),
+                improver,
+                k=1,
+                runs_root=self.runs_root,
+                modes=("agg",),
+            )
+        self.assertEqual([r.task_id for r in first], ["ledger-2"])
+        tasks = self.root / "tasks"
+        self.assertEqual((tasks / "ledger-1" / ".handled").read_text(encoding="utf-8"), "failed")
+        self.assertEqual((tasks / "ledger-2" / ".handled").read_text(encoding="utf-8"), "delivered")
+        self.assertTrue((self.inbox_root / "failed" / "ledger-1.json").is_file())
+        self.assertFalse((tasks / "memo-1").exists())
+        calls, proposals = launcher.calls, len(improver._calls)
+        self.assertGreater(calls, 0)
+
+        # a new adapter over the same root and connector: no per-process memory applies
+        again = self._adapter(launcher, connector=connector)
+        with (
+            patch.object(connector, "deliver") as deliver,
+            patch.object(connector, "fail") as fail,
+            patch.object(intake_mod.schedule, "run_task") as run_task,
+        ):
+            second = run_intake(again, improver, k=1, runs_root=self.runs_root, modes=("agg",))
+        self.assertEqual(second, [])
+        deliver.assert_not_called()
+        fail.assert_not_called()
+        run_task.assert_not_called()
+        self.assertEqual((launcher.calls, len(improver._calls)), (calls, proposals))
+        self.assertFalse((self.inbox_root / "outbox" / "ledger-1").exists())
+
+    def test_no_mark_when_the_connector_raises(self) -> None:
+        connector = LocalFileConnector(self.inbox_root)
+        adapter = self._adapter(FakeLauncher(), connector=connector)
+        with (
+            patch.object(connector, "deliver", side_effect=OSError("deliver down")),
+            patch.object(connector, "fail", side_effect=OSError("fail down")),
+        ):
+            with self.assertRaises(OSError):
+                run_intake(
+                    adapter, FakeImprover(CHANNEL), k=1, runs_root=self.runs_root, modes=("agg",)
+                )
+        self.assertTrue((self.root / "tasks" / "ledger-1" / "spec.json").is_file())
+        self.assertFalse((self.root / "tasks" / "ledger-1" / ".handled").exists())
+
+    def _add_ledger_2(self) -> None:
+        good = self.inbox_root / "inbox" / "ledger-2"
+        (good / "files").mkdir(parents=True)
+        (good / "files" / "ledger.csv").write_text("amount\n1.00\n", encoding="utf-8")
+        (good / "task.json").write_text(
+            json.dumps(
+                {"meta": {"task_spec": _task_spec("ledger-2", "accounting", "sum", "a.txt")}}
+            ),
+            encoding="utf-8",
+        )
 
     def test_run_task_error_fails_the_task_and_goes_on(self) -> None:
         good = self.inbox_root / "inbox" / "ledger-2"

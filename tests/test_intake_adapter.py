@@ -23,8 +23,10 @@ from pathlib import Path
 from harness2.benchmarks.intake import IntakeAdapter, Launcher
 from harness2.core import spec
 from harness2.core.intake import RawTask
+from harness2.core.proposer import Proposer
 
 SECRET = "SECRET-CRITERION-7f3a"
+CHANNEL = spec.ChannelSpec("opencode", "fake-model")
 
 
 def _spec_dict(task_id: str, domain: str = "accounting", **extra) -> dict:
@@ -124,6 +126,7 @@ class IntakeAdapterTest(unittest.TestCase):
             self.conn,
             self.norm,
             launcher=self.launcher,
+            channel=CHANNEL,
             judge=judge,
             domains=domains,
         )
@@ -277,6 +280,27 @@ class IntakeAdapterTest(unittest.TestCase):
         self.assertIsNone(adapter.task_files("t1"))
         run_dir = adapter.execute("t1", None, "r1")
         self.assertTrue((run_dir / "workspace/output").is_dir())
+
+    def test_channel_is_required(self) -> None:
+        with self.assertRaises(TypeError):
+            IntakeAdapter(self.root, FakeConnector([]), FakeNormalizer({}), launcher=FakeLauncher())
+
+    def test_empty_model_channel_is_rejected(self) -> None:
+        for model in ("", "   "):
+            with self.subTest(model=model), self.assertRaises(ValueError):
+                IntakeAdapter(
+                    self.root,
+                    FakeConnector([]),
+                    FakeNormalizer({}),
+                    launcher=FakeLauncher(),
+                    channel=spec.ChannelSpec("opencode", model),
+                )
+
+    def test_channel_is_used_for_proposer_and_selector(self) -> None:
+        adapter = self._one()
+        self.assertIs(adapter.spec.channels["proposer"], CHANNEL)
+        self.assertIs(adapter.spec.channels["selector"], CHANNEL)
+        Proposer(adapter.spec.channels["selector"])
 
     def test_base_harness_and_surface(self) -> None:
         adapter = self._one()

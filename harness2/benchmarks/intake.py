@@ -126,7 +126,7 @@ class IntakeAdapter:
         *,
         launcher: Launcher,
         substrate: Any = None,
-        channel: ChannelSpec | None = None,
+        channel: ChannelSpec,
         judge: Judge | None = None,
         domains: Sequence[str] = (),
     ):
@@ -135,7 +135,10 @@ class IntakeAdapter:
         self.normalizer = normalizer
         self.launcher = launcher
         self.substrate = substrate if substrate is not None else OpencodeSubstrate()
-        channel = channel if channel is not None else ChannelSpec("opencode", "")
+        if not str(channel.model).strip():
+            raise ValueError(
+                "IntakeAdapter needs a channel with a model (ChannelSpec.model is empty)"
+            )
         self.judge = judge
         self.domains = tuple(domains)
         self.spec = BenchSpec(
@@ -387,9 +390,24 @@ class IntakeAdapter:
         return self.judge(Path(run_dir), task_id, criteria)
 
 
-# The task ids each adapter has already handed to its connector (deliver or fail) in this
-# process. A later run_intake skips them; across processes, run_task's resume covers them.
+# The task ids each adapter has already taken up in this process. A later run_intake skips
+# them; across processes, the `tasks/<task_id>/.handled` mark (see below) covers them.
 _HANDLED: "weakref.WeakKeyDictionary[IntakeAdapter, set[str]]" = weakref.WeakKeyDictionary()
+
+# The file under `tasks/<task_id>/` that records the task went back to the connector:
+# one word, "delivered" or "failed", written only after connector.deliver / connector.fail
+# returned without an exception.
+HANDLED_MARK = ".handled"
+
+
+def _is_marked_handled(adapter: IntakeAdapter, task_id: str) -> bool:
+    """Whether the task carries a `.handled` mark (whatever its word): it is not run again."""
+    path = adapter._task_dir(task_id) / HANDLED_MARK
+    return path.is_file() or path.is_symlink()
+
+
+def _write_handled_mark(adapter: IntakeAdapter, task_id: str, word: str) -> None:
+    (adapter._task_dir(task_id) / HANDLED_MARK).write_text(word, encoding="utf-8")
 
 
 def _deliverable_dir(adapter: IntakeAdapter, res: schedule.TaskResult, mode: str) -> Path:
@@ -451,8 +469,11 @@ def run_intake(
 ) -> list[schedule.TaskResult]:
     """Ingest new tasks, run each through `schedule.run_task`, and hand the result back.
 
-    For every stored task this adapter has not yet delivered or failed in this process,
-    run_task runs with the given arguments. The chosen run of `modes[0]` is delivered with
+    For every stored task this adapter has not yet taken up in this process and that has
+    no `tasks/<task_id>/.handled` mark, run_task runs with the given arguments. The mark
+    holds "delivered" or "failed" and is written only after `connector.deliver` or
+    `connector.fail` returned without an exception, so a restarted process does not hand
+    the same task to the connector twice. The chosen run of `modes[0]` is delivered with
     `adapter.connector.deliver(task_id, <its workspace/output/>, res.to_dict())` when that
     directory is a real directory (not a symbolic link) holding at least one regular file;
     otherwise the task goes to `adapter.connector.fail`. An Exception from run_task or from
@@ -474,6 +495,8 @@ def run_intake(
         if task_id in handled:
             continue
         handled.add(task_id)
+        if _is_marked_handled(adapter, task_id):
+            continue
         try:
             res = schedule.run_task(
                 task_id,
@@ -492,11 +515,13 @@ def run_intake(
             adapter.connector.fail(
                 task_id, _clip_reason(f"run_task failed: {type(exc).__name__}: {exc}")
             )
+            _write_handled_mark(adapter, task_id, "failed")
             continue
         try:
             output = _deliverable_dir(adapter, res, modes[0])
         except ValueError as exc:
             adapter.connector.fail(task_id, _clip_reason(str(exc)))
+            _write_handled_mark(adapter, task_id, "failed")
             results.append(res)
             continue
         try:
@@ -505,7 +530,9 @@ def run_intake(
             adapter.connector.fail(
                 task_id, _clip_reason(f"delivery failed: {type(exc).__name__}: {exc}")
             )
+            _write_handled_mark(adapter, task_id, "failed")
             continue
+        _write_handled_mark(adapter, task_id, "delivered")
         results.append(res)
     return results
 

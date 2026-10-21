@@ -206,6 +206,7 @@ adapter = IntakeAdapter(
     connector_for(root="intake-root"),  # the local folder connector
     normalizer_for(),                   # passthrough by default
     launcher=my_launcher,               # your Launcher implementation
+    channel=prop.spec,
 )
 results = run_intake(adapter, prop, k=2, runs_root=Path("runs/intake/runs"))
 ```

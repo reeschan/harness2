@@ -237,6 +237,52 @@ class LocalFileConnectorTest(unittest.TestCase):
                 self.assertIn("task.json", reason)
                 self.assertIn(word, reason)
 
+    def _failed_reason(self, task_id: str) -> str:
+        path = self.root / "failed" / f"{task_id}.json"
+        return json.loads(path.read_text(encoding="utf-8"))["reason"]
+
+    @unittest.skipUnless(hasattr(os, "symlink"), "needs symbolic links")
+    def test_linked_task_files_are_failed_and_not_read(self) -> None:
+        secret = self.base / "secret.txt"
+        secret.write_text('{"title": "leak", "body": "SECRET"}', encoding="utf-8")
+        self._task("a", **{"task.json": json.dumps({"title": "ok", "body": "x"})})
+        linked_json = self._task("b", **{"task.md": "# fallback\n"})
+        linked_md = self._task("c")
+        try:
+            os.symlink(secret, linked_json / "task.json")
+            os.symlink(secret, linked_md / "task.md")
+        except OSError as exc:  # pragma: no cover - platforms without symlink rights
+            self.skipTest(f"cannot create symbolic links: {exc}")
+        tasks = list(self.conn.poll())
+        self.assertEqual([(r.id, r.title) for r in tasks], [("a", "ok")])
+        self.assertNotIn("SECRET", "".join(r.body for r in tasks))
+        for task_id, name in (("b", "task.json"), ("c", "task.md")):
+            with self.subTest(task_id=task_id):
+                reason = self._failed_reason(task_id)
+                self.assertIn(name, reason)
+                self.assertIn("symbolic link", reason)
+                self.assertNotIn("SECRET", reason)
+        self.assertEqual(self._ids(), ["a"])
+
+    def test_unreadable_task_file_is_failed_and_others_are_polled(self) -> None:
+        self._task("a", **{"task.json": json.dumps({"title": "ok", "body": "x"})})
+        (self._task("b", **{"task.md": "# fallback\n"}) / "task.json").mkdir()
+        (self._task("c") / "task.md").mkdir()
+        self.assertEqual([(r.id, r.title) for r in self.conn.poll()], [("a", "ok")])
+        for task_id, name in (("b", "task.json"), ("c", "task.md")):
+            with self.subTest(task_id=task_id):
+                self.assertIn(name, self._failed_reason(task_id))
+        self.assertEqual(self._ids(), ["a"])
+
+    def test_task_md_that_is_not_utf8_is_failed(self) -> None:
+        folder = self._task("u")
+        (folder / "task.md").write_bytes(b"# t\n\xff\xfe\n")
+        self._task("v", **{"task.md": "# v\n"})
+        self.assertEqual(self._ids(), ["v"])
+        reason = self._failed_reason("u")
+        self.assertIn("task.md", reason)
+        self.assertIn("UTF-8", reason)
+
     @unittest.skipUnless(hasattr(os, "symlink"), "needs symbolic links")
     def test_deliver_skips_symbolic_links(self) -> None:
         outside = self.base / "private.json"
