@@ -17,13 +17,15 @@
 A connector is anything with the surface the scheduler uses on a library: `domain`,
 `entries()`, `retain()`, `add()` and `context_dir()`. Connectors are registered by name;
 `connector_for` picks one by explicit name, then by the `HARNESS2_MEMORY_CONNECTOR`
-environment variable, then the on-disk default `file`. `store` runs the grader-verdict
+environment variable, then the on-disk default `file`. A name that is not registered but
+has the form `module:Attr` is imported and used as the factory. `store` runs the grader-verdict
 checks before handing an experience to any connector, so the checks hold whatever the
 backend does.
 """
 
 from __future__ import annotations
 
+import importlib
 import os
 from pathlib import Path
 from typing import Callable, Mapping, Protocol, Sequence, runtime_checkable
@@ -81,6 +83,46 @@ def names() -> list[str]:
     return sorted(_REGISTRY)
 
 
+def connector_name(*, name: str | None = None, env: Mapping[str, str] | None = None) -> str:
+    """The connector name: `name` when given, else `ENV_VAR` from `env` (or `os.environ` when
+    `env` is None), else `DEFAULT`.
+    """
+    if name is not None:
+        return name
+    return (os.environ if env is None else env).get(ENV_VAR) or DEFAULT
+
+
+def _import_factory(name: str) -> Factory:
+    """Load the factory named by a `module:Attr` import path; Attr may be a dotted chain.
+
+    A malformed path, a failed import and a missing attribute raise ValueError; an attribute
+    that is not callable raises TypeError.
+    """
+    module_name, _, attr_path = name.partition(":")
+    if name.count(":") != 1 or not module_name or not attr_path:
+        raise ValueError(
+            f"memory connector {name!r} is not a valid import path; expected 'module:Attr'"
+        )
+    try:
+        target = importlib.import_module(module_name)
+    except Exception as exc:
+        raise ValueError(
+            f"memory connector {name!r}: cannot import module {module_name!r}: {exc}"
+        ) from exc
+    for attr in attr_path.split("."):
+        try:
+            target = getattr(target, attr)
+        except AttributeError as exc:
+            raise ValueError(
+                f"memory connector {name!r}: {module_name!r} has no attribute {attr_path!r}"
+            ) from exc
+    if not callable(target):
+        raise TypeError(
+            f"memory connector {name!r} is {type(target).__name__}, which is not callable"
+        )
+    return target
+
+
 def connector_for(
     root: Path | str,
     domain: str,
@@ -91,17 +133,19 @@ def connector_for(
 ) -> MemoryConnector:
     """Build the connector for one (root, domain).
 
-    The name is `name` when given, else `ENV_VAR` from `env` (or `os.environ` when `env` is
-    None), else `DEFAULT`. An unregistered name raises ValueError; a factory result that is
-    not a MemoryConnector raises TypeError.
+    The name comes from `connector_name`. A registered name is used first; otherwise a name
+    containing `:` is loaded as a `module:Attr` import path (see `_import_factory`). Any other
+    unregistered name raises ValueError; a factory result that is not a MemoryConnector raises
+    TypeError.
     """
-    if name is None:
-        name = (os.environ if env is None else env).get(ENV_VAR) or DEFAULT
+    name = connector_name(name=name, env=env)
     factory = _REGISTRY.get(name)
     if factory is None:
-        raise ValueError(
-            f"unknown memory connector {name!r}; registered: {', '.join(names()) or '(none)'}"
-        )
+        if ":" not in name:
+            raise ValueError(
+                f"unknown memory connector {name!r}; registered: {', '.join(names()) or '(none)'}"
+            )
+        factory = _import_factory(name)
     conn = factory(root=Path(root), domain=domain, surface=surface)
     if not isinstance(conn, MemoryConnector):
         raise TypeError(
