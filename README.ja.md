@@ -61,7 +61,7 @@ Harness² が想定するのは**オープンワールド**、つまりハーネ
 <p align="center">
   <picture>
     <source media="(prefers-color-scheme: dark)" srcset="assets/architecture/architecture-dark.svg">
-    <img src="assets/architecture/architecture-light.svg" alt="Harness² のアーキテクチャ図。CLI（harness2-setup/-check、harness2、harness2-demo、harness2-judge/-report）が harness2.core を動かす。core では schedule がタスクごとに k 回の共有ベースロールアウトを実行し、タスクレベルの再帰が c1..c8 のハーネスツリーと正解を含まない証拠ツリーを使って Propose・Probe・Compose を行い、selection が k 個の最終候補から 1 つを盲目的に選んで振り返る。採用されたハーネスと教訓はドメイン別ライブラリに入り、次のタスクを導く。core は実行・評価側を呼び出す。ベンチマークアダプタ（JobBench、LAB、WorkBuddy-Bench）がサブストレート（OpenCode または Codex CLI）上でロールアウトを起動し、サブストレートは Vertex AI のモデル（実行器・採点用の Gemini、改善用の Claude または Gemini）を呼ぶ。出力は runs/ に保存される。" width="100%">
+    <img src="assets/architecture/architecture-light.svg" alt="Harness² のアーキテクチャ図。CLI（harness2-setup/-check、harness2、harness2-demo、harness2-judge/-report）が harness2.core を動かす。core では schedule がタスクごとに k 回の共有ベースロールアウトを実行し、タスクレベルの再帰が c1..c8 のハーネスツリーと正解を含まない証拠ツリーを使って Propose・Probe・Compose を行い、selection が k 個の最終候補から 1 つを盲目的に選んで振り返る。採用されたハーネスと教訓はドメイン別ライブラリ（MemoryConnector。既定は FileConnector で、ほかのコネクターに差し替えられる）に入り、次のタスクを導く。core は実行・評価側を呼び出す。ベンチマークアダプタ（JobBench、LAB、WorkBuddy-Bench）がサブストレート（OpenCode または Codex CLI）上でロールアウトを起動し、サブストレートは Vertex AI のモデル（実行器・採点用の Gemini、改善用の Claude または Gemini）を呼ぶ。出力は runs/ に保存される。" width="100%">
   </picture>
 </p>
 
