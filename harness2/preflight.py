@@ -25,6 +25,21 @@ from .install import PATCHES, missing_runners
 from .substrate.opencode import OpencodeSubstrate
 
 
+def _needs_adc(*, judge: bool, bench: str) -> bool:
+    """Whether this run needs Google Application Default Credentials."""
+    executor = config.route("executor.oc").model
+    improver = config.route("improver.opencode").model
+    # The bare judge ID (judge.jb and judge.lab carry it with a provider prefix).
+    judge_model = config.route("judge.wb").model
+    # The selected improver route; an unknown channel is validate_models()'s error to report.
+    selected = config.ROLES.get(f"improver.{config.DEFAULT_PROPOSER_CHANNEL}")
+    return (
+        any(m.startswith("google-vertex") for m in (executor, improver))
+        or (selected is not None and selected.provider == "claude-code-vertex")
+        or (judge and (bench == "wb" or judge_model.startswith(("claude", "gemini"))))
+    )
+
+
 def check(adapter, *, judge=False) -> list[str]:
     missing = missing_runners()
     if missing:
@@ -77,12 +92,9 @@ def check(adapter, *, judge=False) -> list[str]:
         errors.append(f"OpenCode dependencies missing; run harness2-setup {bench}")
 
     executor = config.route("executor.oc").model
-    improver = config.route("improver.opencode").model
     # The bare judge ID (judge.jb and judge.lab carry it with a provider prefix).
     judge_model = config.route("judge.wb").model
-    if any(m.startswith("google-vertex") for m in (executor, improver)) or (
-        judge and (bench == "wb" or judge_model.startswith(("claude", "gemini")))
-    ):
+    if _needs_adc(judge=judge, bench=bench):
         probe(
             "Google Application Default Credentials",
             ["gcloud", "auth", "application-default", "print-access-token"],

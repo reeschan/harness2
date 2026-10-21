@@ -68,7 +68,14 @@ print(json.dumps({
 """
 
 
-def load(values):
+ADC_CHILD = """
+import json, sys
+from harness2 import preflight
+print(json.dumps(preflight._needs_adc(judge=sys.argv[1] == "1", bench=sys.argv[2])))
+"""
+
+
+def run_child(values, code, *args):
     env = {
         k: v
         for k, v in os.environ.items()
@@ -79,7 +86,7 @@ def load(values):
     env["PYTHONPATH"] = str(REPO)
     with tempfile.TemporaryDirectory() as cwd:
         proc = subprocess.run(
-            [sys.executable, "-c", CHILD],
+            [sys.executable, "-c", code, *args],
             env=env,
             cwd=cwd,
             capture_output=True,
@@ -89,6 +96,14 @@ def load(values):
     if proc.returncode != 0:
         raise AssertionError(proc.stderr)
     return json.loads(proc.stdout)
+
+
+def load(values):
+    return run_child(values, CHILD)
+
+
+def needs_adc(values, *, judge, bench):
+    return run_child(values, ADC_CHILD, "1" if judge else "0", bench)
 
 
 class ImproverChannelTests(unittest.TestCase):
@@ -110,11 +125,48 @@ class ImproverChannelTests(unittest.TestCase):
                 "HARNESS2_SOLVER_MODEL": "prov/model-a",
                 "HARNESS2_IMPROVER_CHANNEL": "claude_cli",
                 "HARNESS2_IMPROVER_MODEL": "model-q",
+                "GOOGLE_CLOUD_PROJECT": "proj-x",
             }
         )
         self.assertEqual(snap["channel"], "claude_cli")
         self.assertEqual(snap["resolve"], {"ok": ["claude_cli", "model-q"]})
         self.assertEqual(snap["validate"], {"ok": True})
+
+    def test_claude_cli_needs_vertex_project(self):
+        base = {
+            "HARNESS2_SOLVER_MODEL": "prov/model-a",
+            "HARNESS2_IMPROVER_CHANNEL": "claude_cli",
+            "HARNESS2_IMPROVER_MODEL": "model-q",
+        }
+        snap = load(base)
+        self.assertEqual(snap["validate"]["error"], "ConfigError")
+        self.assertIn("GOOGLE_CLOUD_PROJECT", snap["validate"]["message"])
+        for name in ("GOOGLE_CLOUD_PROJECT", "HARNESS2_VERTEX_PROJECT"):
+            with self.subTest(project_env=name):
+                snap = load({**base, name: "proj-x"})
+                self.assertEqual(snap["validate"], {"ok": True})
+
+    def test_preflight_needs_adc_for_claude_cli(self):
+        cases = (
+            # (environment, judge, bench, expected)
+            ({"HARNESS2_SOLVER_MODEL": "prov/model-a"}, False, "jb", False),
+            ({"HARNESS2_SOLVER_MODEL": "prov/model-a"}, False, "lab", False),
+            ({"HARNESS2_SOLVER_MODEL": "google-vertex/model-a"}, False, "jb", True),
+            (
+                {
+                    "HARNESS2_SOLVER_MODEL": "prov/model-a",
+                    "HARNESS2_IMPROVER_CHANNEL": "claude_cli",
+                    "HARNESS2_IMPROVER_MODEL": "model-q",
+                },
+                False,
+                "jb",
+                True,
+            ),
+            ({"HARNESS2_SOLVER_MODEL": "prov/model-a"}, True, "wb", True),
+        )
+        for values, judge, bench, expected in cases:
+            with self.subTest(values=values, judge=judge, bench=bench):
+                self.assertIs(needs_adc(values, judge=judge, bench=bench), expected)
 
     def test_claude_cli_rejects_provider_prefixed_model(self):
         snap = load(

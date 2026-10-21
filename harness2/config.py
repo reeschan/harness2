@@ -271,6 +271,11 @@ def validate_models(*, judge: bool = False) -> None:
                 "The claude_cli improver channel takes a bare model ID without a provider "
                 "prefix in HARNESS2_IMPROVER_MODEL"
             )
+        if not VERTEX_PROJECT:
+            raise ConfigError(
+                "Set GOOGLE_CLOUD_PROJECT for the claude_cli improver channel "
+                "(Claude Code on Vertex AI)"
+            )
     if any(m.startswith("google-vertex") for m in (SOLVER_MODEL_OC, IMPROVER_MODEL)):
         if not VERTEX_PROJECT:
             raise ConfigError("Set GOOGLE_CLOUD_PROJECT for Vertex AI")
