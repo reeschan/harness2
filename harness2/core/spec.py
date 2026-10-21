@@ -68,7 +68,10 @@ def resolve_channel_model(
     if kind not in CHANNELS:
         raise ValueError(f"unknown channel {kind!r}; expected one of {CHANNELS}")
     if model is None:
-        model = config.PROPOSER_MODEL_BY_CHANNEL[kind]
+        # The dict wins when it holds the channel (tests patch it); otherwise the role table.
+        model = config.PROPOSER_MODEL_BY_CHANNEL.get(kind)
+        if model is None:
+            model = config.route(f"improver.{kind}").model
     if not model.strip():
         if use_default:
             return ChannelSpec(kind, "", effort=effort, steps=steps, timeout=timeout)
@@ -80,8 +83,8 @@ def resolve_channel_model(
         )
     if kind == "claude_cli" and "/" in model:
         raise ValueError(
-            f"claude_cli channel takes a bare Anthropic id "
-            f"(e.g. {config.PROPOSER_MODEL_BY_CHANNEL['claude_cli']!r}), got {model!r}"
+            f"claude_cli channel takes a bare model id without a provider prefix "
+            f"in HARNESS2_IMPROVER_MODEL, got {model!r}"
         )
     return ChannelSpec(kind, model, effort=effort, steps=steps, timeout=timeout)
 

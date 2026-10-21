@@ -150,12 +150,11 @@ def overlays(name: str, *, dry_run=False):
 
 def workbuddy_models(*, dry_run=False):
     """Generate the two Vertex routes from the user's model IDs, never credentials."""
-    solver = config.SOLVER_MODEL_OC.removeprefix("google-vertex/")
-    judge = config.JUDGE_MODEL
+    executor = config.route("executor.oc").model
+    solver = executor.removeprefix("google-vertex/")
+    judge = config.route("judge.wb").model
     problem = ""
-    if not config.SOLVER_MODEL_OC.startswith("google-vertex/gemini") or not judge.startswith(
-        "gemini"
-    ):
+    if not executor.startswith("google-vertex/gemini") or not judge.startswith("gemini"):
         problem = (
             "WorkBuddy setup requires a google-vertex/gemini... executor "
             "and a gemini... judge; choose IDs available in your project"
@@ -235,11 +234,12 @@ CODEX_PROVIDER = "harness2"
 
 def configure_codex(*, dry_run=False):
     config.require("HARNESS2_CODEX_BASE_URL", needed_by="Codex setup")
+    executor = config.route("executor.cx")
     body = (
-        f"model = {json.dumps(config.SOLVER_MODEL_CX)}\n"
+        f"model = {json.dumps(executor.model)}\n"
         f"model_provider = {json.dumps(CODEX_PROVIDER)}\n"
         f'[model_providers.{CODEX_PROVIDER}]\nname = "Configured Responses endpoint"\n'
-        f"base_url = {json.dumps(config.CODEX_BASE_URL)}\n"
+        f"base_url = {json.dumps(executor.endpoint)}\n"
         'wire_api = "responses"\nenv_key = "VERTEX_PROXY_KEY"\n'
     )
     if not dry_run:
@@ -269,11 +269,12 @@ def codex_config_error() -> str | None:
         return f"{path} is not valid TOML ({exc}); {CODEX_CONFIG_REMEDY}"
     provider = data.get("model_provider")
     block = (data.get("model_providers") or {}).get(provider) or {}
+    executor = config.route("executor.cx")
     stale = [
         f"{key} is {found!r}, configuration says {want!r}"
         for key, want, found in (
-            ("base_url", config.CODEX_BASE_URL, block.get("base_url")),
-            ("model", config.SOLVER_MODEL_CX, data.get("model")),
+            ("base_url", executor.endpoint, block.get("base_url")),
+            ("model", executor.model, data.get("model")),
         )
         if found != want
     ]
