@@ -16,9 +16,12 @@
 
 `WorktreeLauncher.launch` makes `run_dir/worktree/` a worktree of the source repository
 (`core.worktree.prepare_worktree`), runs the agent there, and writes the diff from the base
-commit to `workspace/output/changes.diff` (nothing when the agent changed nothing). The
-worktree stays until `cleanup()`: the verification and `apply_back` read it later. Nothing
-goes back to the source here.
+commit to `workspace/output/changes.diff` (nothing when the agent changed nothing). Paths in
+`exclude` (relative to the source root) are left out of that diff, and the environment
+variables named in `scrub_env` are removed from what the agent receives; both come from the
+caller (the task connector's capabilities), the launcher names none of its own. The worktree
+stays until `cleanup()`: the verification and `apply_back` read it later. Nothing goes back
+to the source here.
 
 `OpencodeAgent` is the real agent: OpenCode (the substrate's reference argv and env) run with
 the worktree as its directory. The harness is carried in the prompt, never as files in the
@@ -31,14 +34,11 @@ import os
 import signal
 import subprocess
 from pathlib import Path
-from typing import Mapping, Protocol, runtime_checkable
+from typing import Iterable, Mapping, Protocol, Sequence, runtime_checkable
 
 from ..core import worktree
 from ..substrate.base import Install
 from ..substrate.opencode import OpencodeSubstrate, compose_prompt
-
-# Environment variables an agent's child process never receives.
-SCRUB_ENV = ("TYPESAFE_API_KEY",)
 
 WORKTREE_PREAMBLE = (
     "Your working directory is a git worktree of the repository. Make your changes directly "
@@ -71,14 +71,12 @@ class AgentRunner(Protocol):
 
 def _prune(source: Path) -> None:
     """`git worktree prune` in `source`: forget worktrees whose directory is gone."""
-    env = dict(os.environ)
-    env["GIT_TERMINAL_PROMPT"] = "0"
     proc = subprocess.run(
         ["git", "-C", str(source), "worktree", "prune"],
         capture_output=True,
         text=True,
         check=False,
-        env=env,
+        env=worktree.git_env(),
     )
     if proc.returncode != 0:
         raise worktree.WorktreeError(
@@ -86,17 +84,32 @@ def _prune(source: Path) -> None:
         )
 
 
-def _scrubbed(env: Mapping[str, str]) -> dict[str, str]:
-    return {k: v for k, v in env.items() if k not in SCRUB_ENV}
+def _scrubbed(env: Mapping[str, str], names: frozenset[str]) -> dict[str, str]:
+    return {k: v for k, v in env.items() if k not in names}
 
 
 class WorktreeLauncher:
-    """The intake Launcher for tasks that change the `source` git repository."""
+    """The intake Launcher for tasks that change the `source` git repository.
 
-    def __init__(self, source: Path, agent: AgentRunner, *, env: Mapping[str, str] | None = None):
+    `env` is the environment handed to the agent (`os.environ` when None), less the names in
+    `scrub_env`. `exclude` lists paths, relative to the source root, left out of the diff.
+    By default nothing is removed and nothing is left out.
+    """
+
+    def __init__(
+        self,
+        source: Path,
+        agent: AgentRunner,
+        *,
+        env: Mapping[str, str] | None = None,
+        exclude: Sequence[str] = (),
+        scrub_env: Iterable[str] = (),
+    ):
         self.source = Path(source)
         self.agent = agent
         self.env = env
+        self.exclude = tuple(exclude)
+        self.scrub_env = frozenset(scrub_env)
         self.created: list[Path] = []
 
     def launch(
@@ -119,7 +132,7 @@ class WorktreeLauncher:
         base = worktree.prepare_worktree(self.source, wt)
         if wt not in self.created:
             self.created.append(wt)
-        env = _scrubbed(os.environ if self.env is None else self.env)
+        env = _scrubbed(os.environ if self.env is None else self.env, self.scrub_env)
         self.agent.run(
             worktree=wt,
             prompt=WORKTREE_PREAMBLE + "\n\n" + prompt,
@@ -128,7 +141,9 @@ class WorktreeLauncher:
             timeout=timeout,
             env=env,
         )
-        worktree.collect_diff(wt, base, Path(workspace) / "output" / worktree.DIFF_NAME)
+        worktree.collect_diff(
+            wt, base, Path(workspace) / "output" / worktree.DIFF_NAME, exclude=self.exclude
+        )
 
     def cleanup(self) -> None:
         """Remove every worktree this launcher made; calling it again is harmless."""
@@ -198,6 +213,10 @@ class OpencodeAgent:
                 except subprocess.TimeoutExpired as exc:
                     _kill_group(proc)
                     raise TimeoutError(f"opencode did not finish within {timeout}s") from exc
+                except BaseException:
+                    # KeyboardInterrupt and the like: the process group must not outlive us.
+                    _kill_group(proc)
+                    raise
             if rc != 0:
                 raise RuntimeError(f"opencode exited with status {rc}")
         finally:
@@ -215,7 +234,6 @@ class OpencodeAgent:
 __all__ = [
     "AgentRunner",
     "OpencodeAgent",
-    "SCRUB_ENV",
     "WORKTREE_PREAMBLE",
     "WorktreeLauncher",
 ]

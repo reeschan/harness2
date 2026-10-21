@@ -14,36 +14,44 @@
 
 """Git worktrees for code-change tasks: prepare one, take its diff, apply a diff back.
 
-A code-change (PBI) rollout works in its own git worktree of the source repository. The layout
-of one run (`run_dir`) is:
+A code-change rollout works in its own git worktree of the source repository. The layout of
+one run (`run_dir`) is:
 
 - `run_dir/worktree/`: a detached worktree of the source. The agent works here.
 - `run_dir/workspace/output/changes.diff`: the diff from the base commit (`git diff --binary`,
-  without `docs/pbi/`). It is not written when nothing changed.
+  without the paths the caller passes as `exclude`). It is not written when nothing changed.
 
 The base commit is the source HEAD plus the tracked uncommitted changes (`git stash create`)
-plus the untracked, not ignored files (including `docs/pbi/`), committed once inside the
-worktree. So the verification tools under `docs/pbi/tools/` work in the worktree too, and
-never show up in the diff.
+plus the untracked, not ignored files, committed once inside the worktree. So files the
+caller keeps out of version control (its own tools, for example) are in the worktree too; the
+caller keeps them out of the diff with `exclude` (paths relative to the source root).
 
-Only the chosen run's diff goes back to the source (`apply_back`), after the PBI's untouched
-files in the worktree are checked. The check runs the source's `docs/pbi/tools/unchanged.py`
-against the source's record (`--dir <source>/docs/pbi`), never the copies inside the worktree:
-the agent can rewrite those, and `docs/pbi/` never shows up in the diff. The source's index and
-commits are never touched. Git runs without a shell.
+Only the chosen run's diff goes back to the source (`apply_back`). Before it is applied, the
+caller's `guard` sees the worktree and the source and can refuse with a reason. A guard should
+trust only what it reads from the source: the agent can rewrite anything in the worktree. The
+source's index and commits are never touched.
+
+Git runs without a shell and with `git_env()`: the repository location variables of the
+caller's environment are dropped, so every command talks to the repository it names. A
+worktree shares the source's hooks, so the commands this module runs to make and fill a
+worktree run with `core.hooksPath` pointed at an empty directory.
 """
 
 from __future__ import annotations
 
+import contextlib
 import os
 import shutil
 import subprocess
-import sys
+import tempfile
+from collections.abc import Callable, Iterator, Sequence
 from pathlib import Path
 
 WORKTREE_DIRNAME = "worktree"
 DIFF_NAME = "changes.diff"
-EXCLUDE = ("docs/pbi",)
+
+Guard = Callable[[Path, Path], str | None]
+"""Called with (worktree, source) before a diff goes back: None to go on, or the reason not to."""
 
 _IDENTITY = (
     "-c",
@@ -54,14 +62,30 @@ _IDENTITY = (
     "commit.gpgsign=false",
 )
 _STDERR_TAIL = 2000
+_LOCATION_VARS = (
+    "GIT_DIR",
+    "GIT_WORK_TREE",
+    "GIT_COMMON_DIR",
+    "GIT_INDEX_FILE",
+    "GIT_OBJECT_DIRECTORY",
+    "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+    "GIT_PREFIX",
+)
 
 
 class WorktreeError(RuntimeError):
-    """A git command or the unchanged check failed."""
+    """A git command failed, or the guard refused the diff."""
 
 
-def _env() -> dict[str, str]:
+def git_env() -> dict[str, str]:
+    """A copy of `os.environ` for running git: no repository location variables, no prompts.
+
+    `GIT_DIR`, `GIT_WORK_TREE` and the like (set, for example, when running inside a git hook)
+    would make git ignore `-C` and work on another repository, so they are dropped.
+    """
     env = dict(os.environ)
+    for name in _LOCATION_VARS:
+        env.pop(name, None)
     env["GIT_TERMINAL_PROMPT"] = "0"
     return env
 
@@ -72,7 +96,7 @@ def _fail(cmd: list[str], rc: int, stderr: str) -> WorktreeError:
 
 def _git(*args: str, cwd: Path | None = None) -> str:
     cmd = ["git", *args]
-    proc = subprocess.run(cmd, capture_output=True, text=True, check=False, cwd=cwd, env=_env())
+    proc = subprocess.run(cmd, capture_output=True, text=True, check=False, cwd=cwd, env=git_env())
     if proc.returncode != 0:
         raise _fail(cmd, proc.returncode, proc.stderr)
     return proc.stdout
@@ -81,18 +105,37 @@ def _git(*args: str, cwd: Path | None = None) -> str:
 def _git_bytes(*args: str) -> bytes:
     """Like `_git` but keeps stdout as bytes (a diff may hold text that is not UTF-8)."""
     cmd = ["git", *args]
-    proc = subprocess.run(cmd, capture_output=True, check=False, env=_env())
+    proc = subprocess.run(cmd, capture_output=True, check=False, env=git_env())
     if proc.returncode != 0:
         raise _fail(cmd, proc.returncode, proc.stderr.decode("utf-8", "replace"))
     return proc.stdout
 
 
-def _pathspec() -> list[str]:
-    return ["--", ".", *(f":(exclude){p}" for p in EXCLUDE)]
+@contextlib.contextmanager
+def _no_hooks() -> Iterator[tuple[str, str]]:
+    """Git options pointing `core.hooksPath` at an empty directory, removed afterwards."""
+    empty = tempfile.mkdtemp(prefix="harness2-nohooks-")
+    try:
+        yield ("-c", f"core.hooksPath={empty}")
+    finally:
+        shutil.rmtree(empty, ignore_errors=True)
+
+
+def _pathspec(exclude: Sequence[str]) -> list[str]:
+    return ["--", ".", *(f":(exclude){p}" for p in exclude)]
 
 
 def _z_names(out: str) -> list[str]:
     return sorted({n for n in out.split("\0") if n})
+
+
+def _discard(source: Path, dest: Path) -> None:
+    """Best effort: remove and unregister a half-made worktree. Never raises."""
+    with contextlib.suppress(Exception):
+        _git("-C", str(source), "worktree", "remove", "--force", str(dest))
+    shutil.rmtree(dest, ignore_errors=True)
+    with contextlib.suppress(Exception):
+        _git("-C", str(source), "worktree", "prune")
 
 
 def prepare_worktree(source: Path, dest: Path) -> str:
@@ -100,6 +143,8 @@ def prepare_worktree(source: Path, dest: Path) -> str:
 
     The base commit carries the source HEAD, the tracked uncommitted changes and the untracked,
     not ignored files. The source's index, HEAD, working tree and stash list stay as they are.
+    No hooks run. When a step after `git worktree add` fails, the worktree is removed and
+    unregistered before the error is raised.
     """
     source = Path(source)
     dest = Path(dest)
@@ -114,8 +159,18 @@ def prepare_worktree(source: Path, dest: Path) -> str:
 
     rev = _git("-C", str(source), "stash", "create").strip() or "HEAD"
     dest.parent.mkdir(parents=True, exist_ok=True)
-    _git("-C", str(source), "worktree", "add", "--detach", str(dest), rev)
+    with _no_hooks() as no_hooks:
+        _git(*no_hooks, "-C", str(source), "worktree", "add", "--detach", str(dest), rev)
+        try:
+            _fill(source, dest, no_hooks)
+            return _git("-C", str(dest), "rev-parse", "HEAD").strip()
+        except BaseException:
+            _discard(source, dest)
+            raise
 
+
+def _fill(source: Path, dest: Path, no_hooks: Sequence[str]) -> None:
+    """Copy the source's untracked, not ignored files into `dest` and commit them there."""
     listed = _git("-C", str(source), "ls-files", "--others", "--exclude-standard", "-z")
     dest_abs = Path(os.path.abspath(dest))
     for rel in listed.split("\0"):
@@ -130,9 +185,10 @@ def prepare_worktree(source: Path, dest: Path) -> str:
         target.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(src_file, target)
 
-    _git("-C", str(dest), "add", "-A")
+    _git(*no_hooks, "-C", str(dest), "add", "-A")
     _git(
         *_IDENTITY,
+        *no_hooks,
         "-C",
         str(dest),
         "commit",
@@ -141,24 +197,28 @@ def prepare_worktree(source: Path, dest: Path) -> str:
         "-m",
         "harness2 intake base",
     )
-    return _git("-C", str(dest), "rev-parse", "HEAD").strip()
 
 
-def collect_diff(worktree: Path, base_rev: str, out: Path) -> list[str]:
-    """Write the worktree's changes since `base_rev` (without `EXCLUDE`) to `out`.
+def collect_diff(
+    worktree: Path, base_rev: str, out: Path, *, exclude: Sequence[str] = ()
+) -> list[str]:
+    """Write the worktree's changes since `base_rev` to `out`, leaving out `exclude`.
 
-    Returns the changed paths, sorted. When nothing changed, `out` is not written and the
-    result is `[]`.
+    `exclude` holds paths relative to the worktree root (files or directories); changes under
+    them are not in the diff. By default every change is. Returns the changed paths, sorted.
+    When nothing changed, `out` is not written and the result is `[]`.
     """
     wt = str(worktree)
-    _git("-C", wt, "add", "-A")
-    diff = _git_bytes("-C", wt, "diff", "--cached", "--binary", base_rev, *_pathspec())
+    spec = _pathspec(exclude)
+    with _no_hooks() as no_hooks:
+        _git(*no_hooks, "-C", wt, "add", "-A")
+    diff = _git_bytes("-C", wt, "diff", "--cached", "--binary", base_rev, *spec)
     if not diff:
         return []
     out = Path(out)
     out.parent.mkdir(parents=True, exist_ok=True)
     out.write_bytes(diff)
-    names = _git("-C", wt, "diff", "--cached", "--name-only", "-z", base_rev, *_pathspec())
+    names = _git("-C", wt, "diff", "--cached", "--name-only", "-z", base_rev, *spec)
     return _z_names(names)
 
 
@@ -184,20 +244,26 @@ def _diff_paths(source: Path, diff: Path) -> list[str]:
     return sorted(set(paths))
 
 
-def _forbidden(path: str) -> bool:
+def _forbidden(path: str, exclude: Sequence[str]) -> bool:
     if path.startswith("/") or "\\" in path or ".." in path.split("/"):
         return True
-    return any(path == p or path.startswith(p + "/") for p in EXCLUDE)
+    prefixes = [p.strip("/") for p in exclude]
+    return any(path == p or path.startswith(p + "/") for p in prefixes if p)
 
 
-def apply_back(source: Path, run_dir: Path, *, unchanged_name: str | None) -> list[str]:
+def apply_back(
+    source: Path,
+    run_dir: Path,
+    *,
+    guard: Guard | None = None,
+    exclude: Sequence[str] = (),
+) -> list[str]:
     """Apply the run's diff to the source's working tree; return the changed paths, sorted.
 
-    When `unchanged_name` is given, the worktree's untouched files must pass the check first:
-    the source's `docs/pbi/tools/unchanged.py` runs with the worktree as cwd and the source's
-    `docs/pbi` as `--dir`, so it compares the worktree's files with the hashes recorded in the
-    source. The copies of the script and the record inside the worktree are not used. On any
-    failure the source is left as it was.
+    When `guard` is given, it is called first with the worktree and the source paths. If it
+    returns a string, `WorktreeError` is raised with that reason; if it raises, the exception
+    goes up as it is. A diff that touches a path outside the source, or a path under
+    `exclude`, is refused too. On any failure the source is left as it was.
     """
     source = Path(source)
     run_dir = Path(run_dir)
@@ -210,33 +276,14 @@ def apply_back(source: Path, run_dir: Path, *, unchanged_name: str | None) -> li
     if not diff.is_file():
         raise WorktreeError(f"no diff at {diff}")
 
-    if unchanged_name is not None:
-        script = source / "docs" / "pbi" / "tools" / "unchanged.py"
-        if not script.is_file():
-            raise WorktreeError(f"no unchanged.py in the source: {script}")
-        # `--dir` is an option of the top-level parser, so it goes before the subcommand.
-        cmd = [
-            sys.executable,
-            str(script.resolve()),
-            "--dir",
-            str((source / "docs" / "pbi").resolve()),
-            "check",
-            unchanged_name,
-        ]
-        proc = subprocess.run(
-            cmd, capture_output=True, text=True, check=False, cwd=worktree, env=_env()
-        )
-        if proc.returncode != 0:
-            changed = [ln for ln in proc.stdout.splitlines() if ln.startswith("changed ")]
-            detail = "; ".join(changed) or proc.stdout[-_STDERR_TAIL:]
-            raise WorktreeError(
-                f"{' '.join(cmd)} failed (exit {proc.returncode}): {detail} "
-                f"{proc.stderr[-_STDERR_TAIL:]}".rstrip()
-            )
+    if guard is not None:
+        reason = guard(worktree, source)
+        if reason is not None:
+            raise WorktreeError(reason)
 
     diff_abs = str(diff.resolve())
     paths = _diff_paths(source, diff.resolve())
-    bad = [p for p in paths if _forbidden(p)]
+    bad = [p for p in paths if _forbidden(p, exclude)]
     if bad:
         raise WorktreeError(f"the diff touches paths it must not: {', '.join(bad)}")
 

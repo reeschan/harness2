@@ -14,8 +14,6 @@
 
 """core.worktree on real git repositories under a temporary directory."""
 
-import hashlib
-import json
 import os
 import shutil
 import subprocess
@@ -29,19 +27,17 @@ from harness2.core.worktree import WorktreeError
 
 BINARY = bytes(range(256)) * 4
 
-# The real checker, copied into each test source repository.
-REAL_UNCHANGED = Path(__file__).resolve().parents[1] / "docs" / "pbi" / "tools" / "unchanged.py"
-
-
-def sha(data):
-    return hashlib.sha256(data).hexdigest()
-
-
-def write_record(pbi_dir, name, hashes):
-    """Write `<pbi_dir>/verify/<name>.unchanged.json` as unchanged.py's save does."""
-    rec = pbi_dir / "verify" / f"{name}.unchanged.json"
-    rec.parent.mkdir(parents=True, exist_ok=True)
-    rec.write_text(json.dumps(hashes), encoding="utf-8")
+# Repository location variables that would send git to another repository (set, for example,
+# when the tests run from inside a git hook).
+GIT_LOCATION_VARS = (
+    "GIT_DIR",
+    "GIT_WORK_TREE",
+    "GIT_COMMON_DIR",
+    "GIT_INDEX_FILE",
+    "GIT_OBJECT_DIRECTORY",
+    "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+    "GIT_PREFIX",
+)
 
 
 def git(cwd, *args):
@@ -71,6 +67,8 @@ class WorktreeTestBase(unittest.TestCase):
         )
         env.start()
         self.addCleanup(env.stop)
+        for name in GIT_LOCATION_VARS:
+            os.environ.pop(name, None)  # restored by env.stop
         self.tmp = Path(tempfile.mkdtemp())
         self.addCleanup(shutil.rmtree, self.tmp, True)
         self.src = self.tmp / "src"
@@ -83,21 +81,18 @@ class WorktreeTestBase(unittest.TestCase):
         (self.src / ".gitignore").write_text("ignored.log\n")
         git(self.src, "add", "-A")
         git(self.src, "commit", "-q", "-m", "init")
-        # Uncommitted work: a tracked change and untracked files, including docs/pbi/.
+        # Uncommitted work: a tracked change and untracked files, including scratch/.
         (self.src / "a.txt").write_text("alpha changed\n")
         (self.src / "new.txt").write_text("untracked\n")
-        tools = self.src / "docs" / "pbi" / "tools"
-        tools.mkdir(parents=True)
-        (tools / "x.py").write_text("print('x')\n")
-        shutil.copyfile(REAL_UNCHANGED, tools / "unchanged.py")
-        # GOOD guards keep.txt (left alone by the agent); BAD guards a.txt (the agent edits it).
-        pbi = self.src / "docs" / "pbi"
-        write_record(pbi, "GOOD", {"keep.txt": sha(b"keep\n")})
-        write_record(pbi, "BAD", {"a.txt": sha(b"alpha changed\n")})
+        (self.src / "scratch").mkdir()
+        (self.src / "scratch" / "x.txt").write_text("x\n")
         (self.src / "ignored.log").write_text("noise\n")
         self.run_dir = self.tmp / "run"
         self.wt = self.run_dir / wt.WORKTREE_DIRNAME
         self.diff = self.run_dir / "workspace" / "output" / wt.DIFF_NAME
+
+    def listed(self, repo):
+        return git(repo, "worktree", "list", "--porcelain")
 
 
 class PrepareTest(WorktreeTestBase):
@@ -106,7 +101,7 @@ class PrepareTest(WorktreeTestBase):
         self.assertEqual(len(base), 40)
         self.assertEqual((self.wt / "a.txt").read_text(), "alpha changed\n")
         self.assertEqual((self.wt / "new.txt").read_text(), "untracked\n")
-        self.assertEqual((self.wt / "docs/pbi/tools/x.py").read_text(), "print('x')\n")
+        self.assertEqual((self.wt / "scratch/x.txt").read_text(), "x\n")
         self.assertEqual((self.wt / "bin.dat").read_bytes(), BINARY)
         self.assertEqual(git(self.wt, "rev-parse", "HEAD").strip(), base)
         self.assertEqual(git(self.wt, "status", "--porcelain"), "")
@@ -123,10 +118,112 @@ class PrepareTest(WorktreeTestBase):
 
     def test_rejects_non_root_and_existing_dest(self):
         with self.assertRaises(WorktreeError):
-            wt.prepare_worktree(self.src / "docs", self.wt)
+            wt.prepare_worktree(self.src / "scratch", self.wt)
         self.wt.mkdir(parents=True)
         with self.assertRaises(WorktreeError):
             wt.prepare_worktree(self.src, self.wt)
+
+
+class HooksTest(WorktreeTestBase):
+    def test_source_hooks_do_not_run(self):
+        hooks = self.src / ".git" / "hooks"
+        hooks.mkdir(parents=True, exist_ok=True)
+        marks = {}
+        for name in ("pre-commit", "post-checkout"):
+            marks[name] = self.tmp / f"ran-{name}"
+            hook = hooks / name
+            hook.write_text(f"#!/bin/sh\necho ran > '{marks[name]}'\nexit 1\n")
+            hook.chmod(0o755)
+
+        base = wt.prepare_worktree(self.src, self.wt)
+        (self.wt / "a.txt").write_text("alpha by agent\n")
+        self.assertEqual(wt.collect_diff(self.wt, base, self.diff), ["a.txt"])
+        for name, mark in marks.items():
+            self.assertFalse(mark.exists(), name)
+
+        # Control: the hooks are live for a plain commit in the source.
+        proc = subprocess.run(
+            ["git", "-c", "user.name=t", "-c", "user.email=t@t", "commit", "--allow-empty"]
+            + ["-q", "-m", "x"],
+            cwd=self.src,
+            capture_output=True,
+            check=False,
+        )
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertTrue(marks["pre-commit"].exists())
+
+
+class CleanupTest(WorktreeTestBase):
+    def failing_git(self, *fail_on):
+        real = wt._git
+
+        def run(*args, **kwargs):
+            for word, message in fail_on:
+                if word in args:
+                    raise WorktreeError(message)
+            return real(*args, **kwargs)
+
+        return run
+
+    def assert_gone(self):
+        self.assertFalse(self.wt.exists())
+        self.assertNotIn(str(self.run_dir.resolve()), self.listed(self.src))
+        self.assertNotIn(str(self.run_dir), self.listed(self.src))
+
+    def test_failure_after_add_removes_worktree(self):
+        fake = self.failing_git(("commit", "commit boom"))
+        with mock.patch.object(wt, "_git", side_effect=fake):
+            with self.assertRaises(WorktreeError) as cm:
+                wt.prepare_worktree(self.src, self.wt)
+        self.assertIn("commit boom", str(cm.exception))
+        self.assert_gone()
+        # The path is free again.
+        wt.prepare_worktree(self.src, self.wt)
+        self.assertTrue((self.wt / "new.txt").is_file())
+
+    def test_failed_cleanup_keeps_original_error(self):
+        fake = self.failing_git(
+            ("commit", "commit boom"), ("remove", "remove boom"), ("prune", "prune boom")
+        )
+        with mock.patch.object(wt, "_git", side_effect=fake):
+            with self.assertRaises(WorktreeError) as cm:
+                wt.prepare_worktree(self.src, self.wt)
+        self.assertIn("commit boom", str(cm.exception))
+        self.assertFalse(self.wt.exists())
+
+
+class GitEnvTest(WorktreeTestBase):
+    def test_drops_location_vars(self):
+        with mock.patch.dict(os.environ, {n: "/nowhere" for n in GIT_LOCATION_VARS}):
+            env = wt.git_env()
+        for name in GIT_LOCATION_VARS:
+            self.assertNotIn(name, env)
+        self.assertEqual(env["GIT_TERMINAL_PROMPT"], "0")
+
+    def test_works_on_the_named_repository(self):
+        other = self.tmp / "other"
+        other.mkdir()
+        git(other, "init", "-q", "-b", "main")
+        (other / "o.txt").write_text("other\n")
+        git(other, "add", "-A")
+        git(other, "commit", "-q", "-m", "other")
+        foreign = {
+            "GIT_DIR": str(other / ".git"),
+            "GIT_WORK_TREE": str(other),
+            "GIT_INDEX_FILE": str(other / ".git" / "index"),
+        }
+        with mock.patch.dict(os.environ, foreign):
+            base = wt.prepare_worktree(self.src, self.wt)
+            (self.wt / "a.txt").write_text("alpha by agent\n")
+            names = wt.collect_diff(self.wt, base, self.diff)
+            paths = wt.apply_back(self.src, self.run_dir)
+        self.assertEqual(names, ["a.txt"])
+        self.assertEqual(paths, ["a.txt"])
+        self.assertEqual((self.src / "a.txt").read_text(), "alpha by agent\n")
+        self.assertFalse((self.wt / "o.txt").exists())
+        self.assertIn(str(self.run_dir.resolve()), self.listed(self.src))
+        self.assertNotIn(str(self.run_dir.resolve()), self.listed(other))
+        self.assertEqual(git(other, "status", "--porcelain"), "")
 
 
 class CollectTest(WorktreeTestBase):
@@ -143,18 +240,28 @@ class CollectTest(WorktreeTestBase):
         (self.wt / "c.txt").write_text("brand new\n")
         (self.wt / "b.txt").unlink()
         (self.wt / "bin.dat").write_bytes(BINARY[::-1])
-        (self.wt / "docs/pbi/tools/x.py").write_text("print('edited')\n")
-        (self.wt / "docs/pbi/note.md").write_text("scratch\n")
         names = wt.collect_diff(self.wt, self.base, self.diff)
         self.assertEqual(names, ["a.txt", "b.txt", "bin.dat", "c.txt"])
-        text = self.diff.read_bytes().decode("utf-8", "replace")
-        self.assertIn("GIT binary patch", text)
-        self.assertNotIn("docs/pbi", text)
+        self.assertIn("GIT binary patch", self.diff.read_bytes().decode("utf-8", "replace"))
 
-    def test_only_docs_pbi_change_is_empty(self):
-        (self.wt / "docs/pbi/tools/x.py").write_text("print('edited')\n")
-        self.assertEqual(wt.collect_diff(self.wt, self.base, self.diff), [])
+    def test_exclude_keeps_paths_out(self):
+        (self.wt / "a.txt").write_text("alpha by agent\n")
+        (self.wt / "scratch/x.txt").write_text("edited\n")
+        (self.wt / "scratch/note.md").write_text("note\n")
+        names = wt.collect_diff(self.wt, self.base, self.diff, exclude=("scratch",))
+        self.assertEqual(names, ["a.txt"])
+        self.assertNotIn("scratch", self.diff.read_bytes().decode("utf-8", "replace"))
+
+    def test_only_excluded_change_is_empty(self):
+        (self.wt / "scratch/x.txt").write_text("edited\n")
+        self.assertEqual(wt.collect_diff(self.wt, self.base, self.diff, exclude=("scratch",)), [])
         self.assertFalse(self.diff.exists())
+
+    def test_default_excludes_nothing(self):
+        (self.wt / "a.txt").write_text("alpha by agent\n")
+        (self.wt / "scratch/x.txt").write_text("edited\n")
+        names = wt.collect_diff(self.wt, self.base, self.diff)
+        self.assertEqual(names, ["a.txt", "scratch/x.txt"])
 
 
 class ApplyBackTest(WorktreeTestBase):
@@ -175,58 +282,63 @@ class ApplyBackTest(WorktreeTestBase):
             files[p.relative_to(self.src).as_posix()] = p.read_bytes()
         return files, git(self.src, "rev-parse", "HEAD"), git(self.src, "diff", "--cached")
 
-    def test_applies_to_source(self):
-        head = git(self.src, "rev-parse", "HEAD")
-        paths = wt.apply_back(self.src, self.run_dir, unchanged_name="GOOD")
+    def assert_applied(self, paths):
         self.assertEqual(paths, self.names)
         self.assertEqual((self.src / "a.txt").read_text(), "alpha by agent\n")
         self.assertEqual((self.src / "c.txt").read_text(), "brand new\n")
         self.assertFalse((self.src / "b.txt").exists())
         self.assertEqual((self.src / "bin.dat").read_bytes(), BINARY[::-1])
+
+    def test_applies_to_source(self):
+        head = git(self.src, "rev-parse", "HEAD")
+        self.assert_applied(wt.apply_back(self.src, self.run_dir))
         self.assertEqual(git(self.src, "rev-parse", "HEAD"), head)
         self.assertEqual(git(self.src, "diff", "--cached"), "")
 
-    def test_failed_unchanged_check_keeps_source(self):
+    def test_guard_none_applies(self):
+        self.assert_applied(wt.apply_back(self.src, self.run_dir, guard=lambda w, s: None))
+
+    def test_guard_gets_worktree_and_source(self):
+        calls = []
+
+        def guard(worktree, source):
+            calls.append((worktree, source))
+            # Nothing is applied yet when the guard runs.
+            self.assertEqual((source / "a.txt").read_text(), "alpha changed\n")
+            return None
+
+        wt.apply_back(self.src, self.run_dir, guard=guard)
+        self.assertEqual(calls, [(self.wt, self.src)])
+
+    def test_guard_reason_keeps_source(self):
         before = self.snapshot()
         with self.assertRaises(WorktreeError) as cm:
-            wt.apply_back(self.src, self.run_dir, unchanged_name="BAD")
-        self.assertIn("changed a.txt", str(cm.exception))
+            wt.apply_back(self.src, self.run_dir, guard=lambda w, s: "keep.txt was touched")
+        self.assertEqual(str(cm.exception), "keep.txt was touched")
         self.assertEqual(self.snapshot(), before)
 
-    def test_check_uses_source_script_and_record(self):
-        # The agent changes an untouched file, then rewrites the worktree's copies of the
-        # record and of unchanged.py so that a check inside the worktree would pass.
-        (self.wt / "keep.txt").write_text("tampered\n")
-        write_record(self.wt / "docs" / "pbi", "GOOD", {"keep.txt": sha(b"tampered\n")})
-        (self.wt / "docs/pbi/tools/unchanged.py").write_text("raise SystemExit(0)\n")
-        self.diff.unlink()
-        self.assertIn("keep.txt", wt.collect_diff(self.wt, self.base, self.diff))
-        before = self.snapshot()
-        with self.assertRaises(WorktreeError) as cm:
-            wt.apply_back(self.src, self.run_dir, unchanged_name="GOOD")
-        self.assertIn("changed keep.txt", str(cm.exception))
-        self.assertEqual(self.snapshot(), before)
+    def test_guard_exception_goes_up_and_keeps_source(self):
+        def guard(worktree, source):
+            raise ValueError("guard broke")
 
-    def test_missing_source_script(self):
-        (self.src / "docs/pbi/tools/unchanged.py").unlink()
         before = self.snapshot()
-        with self.assertRaises(WorktreeError):
-            wt.apply_back(self.src, self.run_dir, unchanged_name="GOOD")
+        with self.assertRaises(ValueError):
+            wt.apply_back(self.src, self.run_dir, guard=guard)
         self.assertEqual(self.snapshot(), before)
 
     def test_conflict_keeps_source(self):
         (self.src / "a.txt").write_text("someone else\n")
         before = self.snapshot()
         with self.assertRaises(WorktreeError):
-            wt.apply_back(self.src, self.run_dir, unchanged_name="GOOD")
+            wt.apply_back(self.src, self.run_dir)
         self.assertEqual(self.snapshot(), before)
 
     def test_rejects_crafted_diff(self):
         crafted = {
-            "docs/pbi/evil.txt": "docs/pbi/evil.txt",
-            "../escape.txt": "escape.txt",
+            "../escape.txt": (self.tmp / "escape.txt", ()),
+            "scratch/evil.txt": (self.src / "scratch/evil.txt", ("scratch",)),
         }
-        for path, landing in crafted.items():
+        for path, (landing, exclude) in crafted.items():
             with self.subTest(path=path):
                 self.diff.write_text(
                     f"diff --git a/{path} b/{path}\n"
@@ -238,25 +350,18 @@ class ApplyBackTest(WorktreeTestBase):
                 )
                 before = self.snapshot()
                 with self.assertRaises(WorktreeError):
-                    wt.apply_back(self.src, self.run_dir, unchanged_name=None)
+                    wt.apply_back(self.src, self.run_dir, exclude=exclude)
                 self.assertEqual(self.snapshot(), before)
-                self.assertFalse((self.tmp / landing).exists())
-
-    def test_none_skips_check(self):
-        # A check would fail with this script; None must not run it.
-        (self.src / "docs/pbi/tools/unchanged.py").write_text("raise SystemExit(1)\n")
-        paths = wt.apply_back(self.src, self.run_dir, unchanged_name=None)
-        self.assertEqual(paths, self.names)
-        self.assertEqual((self.src / "a.txt").read_text(), "alpha by agent\n")
+                self.assertFalse(landing.exists())
 
     def test_missing_or_symlinked_diff(self):
         real = self.tmp / "real.diff"
         self.diff.rename(real)
         with self.assertRaises(WorktreeError):
-            wt.apply_back(self.src, self.run_dir, unchanged_name=None)
+            wt.apply_back(self.src, self.run_dir)
         self.diff.symlink_to(real)
         with self.assertRaises(WorktreeError):
-            wt.apply_back(self.src, self.run_dir, unchanged_name=None)
+            wt.apply_back(self.src, self.run_dir)
 
 
 class RemoveTest(WorktreeTestBase):

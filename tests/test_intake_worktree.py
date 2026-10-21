@@ -64,6 +64,16 @@ class FakeAgent:
         (Path(run_dir) / "trajectory.md").write_text("[ACTION] edit\n", encoding="utf-8")
 
 
+_GIT_LOCATION_VARS = (
+    "GIT_DIR",
+    "GIT_WORK_TREE",
+    "GIT_INDEX_FILE",
+    "GIT_OBJECT_DIRECTORY",
+    "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+    "GIT_COMMON_DIR",
+)
+
+
 class Base(unittest.TestCase):
     def setUp(self):
         env = mock.patch.dict(
@@ -72,6 +82,8 @@ class Base(unittest.TestCase):
         )
         env.start()
         self.addCleanup(env.stop)
+        for var in _GIT_LOCATION_VARS:
+            os.environ.pop(var, None)
         self.tmp = Path(tempfile.mkdtemp())
         self.addCleanup(shutil.rmtree, self.tmp, True)
         self.src = self.tmp / "src"
@@ -117,24 +129,60 @@ class WorktreeLauncherTest(Base):
         self.launch(launcher)
         self.assertFalse(self.diff.exists())
 
-    def test_scrubs_api_key_and_keeps_the_rest(self):
+    def test_scrub_env_names_leave_and_the_rest_stays(self):
         agent = FakeAgent()
         launcher = iw.WorktreeLauncher(
-            self.src, agent, env={"TYPESAFE_API_KEY": "secret", "KEEP_ME": "1"}
+            self.src,
+            agent,
+            env={"SECRET_A": "s", "SECRET_B": "t", "KEEP_ME": "1"},
+            scrub_env=("SECRET_A", "SECRET_B", "NOT_SET"),
         )
         self.addCleanup(launcher.cleanup)
         self.launch(launcher)
         self.assertEqual(agent.calls[0]["env"], {"KEEP_ME": "1"})
 
-    def test_scrubs_api_key_from_os_environ_by_default(self):
+    def test_scrub_env_applies_to_os_environ_when_env_is_none(self):
         agent = FakeAgent()
-        launcher = iw.WorktreeLauncher(self.src, agent)
+        launcher = iw.WorktreeLauncher(self.src, agent, scrub_env=["SECRET_A"])
         self.addCleanup(launcher.cleanup)
-        with mock.patch.dict(os.environ, {"TYPESAFE_API_KEY": "secret", "KEEP_ME": "1"}):
+        with mock.patch.dict(os.environ, {"SECRET_A": "s", "KEEP_ME": "1"}):
             self.launch(launcher)
         env = agent.calls[0]["env"]
-        self.assertNotIn("TYPESAFE_API_KEY", env)
+        self.assertNotIn("SECRET_A", env)
         self.assertEqual(env["KEEP_ME"], "1")
+
+    def test_by_default_nothing_is_scrubbed(self):
+        agent = FakeAgent()
+        given = {"SECRET_A": "s", "SOME_API_KEY": "k", "KEEP_ME": "1"}
+        launcher = iw.WorktreeLauncher(self.src, agent, env=given)
+        self.addCleanup(launcher.cleanup)
+        self.launch(launcher)
+        self.assertEqual(agent.calls[0]["env"], given)
+
+    def test_exclude_leaves_paths_out_of_the_diff(self):
+        edits = {"a.txt": "alpha changed\n", "secret/x.txt": "hidden\n"}
+        launcher = iw.WorktreeLauncher(self.src, FakeAgent(edits), exclude=("secret",))
+        self.addCleanup(launcher.cleanup)
+        self.launch(launcher)
+        text = self.diff.read_text()
+        self.assertIn("+alpha changed", text)
+        self.assertNotIn("secret/x.txt", text)
+        self.assertNotIn("hidden", text)
+
+    def test_without_exclude_every_change_is_in_the_diff(self):
+        edits = {"a.txt": "alpha changed\n", "secret/x.txt": "hidden\n"}
+        launcher = iw.WorktreeLauncher(self.src, FakeAgent(edits))
+        self.addCleanup(launcher.cleanup)
+        self.launch(launcher)
+        self.assertIn("secret/x.txt", self.diff.read_text())
+
+    def test_exclude_only_leaving_changes_writes_no_diff(self):
+        launcher = iw.WorktreeLauncher(
+            self.src, FakeAgent({"secret/x.txt": "hidden\n"}), exclude=("secret",)
+        )
+        self.addCleanup(launcher.cleanup)
+        self.launch(launcher)
+        self.assertFalse(self.diff.exists())
 
     def test_prompt_starts_with_preamble(self):
         agent = FakeAgent()
@@ -235,14 +283,17 @@ class AdapterTest(Base):
 
 
 class FakeProc:
-    def __init__(self, stdout, rc=0, hang=False):
+    def __init__(self, stdout, rc=0, hang=False, interrupt=False):
         self.pid = 4242
         self.rc = rc
         self.hang = hang
+        self.interrupt = interrupt
         self.killed = False
         stdout.write((json.dumps({"part": {"type": "text", "text": "EVENT-TEXT"}}) + "\n").encode())
 
     def wait(self, timeout=None):
+        if self.interrupt and timeout is not None:
+            raise KeyboardInterrupt
         if self.hang and timeout is not None:
             raise subprocess.TimeoutExpired("opencode", timeout)
         return self.rc
@@ -261,10 +312,11 @@ class OpencodeAgentTest(unittest.TestCase):
         self.calls: list[tuple[list, dict]] = []
         self.rc = 0
         self.hang = False
+        self.interrupt = False
 
     def _popen(self, argv, **kw):
         self.calls.append((argv, kw))
-        return FakeProc(kw["stdout"], rc=self.rc, hang=self.hang)
+        return FakeProc(kw["stdout"], rc=self.rc, hang=self.hang, interrupt=self.interrupt)
 
     def _run(self, install=None, prompt="PROMPT-BODY"):
         with mock.patch.object(iw.subprocess, "Popen", side_effect=self._popen):
@@ -316,6 +368,29 @@ class OpencodeAgentTest(unittest.TestCase):
                 self._run()
         killpg.assert_called_once()
         self.assertEqual(killpg.call_args.args[0], 4242)
+
+    def test_keyboard_interrupt_kills_group_and_reraises(self):
+        self.interrupt = True
+        with (
+            mock.patch.object(iw.os, "killpg") as killpg,
+            mock.patch.object(iw, "_kill_group", wraps=iw._kill_group) as kill_group,
+        ):
+            with self.assertRaises(KeyboardInterrupt):
+                self._run()
+        kill_group.assert_called_once()
+        killpg.assert_called_once()
+        self.assertEqual(killpg.call_args.args[0], 4242)
+        self.assertTrue((self.run_dir / "trajectory.md").is_file())
+
+    def test_timeout_is_still_a_timeout_error(self):
+        self.hang = True
+        with (
+            mock.patch.object(iw.os, "killpg"),
+            mock.patch.object(iw, "_kill_group", wraps=iw._kill_group) as kill_group,
+        ):
+            with self.assertRaisesRegex(TimeoutError, "within 30s"):
+                self._run()
+        kill_group.assert_called_once()
 
     def test_missing_events_writes_error(self):
         iw.OpencodeAgent("m")._write_trajectory(self.run_dir)
