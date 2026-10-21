@@ -56,6 +56,7 @@ class SurfaceSpec:
     hook_events: frozenset[str] = frozenset()
     compile_skill_scripts: bool = False
     reject_empty_always_on: bool = False
+    memory_file: str | None = None
 
     stubs: tuple[tuple[str, str], ...] = ()
 
