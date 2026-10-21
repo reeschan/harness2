@@ -270,6 +270,83 @@ class MemoryRecallRunTests(unittest.TestCase):
         self.assertFalse(res.modes["agg"]["ok"])
         self.assertIn("sha256", res.modes["agg"]["error"])
 
+    def rerun_agg(self, adapter, lib_root, task_id):
+        with (
+            patch.object(memory, "recall", wraps=memory.recall) as recall_fn,
+            patch.object(schedule, "_run_one_mode") as run_one,
+        ):
+            res = schedule.run_task(
+                task_id,
+                K,
+                adapter=adapter,
+                prop=proposer_of(adapter),
+                runs_root=adapter.spec.runs_root,
+                libraries=self.libraries(adapter, lib_root),
+                modes=("agg",),
+                memory_recall=True,
+            )
+        return res, recall_fn, run_one
+
+    def test_record_without_text_fails_the_mode(self):
+        adapter, proposer = self.adapter()
+        lib_root = self.root / "lib"
+        self.run_stream(adapter, proposer, lib_root, memory_recall=True)
+        second = adapter.tasks()[1]
+        path = self.summary_path(adapter, second)
+        got = json.loads(path.read_text())
+        got["status"] = "partial"
+        got["memory_recall"] = {"agg": {"sha256": "x"}}
+        path.write_text(json.dumps(got))
+
+        res, recall_fn, run_one = self.rerun_agg(adapter, lib_root, second)
+        self.assertEqual(recall_fn.call_count, 0)
+        run_one.assert_not_called()
+        self.assertFalse(res.modes["agg"]["ok"])
+        self.assertIn("ValueError", res.modes["agg"]["error"])
+        self.assertIn("agg", res.modes["agg"]["error"])
+        self.assertNotIn("agg", res.memory_recall)
+
+    def test_recorded_text_larger_than_the_room_fails_the_mode(self):
+        adapter, proposer = self.adapter()
+        surface = adapter.substrate.surface()
+        lib_root = self.root / "lib"
+        self.run_stream(adapter, proposer, lib_root, memory_recall=True)
+        second = adapter.tasks()[1]
+        text = self.summary(adapter, second)["memory_recall"]["agg"]["text"]
+        self.assertTrue(text)
+        path = self.summary_path(adapter, second)
+        got = json.loads(path.read_text())
+        got["status"] = "partial"
+        path.write_text(json.dumps(got))
+
+        # Lengthen the base harness's always-on text so one char fewer than the text fits.
+        base_dir = adapter.base_harness()
+        base_tree = harness_tree.read_tree(surface, base_dir)
+        pad = recall.room(surface, base_tree) - (len(text) - 1)
+        self.assertGreater(pad, 0)
+        target = base_dir / recall.target_file(surface)
+        body = target.read_text(encoding="utf-8") if target.is_file() else ""
+        target.write_text(body + "x" * pad, encoding="utf-8")
+        grown = harness_tree.read_tree(surface, base_dir)
+        self.assertEqual(recall.room(surface, grown), len(text) - 1)
+        self.assertGreater(
+            len(harness_tree.always_on_text(surface, recall.inject(surface, grown, text))),
+            surface.always_on_max,
+        )
+
+        res, recall_fn, run_one = self.rerun_agg(adapter, lib_root, second)
+        self.assertEqual(recall_fn.call_count, 0)
+        run_one.assert_not_called()
+        self.assertFalse(res.modes["agg"]["ok"])
+        self.assertIn("ValueError", res.modes["agg"]["error"])
+        self.assertIn(f"{len(text)} chars", res.modes["agg"]["error"])
+        self.assertIn(f"{len(text) - 1} chars of room", res.modes["agg"]["error"])
+        self.assertNotIn("agg", res.memory_recall)
+
+
+def proposer_of(adapter):
+    return DemoProposer(adapter.spec.channels["proposer"])
+
 
 if __name__ == "__main__":
     unittest.main()

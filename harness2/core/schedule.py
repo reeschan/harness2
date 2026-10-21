@@ -511,15 +511,25 @@ def _recall_tree(
 ) -> harness_tree.Tree:
     """`base_tree` with this mode's recall block injected, recording the text on `res`.
 
-    A text recorded on an earlier summary is reused (its sha256 checked) instead of recalling
-    again, so a re-run starts from the same tree.
+    A text recorded on an earlier summary is reused (its sha256 checked, and it must still fit
+    the room left by `base_tree`) instead of recalling again, so a re-run starts from the same
+    tree. Only a missing (None) or empty record recalls afresh; any other record without a
+    string text raises ValueError rather than silently changing the starting tree.
     """
-    if isinstance(recorded, Mapping) and "text" in recorded:
-        text = str(recorded.get("text") or "")
+    if recorded is None or (isinstance(recorded, Mapping) and not recorded):
+        text = memory.recall(mode_lib, task_id, recall_block.room(surface, base_tree))
+    else:
+        if not isinstance(recorded, Mapping) or not isinstance(recorded.get("text"), str):
+            raise ValueError(f"recorded memory_recall for {mode} has no text")
+        text = recorded["text"]
         if _sha256(text) != recorded.get("sha256"):
             raise ValueError(f"recorded memory_recall text for {mode} does not match its sha256")
-    else:
-        text = memory.recall(mode_lib, task_id, recall_block.room(surface, base_tree))
+        room = max(0, recall_block.room(surface, base_tree))
+        if len(text) > room:
+            raise ValueError(
+                f"recorded memory_recall text for {mode} is {len(text)} chars,"
+                f" more than the {room} chars of room left in the base harness"
+            )
     tree = recall_block.inject(surface, base_tree, text)
     res.memory_recall[mode] = {
         "file": recall_block.target_file(surface),
