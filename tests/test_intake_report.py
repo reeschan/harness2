@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""The status rule, locations, details body and five lines of core.intake_report."""
+"""The generic status rule and summary locations of core.intake_report."""
 
 import tempfile
 import unittest
@@ -68,6 +68,15 @@ class ReportStatusTest(unittest.TestCase):
         summary.errors.append("no base rollout produced anything")
         self.assertEqual(ir.report_status(summary.to_dict(), mode="agg"), ir.BLOCKED)
 
+    def test_ran_with_errors_but_no_output_is_concerns(self):
+        summary = _summary(self.run_dir, errors=["agg: boom"], status="partial")
+        self.assertEqual(ir.report_status(summary, mode="agg"), ir.DONE_WITH_CONCERNS)
+
+    def test_status_values(self):
+        self.assertEqual(
+            (ir.DONE, ir.DONE_WITH_CONCERNS, ir.BLOCKED), ("DONE", "DONE_WITH_CONCERNS", "BLOCKED")
+        )
+
     def test_chosen_run_without_output_is_concerns(self):
         summary = _summary(self.run_dir)
         self.assertEqual(ir.report_status(summary, mode="agg"), ir.DONE_WITH_CONCERNS)
@@ -121,75 +130,6 @@ class SummaryLocationsTest(unittest.TestCase):
         self.assertIsNone(got["harness_dir"])
         none = ir.summary_locations(Path("/r"), summary, bench="b", substrate="oc", mode="seq")
         self.assertIsNone(none["harness_dir"])
-
-
-class RenderDetailsTest(unittest.TestCase):
-    def _render(self, **kw):
-        summary = kw.pop("summary", None) or _summary("/x", errors=["agg: odd"])
-        locs = {"summary_json": Path("/r/s/summary.json"), "harness_dir": Path("/r/h/c1")}
-        return ir.render_details(summary, mode="agg", locations=locs, **kw)
-
-    def test_has_five_headings_and_no_status_line(self):
-        text = self._render()
-        for head in ("## 自己判定", "## 変更", "## 検証", "## 未解決", "## ハーネス"):
-            self.assertIn(head + "\n", text)
-        self.assertFalse(text.startswith("状態:"))
-        self.assertIn("/r/s/summary.json", text)
-        self.assertIn("/r/h/c1", text)
-        self.assertIn("chosen_tree_is_base: False", text)
-        self.assertIn("- agg: odd", text)
-
-    def test_why_is_cut_at_4000(self):
-        text = self._render(summary=_summary("/x", why="A" * 5000 + "TAIL"))
-        self.assertIn("A" * 4000, text)
-        self.assertNotIn("A" * 4001, text)
-        self.assertNotIn("TAIL", text)
-
-    def test_changed_and_verify_are_listed(self):
-        verify = [
-            {"n": 1, "command": "python3 -m unittest", "code": 0},
-            {"n": 2, "command": "ruff check", "code": 1},
-        ]
-        text = self._render(verify=verify, changed=["a.py", "b/c.py"])
-        self.assertIn("- a.py\n- b/c.py", text)
-        self.assertIn("- 1: `python3 -m unittest` -> 0", text)
-        self.assertIn("- 2: `ruff check` -> 1", text)
-        self.assertIn("pass 1/2", text)
-
-    def test_empty_sections_say_none(self):
-        text = self._render(summary=_summary("/x"))
-        self.assertIn("## 変更\nなし", text)
-        self.assertIn("## 未解決\nなし", text)
-
-
-class FiveLinesTest(unittest.TestCase):
-    def test_format(self):
-        text = ir.five_lines(
-            ir.DONE,
-            passed=3,
-            total=4,
-            changed=["a.py", "b.py"],
-            unresolved="x\ny",
-            details_path="docs/pbi/reports/PBI-021.md",
-        )
-        self.assertEqual(
-            text.split("\n"),
-            [
-                "状態: DONE",
-                "結果: 受け入れ条件 pass 3/4",
-                "変更: a.py, b.py",
-                "未解決: x y",
-                "詳細: docs/pbi/reports/PBI-021.md",
-            ],
-        )
-
-    def test_empty_values(self):
-        lines = ir.five_lines(
-            ir.BLOCKED, passed=0, total=0, changed=[], unresolved="", details_path="d.md"
-        ).split("\n")
-        self.assertEqual(len(lines), 5)
-        self.assertEqual(lines[2], "変更: なし")
-        self.assertEqual(lines[3], "未解決: なし")
 
 
 if __name__ == "__main__":

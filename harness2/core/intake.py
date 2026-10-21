@@ -20,21 +20,58 @@ into what the scheduler needs. `TASK_SPEC_SCHEMA` describes the dict form of a T
 JSON Schema subset, plus the checks the schema cannot express (BenchPrompts' own rules and
 relative-path rules for files and the deliverable location).
 
+The task connector contract
+---------------------------
+
 A `TaskConnector` polls for raw tasks, fetches their attachments, and takes back either a
-deliverable or a failure. Connectors are registered by name; `connector_for` picks one by
-explicit name, then by the `HARNESS2_TASK_CONNECTOR` environment variable, then the default
-`local`. A name that is not registered but has the form `module:Attr` is imported and used as
-the factory.
+deliverable or a failure. These four methods are required:
+
+- `poll() -> Iterable[RawTask]`
+- `fetch_files(raw, dest) -> None`
+- `deliver(task_id, deliverable_dir, summary) -> None`
+- `fail(task_id, reason) -> None`
+
+A connector may also offer optional capabilities, read by `capabilities(connector)` with
+getattr; anything missing gets a default:
+
+- attribute `workspace_policy`: a `WorkspacePolicy` (paths left out of the diff and a guard
+  run before the diff goes back to the source) or None. Default: `WorkspacePolicy()`, which
+  leaves nothing out and checks nothing.
+- attribute `scrub_env`: an iterable of environment variable names removed from the agent's
+  environment, or None. Default: `()`.
+- method `judge()`: returns a `Judge` or None. A Judge is called as
+  `judge(run_dir, task_id, criteria)` and returns None or a dict with the keys the harness's
+  scoring record reads: `n_passed` (int), `n_criteria` (int) and `all_pass` (bool); any other
+  keys are kept as raw data. Default: None (no judge).
+- method `report(task_id)`: returns the text to print for a task, or None. Default: None.
+- method `close()`: releases what the connector holds. Default: a function that does nothing.
+
+Connectors are found by name. `connector_name` picks the name: an explicit name, then the
+`HARNESS2_TASK_CONNECTOR` environment variable, then the default `local`. `resolve_factory`
+turns the name into a factory: a built-in registration (`register`; only the bundled `local`
+connector by default), then an entry point of the same name in the group
+`harness2.task_connectors`, then, for a name containing `:`, a `module:Attr` import path. An
+entry point's `load()` and a `module:Attr` target are both factories: callables that take the
+connector options as keyword arguments (`factory(**options)`) and return a TaskConnector.
 """
 
 from __future__ import annotations
 
 import importlib
+import importlib.metadata
 import os
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable, Iterable, Mapping, Protocol, runtime_checkable
+from typing import (
+    Any,
+    Callable,
+    Iterable,
+    Mapping,
+    Protocol,
+    Sequence,
+    runtime_checkable,
+)
 
 from .spec import BenchPrompts
 
@@ -279,7 +316,11 @@ def task_spec_to_dict(spec: TaskSpec, *, include_private: bool) -> dict[str, Any
 
 @runtime_checkable
 class TaskConnector(Protocol):
-    """Where tasks come from and where their results go."""
+    """Where tasks come from and where their results go.
+
+    These four methods are the whole required contract; the optional capabilities are read by
+    `capabilities` (see the module docstring).
+    """
 
     def poll(self) -> Iterable[RawTask]: ...
 
@@ -290,8 +331,136 @@ class TaskConnector(Protocol):
     def fail(self, task_id: str, reason: str) -> None: ...
 
 
+Judge = Callable[[Path, str, Sequence[str]], dict | None]
+"""A connector's judge: `judge(run_dir, task_id, criteria)` returns None or a dict with the keys
+the harness's scoring record reads (`n_passed`, `n_criteria`, `all_pass`); other keys stay raw."""
+
+WorkspaceGuard = Callable[[Path, Path], str | None]
+"""`guard(worktree, source)`: None when the diff may go back to the source, else the reason."""
+
+
+@dataclass(frozen=True)
+class WorkspacePolicy:
+    """How a task's worktree diff goes back to the source.
+
+    `exclude` lists paths, relative to the source root, that are left out of the diff. `guard`
+    is called as `guard(worktree, source)` before the diff goes back; it returns None when that
+    is fine, else the reason it is not. The default leaves nothing out and checks nothing.
+    """
+
+    exclude: tuple[str, ...] = ()
+    guard: WorkspaceGuard | None = None
+
+
+def _noop() -> None:
+    return None
+
+
+@dataclass(frozen=True)
+class Capabilities:
+    """A connector's optional capabilities, with the defaults filled in (see `capabilities`)."""
+
+    workspace_policy: WorkspacePolicy = field(default_factory=WorkspacePolicy)
+    scrub_env: tuple[str, ...] = ()
+    judge: Judge | None = None
+    report: Callable[[str], str | None] | None = None
+    close: Callable[[], None] = _noop
+
+
+def _type_name(value: Any) -> str:
+    return type(value).__name__
+
+
+def capabilities(connector: Any) -> Capabilities:
+    """Read the optional capabilities of `connector` with getattr, filling in the defaults.
+
+    - `workspace_policy` (attribute): a WorkspacePolicy or None; default `WorkspacePolicy()`.
+    - `scrub_env` (attribute): an iterable of str (not a single str) or None; default `()`.
+    - `judge()` (method): returns a Judge or None; default None. It is called here, once.
+      A Judge returns None or a dict with `n_passed`, `n_criteria` and `all_pass`.
+    - `report(task_id)` (method): returns the text for a task or None; default None.
+    - `close()` (method): default a function that does nothing.
+
+    An attribute that is present but None counts as missing. A value of the wrong type raises
+    TypeError naming the capability and the type it had.
+    """
+    policy = getattr(connector, "workspace_policy", None)
+    if policy is None:
+        policy = WorkspacePolicy()
+    elif not isinstance(policy, WorkspacePolicy):
+        raise TypeError(
+            f"task connector capability 'workspace_policy' must be a WorkspacePolicy or None, "
+            f"got {_type_name(policy)}"
+        )
+    if not isinstance(policy.exclude, tuple) or not all(isinstance(p, str) for p in policy.exclude):
+        raise TypeError(
+            "task connector capability 'workspace_policy.exclude' must be a tuple of str, "
+            f"got {_type_name(policy.exclude)}"
+        )
+    if policy.guard is not None and not callable(policy.guard):
+        raise TypeError(
+            "task connector capability 'workspace_policy.guard' must be callable or None, "
+            f"got {_type_name(policy.guard)}"
+        )
+
+    raw_env = getattr(connector, "scrub_env", None)
+    if raw_env is None:
+        scrub_env: tuple[str, ...] = ()
+    else:
+        if isinstance(raw_env, (str, bytes)) or not isinstance(raw_env, Iterable):
+            raise TypeError(
+                "task connector capability 'scrub_env' must be an iterable of str or None, "
+                f"got {_type_name(raw_env)}"
+            )
+        scrub_env = tuple(raw_env)
+        for item in scrub_env:
+            if not isinstance(item, str):
+                raise TypeError(
+                    "task connector capability 'scrub_env' must contain only str, "
+                    f"got {_type_name(item)}"
+                )
+
+    judge_method = getattr(connector, "judge", None)
+    judge: Judge | None = None
+    if judge_method is not None:
+        if not callable(judge_method):
+            raise TypeError(
+                "task connector capability 'judge' must be a method returning a Judge or None, "
+                f"got {_type_name(judge_method)}"
+            )
+        judge = judge_method()
+        if judge is not None and not callable(judge):
+            raise TypeError(
+                "task connector capability 'judge()' must return a callable Judge or None, "
+                f"got {_type_name(judge)}"
+            )
+
+    report = getattr(connector, "report", None)
+    if report is not None and not callable(report):
+        raise TypeError(
+            f"task connector capability 'report' must be a method or None, got {_type_name(report)}"
+        )
+
+    close = getattr(connector, "close", None)
+    if close is None:
+        close = _noop
+    elif not callable(close):
+        raise TypeError(
+            f"task connector capability 'close' must be a method or None, got {_type_name(close)}"
+        )
+
+    return Capabilities(
+        workspace_policy=policy,
+        scrub_env=scrub_env,
+        judge=judge,
+        report=report,
+        close=close,
+    )
+
+
 ENV_VAR = "HARNESS2_TASK_CONNECTOR"
 DEFAULT = "local"
+ENTRY_POINT_GROUP = "harness2.task_connectors"
 
 Factory = Callable[..., TaskConnector]
 
@@ -306,9 +475,15 @@ def register(name: str, factory: Factory) -> None:
     _REGISTRY[name] = factory
 
 
+def _entry_points() -> list[Any]:
+    """The installed entry points of `ENTRY_POINT_GROUP`."""
+    return list(importlib.metadata.entry_points(group=ENTRY_POINT_GROUP))
+
+
 def names() -> list[str]:
-    """The registered connector names, sorted."""
-    return sorted(_REGISTRY)
+    """The built-in registered names plus the entry point names of `ENTRY_POINT_GROUP`,
+    sorted and without duplicates."""
+    return sorted(set(_REGISTRY) | {ep.name for ep in _entry_points()})
 
 
 def connector_name(*, name: str | None = None, env: Mapping[str, str] | None = None) -> str:
@@ -351,6 +526,49 @@ def _import_factory(name: str) -> Factory:
     return target
 
 
+def _load_entry_point(name: str, ep: Any) -> Factory:
+    """Load an entry point as a factory; a failed load raises ValueError, a target that is not
+    callable raises TypeError."""
+    try:
+        target = ep.load()
+    except Exception as exc:
+        raise ValueError(
+            f"task connector {name!r}: cannot load entry point {ENTRY_POINT_GROUP}/{name}: {exc}"
+        ) from exc
+    if not callable(target):
+        raise TypeError(
+            f"task connector {name!r} entry point is {type(target).__name__}, which is not callable"
+        )
+    return target
+
+
+def resolve_factory(name: str) -> Factory:
+    """The factory for the connector `name`.
+
+    Looked up in this order: the built-in registrations (`register`), an entry point named
+    `name` in the group `ENTRY_POINT_GROUP` (`harness2.task_connectors`), and, for a name
+    containing `:`, a `module:Attr` import path (see `_import_factory`). An entry point's
+    `load()` must return a factory, the same as a `module:Attr` target: a callable taking the
+    connector options as keyword arguments and returning a TaskConnector. A name found nowhere
+    raises ValueError listing the registered and entry point names.
+    """
+    factory = _REGISTRY.get(name)
+    if factory is not None:
+        return factory
+    eps = _entry_points()
+    for ep in eps:
+        if ep.name == name:
+            return _load_entry_point(name, ep)
+    if ":" in name:
+        return _import_factory(name)
+    registered = ", ".join(sorted(_REGISTRY)) or "(none)"
+    entry_names = ", ".join(sorted({ep.name for ep in eps})) or "(none)"
+    raise ValueError(
+        f"unknown task connector {name!r}; registered: {registered}; "
+        f"entry points ({ENTRY_POINT_GROUP}): {entry_names}"
+    )
+
+
 def connector_for(
     *,
     name: str | None = None,
@@ -359,19 +577,13 @@ def connector_for(
 ) -> TaskConnector:
     """Build a task connector.
 
-    The name comes from `connector_name`. A registered name is used first; otherwise a name
-    containing `:` is loaded as a `module:Attr` import path (see `_import_factory`). Any other
-    unregistered name raises ValueError; a factory result that is not a TaskConnector raises
-    TypeError.
+    The name comes from `connector_name` and the factory from `resolve_factory` (built-in
+    registration, then entry point, then `module:Attr`); the factory is called as
+    `factory(**options)`. A name found nowhere raises ValueError; a factory result that is not
+    a TaskConnector raises TypeError.
     """
     name = connector_name(name=name, env=env)
-    factory = _REGISTRY.get(name)
-    if factory is None:
-        if ":" not in name:
-            raise ValueError(
-                f"unknown task connector {name!r}; registered: {', '.join(names()) or '(none)'}"
-            )
-        factory = _import_factory(name)
+    factory = resolve_factory(name)
     conn = factory(**options)
     if not isinstance(conn, TaskConnector):
         raise TypeError(
@@ -386,10 +598,4 @@ def _local_factory(**options: Any) -> TaskConnector:
     return _import_factory("harness2.core.intake_local:LocalFileConnector")(**options)
 
 
-def _jev_mcp_factory(**options: Any) -> TaskConnector:
-    """Import the jev-mcp connector on first use and build it with `options`."""
-    return _import_factory("harness2.core.intake_mcp:connector_from_options")(**options)
-
-
 register(DEFAULT, _local_factory)
-register("jev-mcp", _jev_mcp_factory)

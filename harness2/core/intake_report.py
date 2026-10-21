@@ -12,20 +12,19 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""The five-line report of an intake task, built from a harness summary.
+"""A generic status rule a connector can use when it builds its report.
 
 Pure functions over the dict `schedule.TaskResult.to_dict()` writes to summary.json:
-`report_status` picks the first line (DONE / DONE_WITH_CONCERNS / BLOCKED),
-`summary_locations` finds summary.json and the adopted harness the way `schedule.run_task`
-names them, `render_details` writes the Markdown body of the details file, and `five_lines`
-renders the same five lines jev-mcp writes. Nothing here talks to MCP.
+`report_status` decides the task's state (DONE / DONE_WITH_CONCERNS / BLOCKED) for one
+mode, and `summary_locations` finds summary.json and the adopted harness the way
+`schedule.run_task` names them. How the report itself is shaped is up to each connector.
 """
 
 from __future__ import annotations
 
 import os
 from pathlib import Path
-from typing import Mapping, Sequence
+from typing import Mapping
 
 from .schedule import Namespace
 
@@ -33,7 +32,6 @@ DONE = "DONE"
 DONE_WITH_CONCERNS = "DONE_WITH_CONCERNS"
 BLOCKED = "BLOCKED"
 
-WHY_CAP = 4000
 BASE_FAILED = "base-failed"
 
 
@@ -56,7 +54,7 @@ def _has_output(run_dir: Path) -> bool:
 
 
 def report_status(summary: Mapping, *, mode: str) -> str:
-    """The first line of the report for `mode`'s outcome on this summary.
+    """The task's state for `mode`'s outcome on this summary.
 
     A chosen run with a deliverable is DONE (DONE_WITH_CONCERNS if any error is recorded).
     Otherwise, when every base rollout failed (`run_task` marks this with status
@@ -95,81 +93,3 @@ def summary_locations(
         "summary_json": base_ns.task_dir(runs_root, task_id) / "summary.json",
         "harness_dir": harness_dir,
     }
-
-
-def _lines(items: Sequence[str]) -> list[str]:
-    out = [f"- {' '.join(str(i).splitlines())}" for i in items]
-    return out or ["なし"]
-
-
-def render_details(
-    summary: Mapping,
-    *,
-    mode: str,
-    locations: Mapping[str, Path | None],
-    verify: Sequence[Mapping] = (),
-    changed: Sequence[str] = (),
-) -> str:
-    """The Markdown body of the details file (jev-mcp prepends the `状態:` line itself)."""
-    sel = _selection(summary, mode)
-    status = report_status(summary, mode=mode)
-    passed = sum(1 for v in verify if v.get("code") == 0)
-
-    def where(key: str) -> str:
-        value = locations.get(key)
-        return str(value) if value is not None else "なし"
-
-    why = str(sel.get("why") or "")
-    if len(why) > WHY_CAP:
-        why = why[:WHY_CAP] + "\n…(truncated)"
-
-    parts = [
-        "## 自己判定",
-        f"- 判定: {status}（mode: {mode}、summary の status: {summary.get('status', '')}）",
-        f"- 検証: pass {passed}/{len(verify)}",
-        "",
-        "## 変更",
-        *_lines(changed),
-        "",
-        "## 検証",
-        *(
-            [f"- {v.get('n', '')}: `{v.get('command', '')}` -> {v.get('code', '')}" for v in verify]
-            or ["なし"]
-        ),
-        "",
-        "## 未解決",
-        *_lines(summary.get("errors") or []),
-        "",
-        "## ハーネス",
-        f"- summary.json: {where('summary_json')}",
-        f"- 選ばれたラベル: {sel.get('chosen_label') or 'なし'}",
-        f"- chosen_tree_is_base: {sel.get('chosen_tree_is_base')}",
-        f"- 採用したハーネス: {where('harness_dir')}",
-        "",
-        "### 選定の理由",
-        why or "なし",
-        "",
-    ]
-    return "\n".join(parts)
-
-
-def five_lines(
-    status: str,
-    *,
-    passed: int,
-    total: int,
-    changed: Sequence[str],
-    unresolved: str,
-    details_path: str,
-) -> str:
-    """The five report lines in jev-mcp's `_write_report` format."""
-    note = " ".join(str(unresolved).splitlines()).strip() or "なし"
-    return "\n".join(
-        [
-            f"状態: {status}",
-            f"結果: 受け入れ条件 pass {passed}/{total}",
-            f"変更: {', '.join(changed) if changed else 'なし'}",
-            f"未解決: {note}",
-            f"詳細: {details_path}",
-        ]
-    )
