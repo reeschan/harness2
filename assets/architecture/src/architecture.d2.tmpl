@@ -130,11 +130,14 @@ exec: "Execution & evaluation" {
     style.stroke: "{{bench_stroke}}"
     style.stroke-dash: 4
     style.font-color: "{{text}}"
-    grid-rows: 1
-    grid-gap: 120
+    grid-rows: 2
+    grid-columns: 2
+    horizontal-gap: 120
+    vertical-gap: 60
 
-    connector: "TaskConnector\nlocal folder | module:Attr" {class: box}
+    connector: "TaskConnector\nlocal folder | module:Attr\n| jev-mcp" {class: box}
     normalizer: "normalizer\nRawTask → TaskSpec\n(schema check, 1 retry)" {class: box}
+    jev: "jev-mcp\nlist / claim / submit / fail / verify" {class: box; width: 300}
   }
 
   bench: "benchmarks  ·  adapters" {
@@ -181,6 +184,13 @@ exec: "Execution & evaluation" {
       label.near: top-center
       icon.near: bottom-center
       icon: {{icons}}/openai.svg
+    }
+    ws: "" {
+      style.fill: transparent
+      style.stroke: transparent
+      direction: right
+      worktree: "git worktree per rollout\nchanges.diff" {class: box}
+      source: "source repo\napply chosen diff\n(after unchanged.py)" {class: box}
     }
   }
 
@@ -252,3 +262,9 @@ core.task -> exec.intake.connector: {
   style.stroke-dash: 4
   source-arrowhead.label: "deliver chosen\nrun's output/"
 }
+exec.intake.jev <-> exec.intake.connector: {
+  target-arrowhead.label: "claim PBI"
+  source-arrowhead.label: "5-line report"
+}
+exec.bench.intake -> exec.substrate.ws.worktree: {target-arrowhead.label: "rollout"}
+exec.substrate.ws.worktree -> exec.substrate.ws.source: "apply\nchosen diff" {style.stroke-dash: 4}
