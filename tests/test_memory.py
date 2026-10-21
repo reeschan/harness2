@@ -19,7 +19,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from harness2.core import memory, schedule
+from harness2.core import context, memory, schedule
 from harness2.core.library import Library
 from harness2.demo import DemoAdapter, DemoProposer
 
@@ -59,6 +59,34 @@ class MemoryConnectorTests(unittest.TestCase):
             memory.connector_for(self.root, "d", self.surface, name="recording")
         with self.assertRaises(ValueError):
             memory.register(" padded", Library)
+
+    def test_store_checks_verdicts_before_any_connector_sees_the_entry(self):
+        added = []
+
+        class Bare:
+            domain = "d"
+
+            def entries(self):
+                return []
+
+            def retain(self, task_ids):
+                pass
+
+            def add(self, task_id, harness, **kw):
+                added.append(task_id)
+
+            def context_dir(self):
+                return None
+
+        exp = {"cue": "c", "lesson": "l", "evidence": "e"}
+        marker = context.GRADER_VERDICT_MARKERS[0]
+        with self.assertRaises(ValueError):
+            memory.store(Bare(), "t1", {"LongTermMEMORY.md": marker}, experience=exp)
+        with self.assertRaises(ValueError):
+            memory.store(Bare(), "t1", {"LongTermMEMORY.md": "ok"}, why=marker, experience=exp)
+        self.assertIsNone(memory.store(Bare(), "t1", {"LongTermMEMORY.md": "ok"}, experience={}))
+        memory.store(Bare(), "t2", {"LongTermMEMORY.md": "ok"}, experience=exp)
+        self.assertEqual(added, ["t2"])
 
     def test_run_domain_uses_the_connector_named_in_the_environment(self):
         RecordingConnector.opened = []

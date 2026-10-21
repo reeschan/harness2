@@ -24,8 +24,8 @@ stand in for the on-disk one:
 
 `FileConnector` (the `library.Library` the method was published with) is the default.
 Another connector is chosen by name with `HARNESS2_MEMORY_CONNECTOR` and registered with
-`register()`. Whatever the connector, entries stay per (run, mode, domain) and pass the
-grader-verdict check before they are stored.
+`register()`. Whatever the connector, entries stay per (run, mode, domain), and the schedule
+writes through `store()`, which runs the grader-verdict check before any connector sees them.
 """
 
 from __future__ import annotations
@@ -34,8 +34,9 @@ import os
 from pathlib import Path
 from typing import Callable, Mapping, Protocol, Sequence, runtime_checkable
 
+from . import context
 from . import tree as harness_tree
-from .library import Library
+from .library import Library, has_experience
 from .tree import SurfaceSpec
 
 ENV_VAR = "HARNESS2_MEMORY_CONNECTOR"
@@ -105,3 +106,25 @@ def connector_for(
             f"memory connector {chosen!r} returned {type(conn).__name__}, not a MemoryConnector"
         )
     return conn
+
+
+def store(
+    conn: MemoryConnector,
+    task_id: str,
+    harness: harness_tree.Tree,
+    *,
+    why: str = "",
+    label: str = "",
+    run_id: str = "",
+    experience: dict | None = None,
+) -> Path | None:
+    """Add one adopted harness through `conn`, after the checks every connector must honor.
+
+    Entries without a complete experience are skipped, and a tree or experience that carries
+    a grader verdict raises before anything reaches the connector.
+    """
+    if not has_experience(experience):
+        return None
+    context.assert_tree_has_no_grader_verdicts(harness)
+    context.assert_tree_has_no_grader_verdicts({"EXPERIENCE.md": str(experience) + why})
+    return conn.add(task_id, harness, why=why, label=label, run_id=run_id, experience=experience)

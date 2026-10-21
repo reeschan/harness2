@@ -226,7 +226,8 @@ def _restore_libraries(
         tree = harness_tree.read_tree(surface, n.task_dir(runs_root, task_id) / "harnesses" / label)
         if not tree:
             continue
-        lib.add(
+        memory.store(
+            lib,
             task_id,
             tree,
             why=str(sel.get("why") or ""),
@@ -553,7 +554,8 @@ def _run_one_mode(
     if sel.ok and chosen is not None and not chosen.delivered:
         res.errors.append(f"{mode}: selected run {chosen.run_id} produced no deliverable")
     if mode_lib and sel.ok and library_store.has_experience(sel.experience):
-        mode_lib.add(
+        memory.store(
+            mode_lib,
             task_id,
             chosen_tree,
             why=sel.why,
