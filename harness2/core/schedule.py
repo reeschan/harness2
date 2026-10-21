@@ -32,7 +32,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Mapping, Sequence
 
-from . import memory, recursion, runmark, selection
+from . import library, memory, recursion, runmark, selection
 from . import tree as harness_tree
 from .proposer import Proposer
 from .spec import BenchmarkAdapter, RunView
@@ -242,9 +242,10 @@ class TaskResult:
     selections: dict = field(default_factory=dict)
     base: list[str] = field(default_factory=list)
     errors: list[str] = field(default_factory=list)
+    memory_meta: Mapping[str, str] | None = None
 
     def to_dict(self) -> dict:
-        return {
+        out = {
             "task_id": self.task_id,
             "domain": self.domain,
             "k": self.k,
@@ -255,6 +256,18 @@ class TaskResult:
             "selections": self.selections,
             "errors": self.errors,
         }
+        if self.memory_meta is not None:
+            out["memory_connector"] = str(self.memory_meta.get("memory_connector", ""))
+            out["memory_scope"] = str(self.memory_meta.get("memory_scope", ""))
+        return out
+
+
+def _memory_meta(memory_scope: str) -> dict[str, str] | None:
+    """The memory settings to record on a summary; None for the default (file, no scope)."""
+    name = memory.connector_name()
+    if name == memory.DEFAULT and not memory_scope:
+        return None
+    return {"memory_connector": name, "memory_scope": memory_scope}
 
 
 def _merged_status(merged: dict) -> str:
@@ -573,6 +586,7 @@ def run_task(
     libraries: dict[str, memory.MemoryConnector] | None = None,
     selector_prop: Proposer | None = None,
     pool_policy: str = "finals",
+    memory_meta: Mapping[str, str] | None = None,
 ) -> TaskResult:
     """k shared reference executions -> every mode -> blind selection per mode -> summary.json.
 
@@ -580,6 +594,8 @@ def run_task(
     caller's job. `pool_policy` is "finals" -- exactly the k finals per mode, the published
     convention and the only pool this release builds; it is a parameter rather than a literal
     only so the cost claim at k=1 (no selector session) stays legible at the call site.
+    `memory_meta`, when given, is written to the summary as `memory_connector` and
+    `memory_scope`; None (the default setting) adds no keys.
     """
     if int(k) < 1:
         raise ValueError(f"k must be positive, got {k!r}")
@@ -598,7 +614,13 @@ def run_task(
     bench, sub = adapter.spec.name, adapter.substrate.name
 
     domain = adapter.domain_of(task_id)
-    res = TaskResult(task_id=task_id, domain=domain, k=k, seed=seed)
+    res = TaskResult(
+        task_id=task_id,
+        domain=domain,
+        k=k,
+        seed=seed,
+        memory_meta=dict(memory_meta) if memory_meta is not None else None,
+    )
     base_ns = Namespace(bench, sub, "agg", k, seed, tag)
     work = base_ns.task_dir(runs_root, task_id)
     work.mkdir(parents=True, exist_ok=True)
@@ -676,12 +698,20 @@ def run_domain(
     tag: str = "",
     selector_prop: Proposer | None = None,
     pool_policy: str = "finals",
+    memory_scope: str = "",
 ) -> dict:
-    """Every task in one domain, in `stream_order()` order, threading the library forward."""
+    """Every task in one domain, in `stream_order()` order, threading the library forward.
+
+    With a non-empty `memory_scope` the library root is shared across runs: before each task
+    the library keeps this stream's preceding tasks and every entry that belongs to no task of
+    this stream, so other runs' entries survive.
+    """
     surface = adapter.substrate.surface()
     libs = {
         mode: memory.connector_for(Path(library_root) / mode, domain, surface) for mode in modes
     }
+    memory_meta = _memory_meta(memory_scope)
+    stream_slugs = {library.slug(t) for t in task_ids}
     out = {
         "domain": domain,
         "n_tasks": len(task_ids),
@@ -693,7 +723,11 @@ def run_domain(
     for i, tid in enumerate(task_ids, 1):
         try:
             for lib in libs.values():
-                lib.retain(task_ids[: i - 1])
+                if memory_scope:
+                    others = [e for e in lib.entries() if e not in stream_slugs]
+                    lib.retain([*task_ids[: i - 1], *others])
+                else:
+                    lib.retain(task_ids[: i - 1])
             before = {mode: len(lib.entries()) for mode, lib in libs.items()}
             r = run_task(
                 tid,
@@ -707,6 +741,7 @@ def run_domain(
                 libraries=libs,
                 selector_prop=selector_prop,
                 pool_policy=pool_policy,
+                memory_meta=memory_meta,
             )
             if r.status in ("ok", "skipped"):
                 out["done"] += 1
@@ -789,6 +824,7 @@ def run_sweep(
     pool_policy: str = "finals",
     max_tasks: int | None = None,
     only_tasks: Sequence[str] = (),
+    memory_scope: str = "",
 ) -> dict:
     """Run domains concurrently, preserving task order after stream filters are applied."""
     ordered_tasks = task_stream(
@@ -820,6 +856,7 @@ def run_sweep(
                 tag=tag,
                 selector_prop=selector,
                 pool_policy=pool_policy,
+                memory_scope=memory_scope,
             ): d
             for d in order
         }
