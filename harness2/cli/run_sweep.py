@@ -39,7 +39,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from .. import config
-from ..core import schedule
+from ..core import memory, schedule
 from ..core.proposer import Proposer
 from . import _common as C
 
@@ -103,7 +103,9 @@ def _print_stream(adapter, args, modes) -> int:
         f"#   summaries under: {C.runs_root_for(adapter)}/"
         f"{C.summary_namespace(adapter, args.k, seed=args.seed)}"
     )
-    print(f"#   library root:    {C.library_root_for(adapter, args.k, seed=args.seed)}")
+    scope = config.MEMORY_SCOPE
+    library_root = C.library_root_for(adapter, args.k, seed=args.seed, scope=scope)
+    print(f"#   library root:    {library_root}")
     print(f"#   domains parallel: {args.workers}")
     for i, (domain, task) in enumerate(stream, 1):
         print(f"{i:>4}  {domain:<40} {task}")
@@ -145,13 +147,17 @@ def _main(args: argparse.Namespace) -> int:
     require_ready(adapter, judge=True)
 
     runs_root = C.runs_root_for(adapter)
-    library_root = C.library_root_for(adapter, args.k, seed=args.seed)
+    scope = config.MEMORY_SCOPE
+    library_root = C.library_root_for(adapter, args.k, seed=args.seed, scope=scope)
     summary_ns = C.summary_namespace(adapter, args.k, seed=args.seed)
     _check_identity(adapter, args, runs_root / summary_ns)
     prop = Proposer(adapter.spec.channels["proposer"], audit_dir=runs_root / "_audit" / summary_ns)
 
     only = _csv(args.only_domains)
     lanes = args.workers
+    warning = _memory_warning(memory.connector_name(), scope)
+    if warning:
+        print(warning, flush=True)
     print(
         f"sweep {summary_ns}: {lanes} domain(s) in parallel, tasks within a domain in stream order",
         flush=True,
@@ -170,6 +176,7 @@ def _main(args: argparse.Namespace) -> int:
         only_domains=only,
         max_tasks=args.max_tasks,
         pool_policy="finals",
+        memory_scope=scope,
     )
 
     stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
@@ -204,6 +211,16 @@ def _main(args: argparse.Namespace) -> int:
     if dead:
         return 1
     return 2 if failed else 0
+
+
+def _memory_warning(connector: str, scope: str) -> str | None:
+    """One `warning:` line when the memory setting is not the default (file, no scope)."""
+    if connector == memory.DEFAULT and not scope:
+        return None
+    return (
+        f"warning: memory connector={connector!r} scope={scope!r}; results are not comparable "
+        f"with the published per-run setting (connector 'file', no scope)"
+    )
 
 
 def _check_identity(adapter, args, namespace_dir: Path) -> None:

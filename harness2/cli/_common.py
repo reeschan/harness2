@@ -23,6 +23,7 @@ from __future__ import annotations
 import argparse
 from pathlib import Path
 
+from .. import config
 from ..core import library as LIB
 from ..core import schedule as SCHED
 from ..core.spec import BenchmarkAdapter
@@ -72,11 +73,30 @@ def runs_root_for(adapter: BenchmarkAdapter) -> Path:
     return adapter.spec.runs_root / "adapt"
 
 
-def library_root_for(adapter: BenchmarkAdapter, k: int, *, seed: int | None, tag: str = "") -> Path:
+def library_root_for(
+    adapter: BenchmarkAdapter,
+    k: int,
+    *,
+    seed: int | None,
+    tag: str = "",
+    scope: str | None = None,
+) -> Path:
     """Per-(benchmark, substrate, k, seed, tag) experience-library root (the improver's R).
 
-    Separate seeds and tags keep independent task streams from sharing entries.
+    Separate seeds and tags keep independent task streams from sharing entries. A non-empty
+    `scope` (None reads `config.MEMORY_SCOPE`) instead returns the root shared across runs,
+    `<runs_root>/library/<benchmark>/scope-<scope>`, whatever k, substrate and seed are.
     """
+    if scope is None:
+        scope = config.MEMORY_SCOPE
+    if scope:
+        SCHED.validate_tag(scope)
+        return LIB.root_for(
+            adapter.spec.runs_root / "library",
+            benchmark=adapter.spec.name,
+            k=k,
+            tag=f"scope-{scope}",
+        )
     SCHED.validate_tag(tag)
     variant = adapter.substrate.name
     if seed is not None:
