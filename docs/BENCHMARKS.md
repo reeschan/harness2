@@ -153,7 +153,7 @@ again. Symbolic links are never followed or copied.
 
 | Variable | Default | Values |
 |---|---|---|
-| `HARNESS2_TASK_CONNECTOR` | `local` | A registered name, or a `module:Attr` import path to a connector factory |
+| `HARNESS2_TASK_CONNECTOR` | `local` | A bundled name (`local`), a name an installed package registers under the `harness2.task_connectors` entry point, or a `module:Attr` import path to a connector factory |
 | `HARNESS2_NORMALIZER` | `passthrough` | `passthrough`, `model`, or a `module:Attr` import path to a normalizer factory |
 
 `passthrough` reads an already structured task, from `meta["task_spec"]` or
@@ -217,113 +217,309 @@ deliverables in `workspace/output/`, and writes `run_dir/trajectory.md`. `prop`
 is the improver's `Proposer`. A launcher that starts rollouts on a real
 substrate will be added in a later release.
 
-## Taking PBIs from jev-mcp
+## Connecting a task source
 
 `harness2-intake` (`harness2/cli/intake.py`, also `python3 -m harness2.cli.intake`)
-runs the queued PBIs of one git repository through Harness². It claims every
-queued task from a jev-mcp server, runs each one with OpenCode in git worktrees
-of that repository (`run_intake`), applies only the chosen run's diff back to
-the repository, and prints the five-line report jev-mcp wrote for every task it
-took up. The connector is registered as `jev-mcp` and uses the `passthrough`
-normalizer: each claimed task already carries its `TaskSpec`, so no model writes
-the spec.
-
-### Starting jev-mcp
-
-jev-mcp is not installed as a command: it is the pbi-orchestration-jev skill's
-`jev_mcp.py`, started with `python`. It takes three arguments:
-
-| Argument | Default | Meaning |
-|---|---|---|
-| `--root <dir>` | — | A directory jev-mcp may work in; repeatable, or pass the list in the `PBI_MCP_ROOTS` environment variable |
-| `--http` | off (stdio) | Serve Streamable HTTP at `127.0.0.1:<port>/mcp` instead of stdio |
-| `--port` | `7830` | The HTTP port |
-
-jev-mcp does not touch paths outside its `--root` directories, so both the
-`--repo` work tree and the `--work-root` must lie under a `--root` (give one
-`--root` for each, or one directory that covers both). `verify` also requires
-its working directory to lie under a `--root`. Run jev-mcp and the harness with
-the same view of the file system: the harness passes paths to jev-mcp. On
-Windows, run both in WSL.
+runs the tasks of any task source on one git repository. It builds a task
+connector, takes up every task the connector offers (`run_intake`), runs each
+rollout with OpenCode in its own git worktree of the repository, hands the
+chosen run's diff to the connector, and prints one report per task it took up.
+Each raw task goes through the normalizer named by `HARNESS2_NORMALIZER`
+(`passthrough` by default, so the connector supplies the [TaskSpec](#taskspec-keys)
+itself).
 
 ```bash
-# jev-mcp over HTTP; the --root directories cover the repo and the work root
-python <path-to>/jev_mcp.py --http --port 7830 \
-  --root /home/me/proj --root /home/me/jev
+# the bundled local folder connector
+harness2-intake --connector local --connector-opt root=/home/me/intake-root \
+  --repo /home/me/proj --work-root /home/me/h2
 
-harness2-intake --repo /home/me/proj --work-root /home/me/jev/h2 \
-  --mcp-url http://127.0.0.1:7830/mcp
+# a connector from an installed package, registered under harness2.task_connectors
+harness2-intake --connector my-tasks --connector-opt url=http://127.0.0.1:8000/mcp \
+  --repo /home/me/proj --work-root /home/me/h2
 
-# or let harness2-intake start jev-mcp on stdio
-harness2-intake --repo /home/me/proj --work-root /home/me/jev/h2 \
-  --mcp-command "python <path-to>/jev_mcp.py --root /home/me/proj --root /home/me/jev"
+# a connector that is not installed: the module:Attr import path of its factory
+harness2-intake --connector mypkg.tasks:make_connector \
+  --repo /home/me/proj --work-root /home/me/h2
 ```
+
+### Choosing the connector
+
+`--connector` takes a name, looked up in this order:
+
+1. a built-in registration: only the bundled `local` folder connector
+   ([above](#the-local-folder-connector));
+2. an entry point of that name in the group `harness2.task_connectors`, which a
+   package installed with pip registers (see
+   [Registering the connector](#registering-the-connector));
+3. for a name containing `:`, a `module:Attr` import path, for trying a connector
+   without installing it.
+
+Without `--connector`, the name comes from `HARNESS2_TASK_CONNECTOR`, else
+`local`. The name resolves to a factory, which the CLI calls with keyword
+arguments:
+
+- every `--connector-opt KEY=VALUE` (repeatable; the value is a string), for the
+  connector's own settings such as a URL or a start command;
+- the context keywords `repo` (the `--repo` path, a string), `mode` (the first
+  mode's on-disk token, `agg` or `seq`), `timeout` (the `--timeout` seconds, an
+  int) and `locate` (a function that takes the summary `deliver` receives and
+  returns `{"summary_json": <path>, "harness_dir": <path or None>}`, where the
+  run's `summary.json` and the adopted harness lie).
+
+A factory receives only the context keywords its signature names (all of them
+when it takes `**kwargs`), and a `--connector-opt` of the same name wins. An
+unknown name, a factory that rejects its keywords or returns something that is
+not a task connector, and an optional capability of the wrong type are argument
+errors.
 
 ### Arguments
 
 | Argument | Default | Meaning |
 |---|---|---|
-| `--repo` | required | Absolute path of the root of the git work tree the PBIs change; under a jev-mcp `--root` |
-| `--mcp-url` | — | jev-mcp over HTTP, e.g. a `/mcp` URL (loopback hosts only) |
-| `--mcp-command` | — | The command that starts jev-mcp on stdio (shlex-split) |
-| `--work-root` | required | The intake adapter's root: under jev-mcp's `--root`, outside the `--repo` work tree |
+| `--connector` | `$HARNESS2_TASK_CONNECTOR`, else `local` | A built-in name, an entry point name of `harness2.task_connectors`, or a `module:Attr` import path of a factory |
+| `--connector-opt KEY=VALUE` | none | A keyword argument of the connector factory; repeatable |
+| `--repo` | required | Absolute path of the root of the git work tree the tasks change |
+| `--work-root` | required | The intake adapter's root; outside the `--repo` work tree |
 | `--runs-root` | `<work-root>/runs` | Scheduler state |
 | `--k` | `1` | Task-level recursion budget (`R = 4k` rollouts per task) |
 | `--modes` | `agg` | `parallel` or `sequential` (`agg` / `seq` are the on-disk tokens), or a comma list; the report follows the first mode |
 | `--seed`, `--tag` | none, empty | Enter the run namespace |
 | `--model` | `config.SOLVER_MODEL_OC` | The OpenCode model of the agent |
-| `--timeout` | `3600` | Seconds for one jev-mcp call (`verify` runs the PBI's commands) and for the improver channel |
+| `--timeout` | `3600` | Seconds offered to the connector as its `timeout` keyword (for its own calls), and the timeout of the model channel the improver uses (proposer and selector) |
 
-Give exactly one of `--mcp-url` and `--mcp-command`. Argument errors, including a
-`--work-root` inside the `--repo` work tree or a `--repo` that is not the root
-of its work tree, exit with status 2 before any task is claimed. A run-time
-failure prints one `error:` line and exits with status 1.
+`--timeout` does not limit a rollout: the agent's run in each rollout is limited
+by `IntakeAdapter.DEFAULT_TIMEOUT`, fixed at 3600 seconds.
 
-### Worktrees and what goes back to the source
+`--repo` must be an absolute path to an existing directory that is the root of
+its git work tree, not a directory inside it, and `--work-root` must lie outside
+that work tree. `--k` and `--timeout` must be positive. Argument errors exit with
+status 2 before any task is taken up.
+
+### Worktrees and the diff
 
 Each rollout gets its own detached git worktree at
 `<work-root>/executions/<run_id>/worktree/`. Its base commit is the source HEAD
-plus the tracked uncommitted changes and the untracked, not ignored files
-(including `docs/pbi/`), committed once inside the worktree, so the PBI's
-verification tools work there. The agent works in the worktree; its deliverable
-is `workspace/output/changes.diff`, the `git diff --binary` from the base commit
-without `docs/pbi/`. A rollout that changed nothing writes no diff and has no
-deliverable.
+plus the tracked uncommitted changes and the untracked, not ignored files,
+committed once inside the worktree. The git commands that make and fill a
+worktree run with `core.hooksPath` pointed at an empty directory, so the source
+repository's hooks (`pre-commit`, `post-checkout` and the like) do not run.
+Repository location variables such as `GIT_DIR` and `GIT_WORK_TREE` are dropped
+from git's environment, so every command works on the repository it names. When
+a step after `git worktree add` fails, the worktree is removed and unregistered.
 
-Only the diff of the chosen run goes back to `--repo`. Before it is applied, the
-source's `docs/pbi/tools/unchanged.py check <PBI>` runs against the worktree with
-the source's record, so the PBI's untouched files are confirmed unchanged; then
-the diff is applied with `git apply --binary`. A failed check or apply leaves the
-source as it was and the task is failed as `BLOCKED`. The source's index and
-commits are never touched, and the worktrees are removed when the run ends.
+The agent works in the worktree, with the environment variables the connector
+lists in `scrub_env` removed from its environment. Its deliverable is
+`workspace/output/changes.diff`, the `git diff --binary` from the base commit,
+without the paths the connector's workspace policy excludes. A rollout that
+changed nothing writes no diff and has no deliverable. The worktrees are removed
+when the run ends.
 
-### The report
+### What goes back to the source
 
-jev-mcp writes the five-line report to `<repo>/docs/pbi/mcp/<task>.last.md`, and
-`harness2-intake` prints it for each task taken up in this run. The first line,
-`状態: <status>`, is one of:
+The connector's `WorkspacePolicy` (`harness2.core.intake.WorkspacePolicy`)
+decides what may go back:
+
+- `exclude`: paths relative to the source root (files or directories) that are
+  left out of the diff, such as the task source's own records kept in the
+  repository;
+- `guard`: called as `guard(worktree, source)` before the diff goes back; it
+  returns None when the diff may go back, else the reason it may not. The agent
+  can rewrite anything in the worktree, so a guard should trust only what it
+  reads from the source.
+
+The default policy leaves nothing out and checks nothing.
+
+The harness does not change `--repo` itself: the chosen run's `workspace/output/`
+goes to the connector's `deliver(task_id, deliverable_dir, summary)`, and the
+connector decides. A connector that applies the diff calls
+`harness2.core.worktree.apply_back(source, run_dir, guard=..., exclude=...)` with
+its policy; `run_dir` is the chosen run's directory (`deliverable_dir.parent.parent`),
+whose worktree still exists while `deliver` runs. `apply_back` calls the guard
+first, refuses a diff that touches a path outside the source or under `exclude`,
+then runs `git apply --check --binary` and `git apply --binary`. On any failure
+the source is left as it was; its index and commits are never touched. When
+`deliver` raises, the task is failed through the connector's `fail`. The bundled
+`local` connector does not apply anything: it copies `changes.diff` into
+`outbox/<id>/`.
+
+### The report and the exit status
+
+For every task this run delivered or failed, `harness2-intake` prints the text
+the connector's `report(task_id)` returns, or, when the connector has no
+`report` or it returns None, the line `<task_id>: <status>`. The reports are
+separated by blank lines and taken before the connector is closed. A `report`
+that raises falls back to the one line and adds an `error:` line on standard
+error. The status follows the chosen run of the first mode:
 
 | Status | When |
 |---|---|
-| `DONE` | The chosen run has a deliverable and no error was recorded |
-| `DONE_WITH_CONCERNS` | The chosen run has a deliverable but errors were recorded, or the task ran but the chosen run left no deliverable |
-| `BLOCKED` | Every base rollout failed, or the task failed (for example, the untouched-files check or the apply failed) |
+| `DONE` | The task was delivered and no error was recorded |
+| `DONE_WITH_CONCERNS` | The task was delivered but errors were recorded during its run |
+| `BLOCKED` | The task was failed through the connector's `fail`: it did not normalize, every base rollout failed, the chosen run left no deliverable, or `deliver` raised |
 
-The other lines give the passed verification commands, the changed files, what
-is unresolved, and the path of the details file. The details include the
-verification results, the path of `summary.json`, the chosen label and the
-selection's reasoning, and the location of the adopted harness. The command
-exits with status 0 only when every task taken up is `DONE`.
+The exit status is 0 when every task taken up is `DONE`, 1 when any is not, when
+the run failed, or when a `report` or the connector's `close` raised, and 2 for an
+argument error. When the connector offers no task, `no task was taken up` goes
+to standard error and the status is 0.
 
-### Verification and selection
+When the run fails part way (for example, a git or configuration error), the
+reports of the tasks this run had already delivered or failed are still printed,
+followed by one `error:` line, and the exit status is 1. The connector's `close`
+runs in every case. A task that was delivered or failed is marked as handled
+under `<work-root>/tasks/<task_id>/` and is not taken up again.
 
-jev-mcp's `verify` runs the PBI's verification commands only after selection:
-once on the chosen run when it is delivered, and as the judge for post-hoc
-scoring (`IntakeAdapter.score`). Selection never looks at verification results
-or scores.
+## Writing a task connector
 
-### The Jev API key
+A task connector is any object that meets the contract in
+`harness2.core.intake`; harness2 needs no change to use it. These four methods
+of the `TaskConnector` protocol are required:
 
-The Jev API key (`TYPESAFE_API_KEY`) is not given to the harness. The harness
-code never reads it, and it is removed from the environment of the agent's
-child process.
+| Method | Does |
+|---|---|
+| `poll() -> Iterable[RawTask]` | Returns the tasks to take up. A `RawTask` has `id`, `title`, `body`, `files` and `meta`; for the `passthrough` normalizer, put the TaskSpec dict in `meta["task_spec"]` or the body as JSON |
+| `fetch_files(raw, dest) -> None` | Writes the task's attachments under `dest`; it may leave `dest` missing when there are none |
+| `deliver(task_id, deliverable_dir, summary) -> None` | Takes the chosen run's `workspace/output/` and the task's summary dict |
+| `fail(task_id, reason) -> None` | Takes a task that could not be delivered, with the reason |
+
+### Optional capabilities
+
+A connector may also offer these capabilities. `capabilities(connector)` reads
+them with getattr and fills in the defaults; an attribute that is present but
+None counts as missing, and a value of the wrong type raises TypeError naming the
+capability.
+
+| Capability | Kind | Default | Use |
+|---|---|---|---|
+| `workspace_policy` | Attribute: a `WorkspacePolicy(exclude=..., guard=...)` | `WorkspacePolicy()`: nothing left out, nothing checked | Paths kept out of the diff, and the check before the diff goes back ([above](#what-goes-back-to-the-source)) |
+| `scrub_env` | Attribute: an iterable of environment variable names (not a single string) | `()` | Variables removed from the agent's environment, for example the task source's API key |
+| `judge()` | Method returning a Judge or None; called once | None (no judge) | The scorer used after selection |
+| `report(task_id)` | Method returning a string or None | None | The text printed for a task; without it, `<task_id>: <status>` |
+| `close()` | Method | Does nothing | Releases connections and processes; the CLI calls it once at the end, also when the run fails |
+
+### The judge
+
+A Judge is a callable. `IntakeAdapter.score` calls it as
+`judge(run_dir, task_id, criteria)` with the chosen run's directory, the task id,
+and the task's private criteria, and it returns None (unscored) or a dict with
+the keys the harness's scoring record reads:
+
+| Key | Type | Meaning |
+|---|---|---|
+| `n_passed` | int | Criteria passed, `0 <= n_passed <= n_criteria` |
+| `n_criteria` | int | Criteria checked |
+| `all_pass` | bool | Every criterion passed; when missing, `n_passed == n_criteria` is used |
+
+Other keys are kept as raw data. Selection never looks at scores, so the judge
+is used only after selection, for post-hoc scoring. The judging step calls it
+from several threads at once, so a judge that shares a connection must be safe to
+call concurrently.
+
+### Registering the connector
+
+The connector is built by a factory: a callable that takes the connector options
+as keyword arguments and returns the connector.
+
+```python
+from pathlib import Path
+
+from harness2.core import worktree
+from harness2.core.intake import RawTask, WorkspacePolicy
+
+
+class MyConnector:
+    workspace_policy = WorkspacePolicy(exclude=(".tasks",))
+    scrub_env = ("MY_TASKS_API_KEY",)
+
+    def __init__(self, *, url: str, repo: str, timeout: int):
+        self.url, self.repo, self.timeout = url, Path(repo), timeout
+
+    def poll(self): ...                      # -> list[RawTask]
+    def fetch_files(self, raw, dest): ...
+
+    def deliver(self, task_id, deliverable_dir, summary):
+        run_dir = Path(deliverable_dir).parent.parent
+        worktree.apply_back(
+            self.repo,
+            run_dir,
+            guard=self.workspace_policy.guard,
+            exclude=self.workspace_policy.exclude,
+        )
+        ...                                  # tell the task source the task is done
+
+    def fail(self, task_id, reason): ...
+
+
+def make_connector(*, url: str, repo: str, timeout: int = 60) -> MyConnector:
+    return MyConnector(url=url, repo=repo, timeout=int(timeout))
+```
+
+A package makes the factory available by name with an entry point in the group
+`harness2.task_connectors` in its `pyproject.toml`:
+
+```toml
+[project.entry-points."harness2.task_connectors"]
+my-tasks = "my_package.connector:make_connector"
+```
+
+After `pip install`, `harness2-intake --connector my-tasks --connector-opt url=...`
+uses it. Before installing, `--connector my_package.connector:make_connector`
+loads the same factory.
+
+### Contract tests
+
+`harness2.testing.connector_contract` checks a connector against the contract
+from your own tests. `check_connector(connector)`, `check_judge_result(result)`
+and `check_fetched_files(dest)` raise AssertionError on a mismatch, and
+`ConnectorContractTests` is a unittest mixin that runs them against the
+connector your test builds: `poll()` yields only `RawTask`, `fetch_files` stays
+under `dest`, the judge's result has the shape above, `report` returns a string
+or None, and `close` does not raise.
+
+```python
+import unittest
+from pathlib import Path
+
+from harness2.testing.connector_contract import ConnectorContractTests
+from my_package.connector import MyConnector
+
+
+class MyConnectorContractTest(ConnectorContractTests, unittest.TestCase):
+    def make_connector(self, tmp: Path):
+        # Put at least one task where the connector finds it, so that
+        # poll / fetch_files / judge run on a real task.
+        return MyConnector(url="http://127.0.0.1:8000/mcp", repo=str(tmp), timeout=60)
+```
+
+List `unittest.TestCase` after the mixin. Each test calls `make_connector` with a
+fresh temporary directory and closes the connector afterwards; override
+`make_run_dir(tmp, task_id)` to give the judge a run directory that looks like a
+finished run.
+
+### The optional MCP plugin
+
+A connector for a task server that speaks MCP can import
+`harness2.plugins.mcp`, a small MCP client built only on the standard library
+(nothing extra to install). harness2's core, CLI and benchmarks do not import it.
+
+```python
+from harness2.plugins.mcp import McpError, McpToolError, client_from
+
+client = client_from(url="http://127.0.0.1:8000/mcp", timeout=60)
+# or: client_from(command=["python", "my_task_server.py"], timeout=60)
+try:
+    tasks = client.call_tool("list_tasks", {"repo": "/home/me/proj"})
+finally:
+    client.close()
+```
+
+- `client_from(url=...)` returns an `HttpMcpClient` (Streamable HTTP) and
+  `client_from(command=[...])` a `StdioMcpClient` (the server as a child process,
+  one JSON-RPC message per line); give exactly one of them.
+- `call_tool(name, arguments)` returns the tool's structured result as a dict. A
+  result marked `isError` raises `McpToolError`; a transport or protocol failure
+  raises `McpError`.
+- HTTP goes only to the loopback addresses `127.0.0.1`, `localhost` and `::1`.
+  The client ignores proxy settings in the environment and does not follow
+  redirects; a redirect answer raises `McpError`.
+- Each client runs its calls one after another under a lock, so one client may
+  be shared between threads, for example by a judge that is called in parallel.
