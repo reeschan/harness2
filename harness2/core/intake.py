@@ -386,4 +386,10 @@ def _local_factory(**options: Any) -> TaskConnector:
     return _import_factory("harness2.core.intake_local:LocalFileConnector")(**options)
 
 
+def _jev_mcp_factory(**options: Any) -> TaskConnector:
+    """Import the jev-mcp connector on first use and build it with `options`."""
+    return _import_factory("harness2.core.intake_mcp:connector_from_options")(**options)
+
+
 register(DEFAULT, _local_factory)
+register("jev-mcp", _jev_mcp_factory)
