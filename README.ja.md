@@ -61,7 +61,7 @@ Harness² が想定するのは**オープンワールド**、つまりハーネ
 <p align="center">
   <picture>
     <source media="(prefers-color-scheme: dark)" srcset="assets/architecture/architecture-dark.svg">
-    <img src="assets/architecture/architecture-light.svg" alt="Harness² のアーキテクチャ図。CLI（harness2-setup/-check、harness2、harness2-demo、harness2-judge/-report）が harness2.core を動かす。core では schedule がタスクごとに k 回の共有ベースロールアウトを実行し、タスクレベルの再帰が c1..c8 のハーネスツリーと正解を含まない証拠ツリーを使って Propose・Probe・Compose を行い、selection が k 個の最終候補から 1 つを盲目的に選んで振り返る。採用されたハーネスと教訓はドメイン別ライブラリ（MemoryConnector。既定は FileConnector で、ほかのコネクターに差し替えられる）に入り、次のタスクを導く。core は実行・評価側を呼び出す。ベンチマークアダプタ（JobBench、LAB、WorkBuddy-Bench）がサブストレート（OpenCode または Codex CLI）上でロールアウトを起動し、サブストレートは Vertex AI のモデル（実行器・採点用の Gemini、改善用の Claude または Gemini）を呼ぶ。出力は runs/ に保存される。" width="100%">
+    <img src="assets/architecture/architecture-light.svg" alt="Harness² のアーキテクチャ図。CLI（harness2-setup/-check、harness2、harness2-demo、harness2-judge/-report）が harness2.core を動かす。core では schedule がタスクごとに k 回の共有ベースロールアウトを実行し、タスクレベルの再帰が c1..c8 のハーネスツリーと正解を含まない証拠ツリーを使って Propose・Probe・Compose を行い、selection が k 個の最終候補から 1 つを盲目的に選んで振り返る。採用されたハーネスと教訓はドメイン別ライブラリ（MemoryConnector。既定は FileConnector で、ほかのコネクターに差し替えられる）に入り、次のタスクを導く。core は実行・評価側を呼び出す。ベンチマークアダプタ（JobBench、LAB、WorkBuddy-Bench）がサブストレート（OpenCode または Codex CLI）上でロールアウトを起動し、サブストレートは Vertex AI のモデル（実行器・採点用の Gemini、改善用の Claude または Gemini）を呼ぶ。タスクの取り込みでは、TaskConnector（ローカルのフォルダか module:Attr で差し込むもの）が受け取ったタスクを正規化に渡して TaskSpec にし、IntakeAdapter がベンチマークのアダプターと同じように実行し（private_criteria は採点者だけが読む）、選ばれた実行の output/ をコネクターで届ける。出力は runs/ に保存される。" width="100%">
   </picture>
 </p>
 
@@ -190,8 +190,12 @@ harness2-report --bench lab --k 1 --mode parallel
 | パス | 内容 |
 |---|---|
 | [`harness2/core/`](harness2/core) | 手法本体: スケジューリング、再帰、プロンプト、改善セッション、証拠ツリー、ハーネスツリー、選択、ライブラリ、予算台帳、採点とレポート |
+| [`harness2/core/intake.py`](harness2/core/intake.py) | タスクの取り込み: RawTask、TaskSpec とそのスキーマ、TaskConnector の登録 |
+| [`harness2/core/normalize.py`](harness2/core/normalize.py) | 受け取ったタスクを TaskSpec に直す正規化（passthrough と model） |
+| [`harness2/core/intake_local.py`](harness2/core/intake_local.py) | ローカルのフォルダのタスクコネクター（inbox、outbox、failed） |
 | [`harness2/substrate/`](harness2/substrate) | 共通インターフェースの背後にある実行器: OpenCode と Codex CLI |
 | [`harness2/benchmarks/`](harness2/benchmarks) | JobBench、LAB、WorkBuddy-Bench のアダプタ |
+| [`harness2/benchmarks/intake.py`](harness2/benchmarks/intake.py) | ベンチマーク以外のタスク向けの IntakeAdapter と `run_intake` |
 | [`harness2/cli/`](harness2/cli) | `harness2-*` コマンド群 |
 | [`harness2/demo.py`](harness2/demo.py) | `harness2-demo` が使う決定的なローカルアダプタ |
 | [`docs/`](docs) | セットアップ、ベンチマーク、実験のガイド（英語） |
