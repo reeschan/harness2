@@ -61,6 +61,7 @@ OPENCODE_SURFACE = SurfaceSpec(
     subagent_requires_mode=True,
     plugin_dir="plugin",
     hooks_file=None,
+    memory_file="LongTermMEMORY.md",
     stubs=(
         (
             "scripts/README.md",

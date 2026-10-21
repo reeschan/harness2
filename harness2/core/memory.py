@@ -31,6 +31,7 @@ from pathlib import Path
 from typing import Callable, Mapping, Protocol, Sequence, runtime_checkable
 
 from . import context, library
+from . import recall as recall_block
 from . import tree as harness_tree
 from .library import Library
 from .tree import SurfaceSpec
@@ -167,15 +168,28 @@ def store(
 ) -> Path | None:
     """Hand one adopted harness and its experience to `conn`.
 
-    An incomplete experience stores nothing and returns None. Otherwise the tree and the
-    experience text are checked for grader verdicts before `conn.add` is called, and its
-    result is returned.
+    An incomplete experience stores nothing and returns None. Otherwise every recall block is
+    stripped from the tree, the stripped tree and the experience text are checked for grader
+    verdicts, and `conn.add` is called with the stripped tree; its result is returned.
     """
     if not library.has_experience(experience):
         return None
+    harness = recall_block.strip(harness)
     context.assert_tree_has_no_grader_verdicts(harness)
     context.assert_tree_has_no_grader_verdicts({"EXPERIENCE.md": str(experience) + why})
     return conn.add(task_id, harness, why=why, label=label, run_id=run_id, experience=experience)
+
+
+def recall(conn: MemoryConnector, task_id: str, limit_chars: int) -> str:
+    """The connector's recall text for `task_id`, cut to `limit_chars`.
+
+    Recall is optional: a connector without a callable `recall`, or a `limit_chars` of zero or
+    less, gives "".
+    """
+    fn = getattr(conn, "recall", None)
+    if not callable(fn) or limit_chars <= 0:
+        return ""
+    return (fn(task_id, limit_chars) or "")[:limit_chars]
 
 
 register(DEFAULT, FileConnector)

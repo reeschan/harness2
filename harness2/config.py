@@ -91,6 +91,8 @@ def require(name: str, *, needed_by: str) -> str:
 RUNS = Path(env("HARNESS2_RUNS_DIR", ROOT / "runs")).expanduser().resolve()
 # Non-empty: sweeps share one library root per benchmark across runs (scope-<value>).
 MEMORY_SCOPE = env("HARNESS2_MEMORY_SCOPE", "")
+# "1": inject each mode's library recall into the starting harness (off by default).
+MEMORY_RECALL = env("HARNESS2_MEMORY_RECALL", "0") == "1"
 VERTEX_PROJECT = env("GOOGLE_CLOUD_PROJECT", env("HARNESS2_VERTEX_PROJECT", ""))
 VERTEX_REGION = env("GOOGLE_CLOUD_LOCATION", "global")
 if VERTEX_PROJECT:

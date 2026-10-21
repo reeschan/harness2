@@ -155,7 +155,7 @@ def _main(args: argparse.Namespace) -> int:
 
     only = _csv(args.only_domains)
     lanes = args.workers
-    warning = _memory_warning(memory.connector_name(), scope)
+    warning = _memory_warning(memory.connector_name(), scope, recall=config.MEMORY_RECALL)
     if warning:
         print(warning, flush=True)
     print(
@@ -177,6 +177,7 @@ def _main(args: argparse.Namespace) -> int:
         max_tasks=args.max_tasks,
         pool_policy="finals",
         memory_scope=scope,
+        memory_recall=config.MEMORY_RECALL,
     )
 
     stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
@@ -213,13 +214,16 @@ def _main(args: argparse.Namespace) -> int:
     return 2 if failed else 0
 
 
-def _memory_warning(connector: str, scope: str) -> str | None:
-    """One `warning:` line when the memory setting is not the default (file, no scope)."""
-    if connector == memory.DEFAULT and not scope:
+def _memory_warning(connector: str, scope: str, recall: bool = False) -> str | None:
+    """One `warning:` line when the memory setting is not the default (file, no scope,
+    no recall)."""
+    if connector == memory.DEFAULT and not scope and not recall:
         return None
+    on = " recall=on" if recall else ""
+    off = ", no recall" if recall else ""
     return (
-        f"warning: memory connector={connector!r} scope={scope!r}; results are not comparable "
-        f"with the published per-run setting (connector 'file', no scope)"
+        f"warning: memory connector={connector!r} scope={scope!r}{on}; results are not "
+        f"comparable with the published per-run setting (connector 'file', no scope{off})"
     )
 
 
