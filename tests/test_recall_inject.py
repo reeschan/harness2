@@ -96,6 +96,16 @@ class InjectTest(unittest.TestCase):
                     recall.inject(OC, t, f"note {m} here")
         self.assertEqual(t, before)
 
+    def test_reserved_delimiter_raises(self):
+        t = oc_tree()
+        before = copy.deepcopy(t)
+        for m in (recall.BEGIN, recall.END):
+            with self.subTest(marker=m):
+                with self.assertRaises(ValueError) as cm:
+                    recall.inject(OC, t, "lesson " + m + " tail")
+                self.assertIn("reserved recall delimiter", str(cm.exception))
+                self.assertEqual(t, before)
+
 
 class RoomTest(unittest.TestCase):
     def test_text_of_room_size_fits_cap(self):

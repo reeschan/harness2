@@ -57,13 +57,16 @@ def _block(text: str) -> str:
 def inject(surface: SurfaceSpec, tree: harness_tree.Tree, text: str) -> harness_tree.Tree:
     """A copy of `tree` with `text` appended to the target file between BEGIN and END.
 
-    Empty text returns an unchanged copy. Text carrying a grader-verdict marker raises
-    ValueError. A target file missing from the tree is created holding only the block.
+    Empty text returns an unchanged copy. Text carrying a grader-verdict marker, BEGIN or END
+    raises ValueError. A target file missing from the tree is created holding only the block.
     """
     out = dict(tree)
     if not text:
         return out
     context.assert_tree_has_no_grader_verdicts({"RECALL.md": text})
+    for marker in (BEGIN, END):
+        if marker in text:
+            raise ValueError(f"recall text contains a reserved recall delimiter: {marker}")
     rel = target_file(surface)
     if rel in out:
         out[rel] = out[rel] + _SEP + _block(text)
