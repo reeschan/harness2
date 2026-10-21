@@ -19,6 +19,7 @@ import subprocess
 import sys
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from harness2.core import intake
 from harness2.core.intake import RawTask, TaskConnector, TaskSpec
@@ -326,6 +327,183 @@ class RegistryTest(unittest.TestCase):
         with self.assertRaises(TypeError) as cm:
             intake.connector_for(name="bad")
         self.assertIn("not a TaskConnector", str(cm.exception))
+
+
+class FullConnector(FakeConnector):
+    """A connector with every optional capability."""
+
+    def __init__(self, **options):
+        super().__init__(**options)
+        self.workspace_policy = intake.WorkspacePolicy(
+            exclude=(".tasks",), guard=lambda worktree, source: None
+        )
+        self.scrub_env = ["SECRET_KEY", "OTHER_TOKEN"]
+        self.closed = 0
+
+    def _judge(self, run_dir, task_id, criteria):
+        return {"n_passed": 1, "n_criteria": 1, "all_pass": True}
+
+    def judge(self):
+        return self._judge
+
+    def report(self, task_id):
+        return f"{task_id}: ok"
+
+    def close(self):
+        self.closed += 1
+
+
+class CapabilitiesTest(unittest.TestCase):
+    def test_defaults_for_a_plain_connector(self):
+        caps = intake.capabilities(FakeConnector())
+        self.assertEqual(caps.workspace_policy, intake.WorkspacePolicy())
+        self.assertEqual(caps.workspace_policy.exclude, ())
+        self.assertIsNone(caps.workspace_policy.guard)
+        self.assertEqual(caps.scrub_env, ())
+        self.assertIsNone(caps.judge)
+        self.assertIsNone(caps.report)
+        self.assertIsNone(caps.close())
+
+    def test_none_attributes_count_as_missing(self):
+        conn = FakeConnector()
+        conn.workspace_policy = None
+        conn.scrub_env = None
+        caps = intake.capabilities(conn)
+        self.assertEqual(caps.workspace_policy, intake.WorkspacePolicy())
+        self.assertEqual(caps.scrub_env, ())
+
+    def test_every_capability_is_read(self):
+        conn = FullConnector()
+        caps = intake.capabilities(conn)
+        self.assertIs(caps.workspace_policy, conn.workspace_policy)
+        self.assertEqual(caps.workspace_policy.exclude, (".tasks",))
+        self.assertEqual(caps.scrub_env, ("SECRET_KEY", "OTHER_TOKEN"))
+        result = caps.judge(Path("/r"), "t1", ["c"])
+        self.assertEqual(result, {"n_passed": 1, "n_criteria": 1, "all_pass": True})
+        self.assertEqual(caps.report("t1"), "t1: ok")
+        caps.close()
+        self.assertEqual(conn.closed, 1)
+
+    def test_judge_method_may_return_none(self):
+        conn = FakeConnector()
+        conn.judge = lambda: None
+        self.assertIsNone(intake.capabilities(conn).judge)
+
+    def test_wrong_types_raise(self):
+        cases = {
+            "workspace_policy": ("workspace_policy", {"exclude": ("x",)}, "dict"),
+            "scrub_env str": ("scrub_env", "SECRET", "str"),
+            "scrub_env int": ("scrub_env", 3, "int"),
+            "scrub_env item": ("scrub_env", ["OK", 1], "int"),
+            "judge": ("judge", 1, "int"),
+            "judge result": ("judge", lambda: "not callable", "str"),
+            "report": ("report", "text", "str"),
+            "close": ("close", 0, "int"),
+            "exclude": ("workspace_policy", intake.WorkspacePolicy(exclude=["a"]), "list"),
+            "guard": ("workspace_policy", intake.WorkspacePolicy(guard="g"), "str"),
+        }
+        for label, (attr, value, type_name) in cases.items():
+            with self.subTest(case=label):
+                conn = FakeConnector()
+                setattr(conn, attr, value)
+                with self.assertRaises(TypeError) as cm:
+                    intake.capabilities(conn)
+                self.assertIn(attr, str(cm.exception))
+                self.assertIn(type_name, str(cm.exception))
+
+
+class FakeEntryPoint:
+    def __init__(self, name, target):
+        self.name = name
+        self._target = target
+        self.loaded = 0
+
+    def load(self):
+        self.loaded += 1
+        return self._target
+
+
+class EntryPointTest(unittest.TestCase):
+    def setUp(self):
+        self._saved = copy.copy(intake._REGISTRY)
+
+    def tearDown(self):
+        intake._REGISTRY.clear()
+        intake._REGISTRY.update(self._saved)
+
+    def _patch(self, *eps):
+        calls = []
+
+        def entry_points(**kwargs):
+            calls.append(kwargs)
+            return list(eps)
+
+        patcher = mock.patch("importlib.metadata.entry_points", entry_points)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        return calls
+
+    def test_group_name(self):
+        self.assertEqual(intake.ENTRY_POINT_GROUP, "harness2.task_connectors")
+
+    def test_resolve_by_entry_point_name(self):
+        calls = self._patch(FakeEntryPoint("ext", FakeConnector))
+        self.assertIs(intake.resolve_factory("ext"), FakeConnector)
+        self.assertEqual(calls[0], {"group": intake.ENTRY_POINT_GROUP})
+        conn = intake.connector_for(name="ext", root="/r")
+        self.assertIsInstance(conn, FakeConnector)
+        self.assertEqual(conn.options, {"root": "/r"})
+        conn = intake.connector_for(env={intake.ENV_VAR: "ext"})
+        self.assertIsInstance(conn, FakeConnector)
+        self.assertIn("ext", intake.names())
+        self.assertIn("local", intake.names())
+
+    def test_builtin_registration_comes_first(self):
+        ep = FakeEntryPoint("fake", FullConnector)
+        self._patch(ep)
+        intake.register("fake", FakeConnector)
+        self.assertIs(intake.resolve_factory("fake"), FakeConnector)
+        self.assertNotIsInstance(intake.connector_for(name="fake"), FullConnector)
+        self.assertEqual(ep.loaded, 0)
+        self.assertEqual(intake.names().count("fake"), 1)
+
+    def test_entry_point_comes_before_import_path(self):
+        self._patch(FakeEntryPoint(f"{__name__}:FakeConnector", FullConnector))
+        self.assertIs(intake.resolve_factory(f"{__name__}:FakeConnector"), FullConnector)
+
+    def test_import_path_still_works(self):
+        self._patch(FakeEntryPoint("ext", FullConnector))
+        self.assertIs(intake.resolve_factory(f"{__name__}:FakeConnector"), FakeConnector)
+
+    def test_unknown_name_lists_registered_and_entry_points(self):
+        self._patch(FakeEntryPoint("ext", FakeConnector))
+        for call in (
+            lambda: intake.resolve_factory("nope"),
+            lambda: intake.connector_for(name="nope"),
+        ):
+            with self.assertRaises(ValueError) as cm:
+                call()
+            self.assertIn("unknown task connector 'nope'", str(cm.exception))
+            self.assertIn("local", str(cm.exception))
+            self.assertIn("ext", str(cm.exception))
+
+    def test_entry_point_errors(self):
+        class Broken:
+            name = "broken"
+
+            def load(self):
+                raise ImportError("no module")
+
+        self._patch(Broken(), FakeEntryPoint("number", 42))
+        with self.assertRaises(ValueError):
+            intake.connector_for(name="broken")
+        with self.assertRaises(TypeError):
+            intake.connector_for(name="number")
+
+    def test_only_local_is_built_in(self):
+        self._patch()
+        self.assertEqual(intake.names(), ["local"])
+        self.assertEqual(sorted(intake._REGISTRY), ["local"])
 
 
 if __name__ == "__main__":

@@ -37,6 +37,12 @@ style: {
   style.font-size: 15
 }
 
+(** <-> **)[*]: {
+  style.stroke: "{{edge}}"
+  style.font-color: "{{edge_text}}"
+  style.font-size: 15
+}
+
 cli: "CLI  ·  harness2-*" {
   class: group
   style.fill: "{{cli_bg}}"
@@ -91,9 +97,11 @@ core: "harness2.core  ·  the method (benchmark-independent)" {
     style.stroke: transparent
     grid-rows: 1
     grid-gap: 120
-    library: "MemoryConnector\nper-domain experience\n= improvement harness\nscope: per run | HARNESS2_MEMORY_SCOPE" {
+    library: "MemoryConnector\nper-domain experience\n= improvement harness\nscope: per run |\nHARNESS2_MEMORY_SCOPE" {
       class: box
       shape: cylinder
+      width: 300
+      height: 170
     }
     selection: "selection\nblind pick of a final\n+ reflection" {class: box}
     routes: "model connector  ·  config.ROLES\nrole → route table\nexecutor: oc · cx\nimprover: opencode · claude_cli\njudge: jb · lab · wb" {
@@ -130,14 +138,18 @@ exec: "Execution & evaluation" {
     style.stroke: "{{bench_stroke}}"
     style.stroke-dash: 4
     style.font-color: "{{text}}"
-    grid-rows: 1
-    grid-gap: 120
+    grid-rows: 2
+    grid-columns: 2
+    horizontal-gap: 120
+    vertical-gap: 60
 
-    connector: "TaskConnector\nlocal folder | module:Attr" {class: box}
+    connector: "TaskConnector\nlocal | entry point | module:Attr" {class: box}
     normalizer: "normalizer\nRawTask → TaskSpec\n(schema check, 1 retry)" {class: box}
+    ext: "external task connector\nentry point | module:Attr" {class: box; width: 300}
   }
 
   bench: "benchmarks  ·  adapters" {
+    label.near: top-left
     class: group
     style.fill: "{{bench_bg}}"
     style.stroke: "{{bench_stroke}}"
@@ -159,6 +171,7 @@ exec: "Execution & evaluation" {
   }
 
   substrate: "substrate  ·  task executors" {
+    label.near: top-left
     class: group
     style.fill: "{{sub_bg}}"
     style.stroke: "{{sub_stroke}}"
@@ -181,6 +194,13 @@ exec: "Execution & evaluation" {
       label.near: top-center
       icon.near: bottom-center
       icon: {{icons}}/openai.svg
+    }
+    ws: "" {
+      style.fill: transparent
+      style.stroke: transparent
+      direction: right
+      worktree: "git worktree per rollout\nchanges.diff (policy exclude)" {class: box}
+      source: "source repo\napply chosen diff\n(after policy guard)" {class: box}
     }
   }
 
@@ -248,7 +268,7 @@ core.outputs.routes -> exec.models: {style.stroke-dash: 4}
 exec.intake.connector -> exec.intake.normalizer: "RawTask"
 exec.intake.normalizer -> exec.bench.intake: "TaskSpec"
 exec.bench.intake -> exec.substrate
-core.task -> exec.intake.connector: {
-  style.stroke-dash: 4
-  source-arrowhead.label: "deliver chosen\nrun's output/"
-}
+core.task -> exec.intake.connector: "deliver chosen\nrun's output" {style.stroke-dash: 4}
+exec.intake.ext <-> exec.intake.connector: "claim task ·\nreport"
+exec.bench.intake -> exec.substrate.ws.worktree: "rollout"
+exec.substrate.ws.worktree -> exec.substrate.ws.source: "apply\nchosen diff" {style.stroke-dash: 4}
