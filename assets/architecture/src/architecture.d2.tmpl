@@ -124,6 +124,19 @@ exec: "Execution & evaluation" {
   grid-columns: 1
   grid-gap: 30
 
+  intake: "task intake  ·  external tasks" {
+    class: group
+    style.fill: "{{bench_bg}}"
+    style.stroke: "{{bench_stroke}}"
+    style.stroke-dash: 4
+    style.font-color: "{{text}}"
+    grid-rows: 1
+    grid-gap: 120
+
+    connector: "TaskConnector\nlocal folder | module:Attr" {class: box}
+    normalizer: "normalizer\nRawTask → TaskSpec\n(schema check, 1 retry)" {class: box}
+  }
+
   bench: "benchmarks  ·  adapters" {
     class: group
     style.fill: "{{bench_bg}}"
@@ -142,6 +155,7 @@ exec: "Execution & evaluation" {
       icon.near: bottom-center
       icon: {{icons}}/docker.svg
     }
+    intake: "IntakeAdapter\nprivate_criteria → judge only" {class: box; width: 250}
   }
 
   substrate: "substrate  ·  task executors" {
@@ -230,3 +244,11 @@ exec.substrate -> exec.models: "model calls"
 exec.models -> exec.runs: "outputs"
 core.outputs.routes -> exec.substrate.oc: {style.stroke-dash: 4}
 core.outputs.routes -> exec.models: {style.stroke-dash: 4}
+
+exec.intake.connector -> exec.intake.normalizer: "RawTask"
+exec.intake.normalizer -> exec.bench.intake: "TaskSpec"
+exec.bench.intake -> exec.substrate
+core.task -> exec.intake.connector: {
+  style.stroke-dash: 4
+  source-arrowhead.label: "deliver chosen\nrun's output/"
+}

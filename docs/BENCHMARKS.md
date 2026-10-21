@@ -122,3 +122,97 @@ the improver never receives verifier output. Missing verifier results remain
 unscored. Runs live under `runs/wb/<subset>/`.
 
 For Codex, start the bridge with `harness2-bridge --host 0.0.0.0` so that the containers can reach it.
+
+## Task intake (non-benchmark tasks)
+
+Task intake runs Harness² on tasks that do not come from a benchmark. A task
+connector polls for raw tasks and fetches their attachments; a normalizer turns
+each raw task into a `TaskSpec`; `IntakeAdapter` stores the spec and exposes the
+tasks through the same adapter interface as the benchmarks, so the existing loop
+(`schedule.run_task`) runs them unchanged. `run_intake` then hands the chosen
+run's `workspace/output/` back to the connector, or reports the task as failed.
+
+### The local folder connector
+
+The default connector, `local` (`harness2/core/intake_local.py`), needs no
+outside service. Everything lives under one root folder:
+
+| Path | Contents |
+|---|---|
+| `inbox/<id>/task.json` | Optional. `{"title": ..., "body": ..., "meta": {...}}`; a `task_spec` entry in `meta` is used as is by the `passthrough` normalizer |
+| `inbox/<id>/task.md` | Optional. The body; the title is the first `# ` heading, or the id. When both files exist, `task.json` wins |
+| `inbox/<id>/files/` | Optional. The attachments |
+| `outbox/<id>/` | A delivered task: a copy of the deliverable directory plus `summary.json` |
+| `failed/<id>.json` | A failed task: `{"task_id": ..., "reason": ...}` |
+
+A task id must match `^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$`; other inbox folders
+are skipped. A task with an outbox folder or a failed record is not polled
+again. Symbolic links are never followed or copied.
+
+### Choosing a connector and a normalizer
+
+| Variable | Default | Values |
+|---|---|---|
+| `HARNESS2_TASK_CONNECTOR` | `local` | A registered name, or a `module:Attr` import path to a connector factory |
+| `HARNESS2_NORMALIZER` | `passthrough` | `passthrough`, `model`, or a `module:Attr` import path to a normalizer factory |
+
+`passthrough` reads an already structured task, from `meta["task_spec"]` or
+from the body as JSON, without a model. `model` asks a model to write the spec;
+use it only when the `normalizer` route has a model configured
+(`config.ROLES["normalizer"]`) or when you pass `proposer=` to
+`normalizer_for`, otherwise it stops with an error. Either way, a spec that
+fails validation is retried once with the problems as feedback, and a second
+failure sends the task to `connector.fail`.
+
+### TaskSpec keys
+
+The normalizer's output is checked against `TASK_SPEC_SCHEMA` in
+`harness2/core/intake.py`. Unknown keys are rejected.
+
+| Key | Required | Type | Notes |
+|---|---|---|---|
+| `task_id` | yes | string | Pattern `^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$`; must equal the incoming id |
+| `domain` | yes | string | Same pattern; reuse an existing domain when one fits |
+| `prompt` | yes | string | The task as the worker reads it; at least 1 character |
+| `files` | yes | array of string | Attachment paths relative to the task's files directory; empty means every attachment |
+| `deliverable` | yes | object | `what` (required string) and `where` (optional string, a path relative to `output/`) |
+| `prompts` | yes | object | `work` (required), `domain_word`, `deliverable_word`, `yardstick` (optional strings) |
+| `private_criteria` | no | array of string | Acceptance criteria hidden from the agent (see below) |
+
+Paths in `files` and `deliverable.where` must be relative, use `/`, and contain
+no `..` segment.
+
+### Private criteria
+
+`private_criteria` are stored only in `<root>/private/<task_id>.json`. They
+never enter the task's `spec.json`, its files, the rollout workspace, the
+prompts, or the evidence and context that the improver reads, and an attachment
+named `private_criteria*` is not ingested. The improver never sees them; only
+the judge passed to `IntakeAdapter` reads them, through `score()`, which runs
+after selection. Without a judge, `score()` returns `None` and the method still
+runs: selection never looks at scores.
+
+### Running from Python
+
+```python
+from pathlib import Path
+
+from harness2.benchmarks.intake import IntakeAdapter, run_intake
+from harness2.core.intake import connector_for
+from harness2.core.normalize import normalizer_for
+
+adapter = IntakeAdapter(
+    Path("runs/intake"),
+    connector_for(root="intake-root"),  # the local folder connector
+    normalizer_for(),                   # passthrough by default
+    launcher=my_launcher,               # your Launcher implementation
+    channel=prop.spec,
+)
+results = run_intake(adapter, prop, k=2, runs_root=Path("runs/intake/runs"))
+```
+
+`my_launcher` is your own object with a `launch(*, workspace, prompt, install,
+run_dir, timeout)` method: it runs the agent in `workspace`, leaves the
+deliverables in `workspace/output/`, and writes `run_dir/trajectory.md`. `prop`
+is the improver's `Proposer`. A launcher that starts rollouts on a real
+substrate will be added in a later release.

@@ -79,7 +79,7 @@ launchers, and grading.
 <p align="center">
   <picture>
     <source media="(prefers-color-scheme: dark)" srcset="assets/architecture/architecture-dark.svg">
-    <img src="assets/architecture/architecture-light.svg" alt="Harness² architecture. The CLI (harness2-setup/-check, harness2, harness2-demo, harness2-judge/-report) drives harness2.core. In core, schedule runs k shared base rollouts per task; task-level recursion runs Propose, Probe and Compose using the c1..c8 harness tree and an answer-free evidence tree; selection blindly picks one of the k finals and reflects on it; the adopted harness and lesson go into the per-domain library, a MemoryConnector (FileConnector by default, swappable for another connector), which guides the next task. Core calls out to execution and evaluation: benchmark adapters (JobBench, LAB, WorkBuddy-Bench) launch rollouts on a substrate (OpenCode or Codex CLI), which calls Vertex AI models (Gemini executor and judge; Claude or Gemini improver). Outputs are written to runs/." width="100%">
+    <img src="assets/architecture/architecture-light.svg" alt="Harness² architecture. The CLI (harness2-setup/-check, harness2, harness2-demo, harness2-judge/-report) drives harness2.core. In core, schedule runs k shared base rollouts per task; task-level recursion runs Propose, Probe and Compose using the c1..c8 harness tree and an answer-free evidence tree; selection blindly picks one of the k finals and reflects on it; the adopted harness and lesson go into the per-domain library, a MemoryConnector (FileConnector by default, swappable for another connector), which guides the next task. Core calls out to execution and evaluation: benchmark adapters (JobBench, LAB, WorkBuddy-Bench) launch rollouts on a substrate (OpenCode or Codex CLI), which calls Vertex AI models (Gemini executor and judge; Claude or Gemini improver). Task intake brings in external tasks: a TaskConnector (a local folder or a module:Attr plug-in) passes raw tasks to a normalizer that turns them into a TaskSpec, the IntakeAdapter runs them like a benchmark adapter with private criteria visible only to the judge, and the chosen run's output/ is delivered back through the connector. Outputs are written to runs/." width="100%">
   </picture>
 </p>
 
@@ -242,8 +242,12 @@ for details; each command also supports `--help`.
 | Path | Contents |
 |---|---|
 | [`harness2/core/`](harness2/core) | The method: scheduling, recursion, prompts, proposer, evidence tree, harness tree, selection, library, budget ledger, judging and reports |
+| [`harness2/core/intake.py`](harness2/core/intake.py) | Task intake: RawTask, TaskSpec and its schema, and the TaskConnector registry |
+| [`harness2/core/normalize.py`](harness2/core/normalize.py) | Normalizers that turn a raw task into a TaskSpec (passthrough and model) |
+| [`harness2/core/intake_local.py`](harness2/core/intake_local.py) | The local folder task connector (inbox, outbox, failed) |
 | [`harness2/substrate/`](harness2/substrate) | Executors behind one interface: OpenCode and Codex CLI |
 | [`harness2/benchmarks/`](harness2/benchmarks) | Adapters for JobBench, LAB, and WorkBuddy-Bench |
+| [`harness2/benchmarks/intake.py`](harness2/benchmarks/intake.py) | IntakeAdapter and `run_intake` for non-benchmark tasks |
 | [`harness2/cli/`](harness2/cli) | The `harness2-*` commands |
 | [`harness2/demo.py`](harness2/demo.py) | Deterministic local adapter used by `harness2-demo` |
 | [`docs/`](docs) | Setup, benchmark, and experiment guides |
