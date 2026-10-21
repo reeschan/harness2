@@ -157,7 +157,8 @@ class ConnectorContractTests:
 
     Subclass it together with `unittest.TestCase` and implement `make_connector(tmp)`. Override
     `make_run_dir(tmp, task_id)` to give the judge a richer run directory, and `judge_task_id`
-    (the task_id passed to the judge) / `judge_criteria` to change what the judge is called with.
+    (set it to pass a fixed task_id to the judge instead of each polled task_id) /
+    `judge_criteria` to change what the judge is called with.
     """
 
     judge_task_id: str = ""
@@ -222,7 +223,9 @@ class ConnectorContractTests:
         task_ids = [raw.id for raw in conn.poll()] or ["contract-task"]
         for task_id in task_ids:
             run_dir = self.make_run_dir(tmp, task_id)
-            check_judge_result(judge(run_dir, self.judge_task_id, tuple(self.judge_criteria)))
+            check_judge_result(
+                judge(run_dir, self.judge_task_id or task_id, tuple(self.judge_criteria))
+            )
 
     def test_contract_report_returns_text_or_none(self) -> None:
         tmp = self._tmp()

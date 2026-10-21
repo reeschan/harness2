@@ -91,7 +91,7 @@ class FullConnector:
         return None
 
     def judge(self):
-        def run(run_dir: Path, report: str, criteria) -> dict:
+        def run(run_dir: Path, task_id: str, criteria) -> dict:
             assert run_dir.is_dir()
             return {"n_passed": 1, "n_criteria": 2, "all_pass": False}
 
@@ -107,6 +107,55 @@ class FullConnector:
 class FullConnectorContractTest(ConnectorContractTests, unittest.TestCase):
     def make_connector(self, tmp: Path) -> FullConnector:
         return FullConnector()
+
+
+class RecordingJudgeConnector(FullConnector):
+    """A connector whose judge records the task_id it was called with."""
+
+    def __init__(self, task_ids: Iterable[str]) -> None:
+        super().__init__()
+        self.task_ids = list(task_ids)
+        self.judge_task_ids: list[str] = []
+
+    def poll(self) -> Iterable[RawTask]:
+        return [RawTask(id=task_id, title="T", body="B") for task_id in self.task_ids]
+
+    def judge(self):
+        def run(run_dir: Path, task_id: str, criteria) -> dict:
+            assert run_dir.is_dir()
+            self.judge_task_ids.append(task_id)
+            return {"n_passed": 1, "n_criteria": 2, "all_pass": False}
+
+        return run
+
+
+def _contract_test(connector: FullConnector, judge_task_id: str = "") -> unittest.TestCase:
+    """A `ConnectorContractTests` test case for `connector`, callable directly."""
+
+    class ContractTest(ConnectorContractTests, unittest.TestCase):
+        def make_connector(self, tmp: Path) -> FullConnector:
+            return connector
+
+    ContractTest.judge_task_id = judge_task_id
+    return ContractTest("test_contract_judge_result")
+
+
+class JudgeTaskIdTest(unittest.TestCase):
+    """`test_contract_judge_result` passes each polled task_id unless judge_task_id is set."""
+
+    def test_default_uses_each_polled_task_id(self) -> None:
+        connector = RecordingJudgeConnector(["t1", "t2"])
+        case = _contract_test(connector)
+        case.test_contract_judge_result()
+        case.doCleanups()
+        self.assertEqual(connector.judge_task_ids, ["t1", "t2"])
+
+    def test_judge_task_id_overrides_polled_task_ids(self) -> None:
+        connector = RecordingJudgeConnector(["t1", "t2"])
+        case = _contract_test(connector, judge_task_id="pinned")
+        case.test_contract_judge_result()
+        case.doCleanups()
+        self.assertEqual(connector.judge_task_ids, ["pinned", "pinned"])
 
 
 class BadScrubEnv(FullConnector):
