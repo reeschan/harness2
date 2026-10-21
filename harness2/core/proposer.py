@@ -38,6 +38,9 @@ from .spec import ChannelSpec
 
 SYSTEM_ARG_MAX = 120_000
 
+# The only tools a claude_cli session gets: file tools, no command or web tools.
+CLAUDE_CLI_TOOLS = "Read,Edit,Write,Glob,Grep"
+
 
 MAX_CONCURRENCY = int(config.PROPOSER_CONCURRENCY)
 _SEM = threading.BoundedSemaphore(MAX_CONCURRENCY) if MAX_CONCURRENCY > 0 else None
@@ -211,9 +214,19 @@ class Proposer:
         self, cwd: Path, mission: str, system: str, wall: int
     ) -> tuple[str, float, str]:
         cli = shutil.which("claude") or "claude"
+        # Fence the session like OPENCODE_PERMISSION does for _opencode: file tools only,
+        # confined to cwd (the context is copied to cwd/context, so no --add-dir), no
+        # command tools, no MCP servers, and anything that would prompt is denied.
         cmd = [
             cli,
-            "--dangerously-skip-permissions",
+            "--restricted",
+            "--tools",
+            CLAUDE_CLI_TOOLS,
+            "--permission-mode",
+            "acceptEdits",
+            "--permission-prompts",
+            "none",
+            "--strict-mcp-config",
             "-p",
             "--output-format",
             "json",
