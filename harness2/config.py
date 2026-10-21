@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import os
 import sys
+from dataclasses import dataclass
 from pathlib import Path
 
 PKG = Path(__file__).resolve().parent
@@ -99,11 +100,94 @@ if VERTEX_PROJECT:
     os.environ.setdefault("GOOGLE_CLOUD_PROJECT", VERTEX_PROJECT)
 os.environ.setdefault("GOOGLE_CLOUD_LOCATION", VERTEX_REGION)
 
+_vertex_host = (
+    "aiplatform.googleapis.com"
+    if VERTEX_REGION == "global"
+    else f"{VERTEX_REGION}-aiplatform.googleapis.com"
+)
+VERTEX_OPENAI_URL = (
+    f"https://{_vertex_host}/v1/projects/{VERTEX_PROJECT}"
+    f"/locations/{VERTEX_REGION}/endpoints/openapi"
+)
 
-SOLVER_MODEL_OC = env("HARNESS2_SOLVER_MODEL", "")
-SOLVER_MODEL_CX = env("HARNESS2_CODEX_MODEL", SOLVER_MODEL_OC.split("/", 1)[-1])
-IMPROVER_MODEL = env("HARNESS2_IMPROVER_MODEL", SOLVER_MODEL_OC)
-JUDGE_MODEL = env("HARNESS2_JUDGE_MODEL", "")
+
+@dataclass(frozen=True)
+class ModelRoute:
+    """How one role reaches its model. `auth_env` names the key's env variable, never its value."""
+
+    role: str
+    provider: str
+    model: str
+    endpoint: str = ""
+    auth_env: str = ""
+
+
+def _opencode_provider(model: str) -> str:
+    """The provider of an OpenCode `provider/model` ID ("" when there is no `/`)."""
+    return model.split("/", 1)[0] if "/" in model else ""
+
+
+def _build_roles() -> dict[str, ModelRoute]:
+    """Role -> route, from the environment as it stands after load_dotenv() and VERTEX_*."""
+    solver_oc = env("HARNESS2_SOLVER_MODEL", "")
+    solver_cx = env("HARNESS2_CODEX_MODEL", solver_oc.split("/", 1)[-1])
+    improver = env("HARNESS2_IMPROVER_MODEL", solver_oc)
+    # claude_cli takes HARNESS2_IMPROVER_MODEL as a bare ID; it never falls back to the solver.
+    improver_cli = (
+        env("HARNESS2_IMPROVER_MODEL", "")
+        if env("HARNESS2_IMPROVER_CHANNEL", "opencode") == "claude_cli"
+        else improver
+    )
+    judge = env("HARNESS2_JUDGE_MODEL", "")
+    # JB decides the google/ prefix from HARNESS2_JUDGE_BASE_URL itself, not from the endpoint
+    # (the default Vertex endpoint still gets the prefix).
+    jb_judge = (
+        "google/" + judge
+        if judge.startswith("gemini") and not env("HARNESS2_JUDGE_BASE_URL")
+        else judge
+    )
+    lab_judge = "vertex/" + judge if judge.startswith(("claude", "gemini")) else judge
+    routes = (
+        ModelRoute("executor.oc", _opencode_provider(solver_oc), solver_oc),
+        ModelRoute(
+            "executor.cx",
+            "harness2",
+            solver_cx,
+            endpoint=env("HARNESS2_CODEX_BASE_URL", ""),
+            auth_env="HARNESS2_CODEX_API_KEY",
+        ),
+        ModelRoute("improver.opencode", _opencode_provider(improver), improver),
+        ModelRoute("improver.claude_cli", "claude-code-vertex", improver_cli),
+        ModelRoute(
+            "judge.jb",
+            "openai-compatible",
+            jb_judge,
+            endpoint=env("HARNESS2_JUDGE_BASE_URL", VERTEX_OPENAI_URL if VERTEX_PROJECT else ""),
+            auth_env="HARNESS2_JUDGE_API_KEY",
+        ),
+        ModelRoute("judge.lab", _opencode_provider(lab_judge), lab_judge),
+        # The bare judge ID; the WorkBuddy routes file prefixes it with google/.
+        ModelRoute("judge.wb", "workbuddy", judge),
+        ModelRoute("normalizer", "", ""),
+    )
+    return {r.role: r for r in routes}
+
+
+ROLES: dict[str, ModelRoute] = _build_roles()
+
+
+def route(role: str) -> ModelRoute:
+    """The route for `role`; ValueError listing the known roles when it is unknown."""
+    try:
+        return ROLES[role]
+    except KeyError:
+        raise ValueError(f"unknown role {role!r}; known roles: {', '.join(ROLES)}") from None
+
+
+SOLVER_MODEL_OC = ROLES["executor.oc"].model
+SOLVER_MODEL_CX = ROLES["executor.cx"].model
+IMPROVER_MODEL = ROLES["improver.opencode"].model
+JUDGE_MODEL = ROLES["judge.wb"].model
 
 DEPENDENCY_PINS = {
     "job-bench-eval": "fa03a17f9ff662f136798a274e10011c3aa00fd0",
@@ -134,26 +218,11 @@ def lab_repo() -> Path:
 OPENCODE_DIR = DEPENDENCIES / "opencode"
 BUN = DEPENDENCIES / "tools" / "node_modules" / ".bin" / "bun"
 LAB_PYTHON = lab_repo() / ".venv" / "bin" / "python"
-LAB_JUDGE_MODEL = (
-    "vertex/" + JUDGE_MODEL if JUDGE_MODEL.startswith(("claude", "gemini")) else JUDGE_MODEL
-)
+LAB_JUDGE_MODEL = ROLES["judge.lab"].model
 LAB_DELIV_CAP = 60000
 JB_JUDGE_PYTHON = jb_repo() / ".venv" / "bin" / "python"
-JB_JUDGE_MODEL = (
-    "google/" + JUDGE_MODEL
-    if JUDGE_MODEL.startswith("gemini") and not env("HARNESS2_JUDGE_BASE_URL")
-    else JUDGE_MODEL
-)
-_vertex_host = (
-    "aiplatform.googleapis.com"
-    if VERTEX_REGION == "global"
-    else f"{VERTEX_REGION}-aiplatform.googleapis.com"
-)
-VERTEX_OPENAI_URL = (
-    f"https://{_vertex_host}/v1/projects/{VERTEX_PROJECT}"
-    f"/locations/{VERTEX_REGION}/endpoints/openapi"
-)
-JB_JUDGE_API_BASE = env("HARNESS2_JUDGE_BASE_URL", VERTEX_OPENAI_URL if VERTEX_PROJECT else "")
+JB_JUDGE_MODEL = ROLES["judge.jb"].model
+JB_JUDGE_API_BASE = ROLES["judge.jb"].endpoint
 JB_JUDGE_API_KEY = env("HARNESS2_JUDGE_API_KEY", "")
 JB_JUDGE_REASONING_EFFORT = "low"
 JB_REPORTING_JUDGE_DETAILS = ""
@@ -161,7 +230,7 @@ JB_OBS_TRUNC = 50000
 
 CODEX_VERSION = "0.144.6"
 CODEX_DIST = str(DEPENDENCIES / "codex" / "dist")
-CODEX_BASE_URL = env("HARNESS2_CODEX_BASE_URL", "")
+CODEX_BASE_URL = ROLES["executor.cx"].endpoint
 CODEX_CONTAINER_URL = env("HARNESS2_CODEX_CONTAINER_URL", CODEX_BASE_URL)
 VERTEX_PROXY_KEY = env("HARNESS2_CODEX_API_KEY", "")
 CODEX_HOME_DIR = DEPENDENCIES / "codex" / "home"
@@ -175,17 +244,33 @@ WB_MAX_JOBS = {"oc": 1, "cx": 1}
 WB_MAX_TRIALS = {"oc": 2, "cx": 2}
 WB_MODEL_CONNECTION = "local_proxy"
 
-DEFAULT_PROPOSER_CHANNEL = "opencode"
-PROPOSER_MODEL_BY_CHANNEL = {"opencode": IMPROVER_MODEL, "claude_cli": IMPROVER_MODEL}
+IMPROVER_CHANNELS = ("opencode", "claude_cli")
+DEFAULT_PROPOSER_CHANNEL = env("HARNESS2_IMPROVER_CHANNEL", "opencode")
+PROPOSER_MODEL_BY_CHANNEL = {
+    "opencode": ROLES["improver.opencode"].model,
+    "claude_cli": ROLES["improver.claude_cli"].model,
+}
 PHASE_WIDTH = 2
 TRANSPORT_ATTEMPTS = 2
 PROPOSER_CONCURRENCY = 2
 
 
 def validate_models(*, judge: bool = False) -> None:
+    channel = DEFAULT_PROPOSER_CHANNEL
+    if channel not in IMPROVER_CHANNELS:
+        raise ConfigError(
+            f"HARNESS2_IMPROVER_CHANNEL must be one of {IMPROVER_CHANNELS}, got {channel!r}"
+        )
     require("HARNESS2_SOLVER_MODEL", needed_by="executor rollouts")
-    if "/" not in SOLVER_MODEL_OC or "/" not in IMPROVER_MODEL:
+    if "/" not in SOLVER_MODEL_OC or (channel == "opencode" and "/" not in IMPROVER_MODEL):
         raise ConfigError("Executor and improver models must use OpenCode's provider/model syntax")
+    if channel == "claude_cli":
+        require("HARNESS2_IMPROVER_MODEL", needed_by="the claude_cli improver channel")
+        if "/" in ROLES["improver.claude_cli"].model:
+            raise ConfigError(
+                "The claude_cli improver channel takes a bare model ID without a provider "
+                "prefix in HARNESS2_IMPROVER_MODEL"
+            )
     if any(m.startswith("google-vertex") for m in (SOLVER_MODEL_OC, IMPROVER_MODEL)):
         if not VERTEX_PROJECT:
             raise ConfigError("Set GOOGLE_CLOUD_PROJECT for Vertex AI")
