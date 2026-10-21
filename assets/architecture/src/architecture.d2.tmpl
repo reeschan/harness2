@@ -91,11 +91,23 @@ core: "harness2.core  ·  the method (benchmark-independent)" {
     style.stroke: transparent
     grid-rows: 1
     grid-gap: 120
-    library: "library\nper-domain experience\n= improvement harness" {
+    library: "MemoryConnector\nper-domain experience\n= improvement harness" {
       class: box
       shape: cylinder
     }
     selection: "selection\nblind pick of a final\n+ reflection" {class: box}
+  }
+
+  impls: "" {
+    style.fill: transparent
+    style.stroke: transparent
+    grid-rows: 1
+    grid-gap: 40
+    file: "FileConnector (default)\nfiles under the library root" {class: box}
+    plug: "pluggable connector\ne.g. SharedMemory MCP" {
+      class: box
+      style.stroke-dash: 4
+    }
   }
 }
 
@@ -205,6 +217,8 @@ core.outputs.library -> core.task: "guides the next task\n(harnessing-level recu
   style.stroke-width: 3
   style.font-color: "{{accent_text}}"
 }
+core.outputs.library -> core.impls.file: "default" {style.stroke-dash: 4}
+core.outputs.library -> core.impls.plug: "HARNESS2_MEMORY_CONNECTOR" {style.stroke-dash: 4}
 
 core -> exec: "rollouts ·\nimprover calls" {style.stroke-width: 3}
 exec.bench -> exec.substrate: "launch rollout"

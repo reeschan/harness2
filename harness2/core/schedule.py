@@ -32,8 +32,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Mapping, Sequence
 
-from . import library as library_store
-from . import recursion, runmark, selection
+from . import memory, recursion, runmark, selection
 from . import tree as harness_tree
 from .proposer import Proposer
 from .spec import BenchmarkAdapter, RunView
@@ -206,7 +205,7 @@ def _restore_libraries(
     modes: Sequence[str],
     seed: int | None,
     tag: str,
-    libraries: dict[str, library_store.Library],
+    libraries: dict[str, memory.MemoryConnector],
     selections: dict,
 ) -> None:
     """Replay a skipped task into its libraries from the saved chosen harness."""
@@ -215,18 +214,14 @@ def _restore_libraries(
         lib = libraries.get(mode)
         sel = selections.get(mode) or {}
         label = str(sel.get("chosen_label") or "")
-        if (
-            not lib
-            or not label
-            or not sel.get("ok")
-            or not library_store.has_experience(sel.get("experience"))
-        ):
+        if lib is None or not label or not sel.get("ok"):
             continue
         n = Namespace(adapter.spec.name, adapter.substrate.name, mode, k, seed, tag)
         tree = harness_tree.read_tree(surface, n.task_dir(runs_root, task_id) / "harnesses" / label)
         if not tree:
             continue
-        lib.add(
+        memory.store(
+            lib,
             task_id,
             tree,
             why=str(sel.get("why") or ""),
@@ -329,10 +324,10 @@ def _write_summary(summary_path: Path, res: TaskResult) -> None:
 
 
 def _resolve_libraries(
-    library: library_store.Library | None,
-    libraries: dict[str, library_store.Library] | None,
+    library: memory.MemoryConnector | None,
+    libraries: dict[str, memory.MemoryConnector] | None,
     modes: Sequence[str],
-) -> dict[str, library_store.Library]:
+) -> dict[str, memory.MemoryConnector]:
     mode_libs = dict(libraries or {})
     if library is None:
         return mode_libs
@@ -356,7 +351,7 @@ def _resume(
     modes: Sequence[str],
     seed: int | None,
     tag: str,
-    mode_libs: dict[str, library_store.Library],
+    mode_libs: dict[str, memory.MemoryConnector],
     res: TaskResult,
 ) -> bool:
     """Fill `res` from a cached summary covering every requested mode; True if it did."""
@@ -488,7 +483,7 @@ def _run_one_mode(
     selector: Proposer,
     n: Namespace,
     runs_root: Path,
-    mode_lib: library_store.Library | None,
+    mode_lib: memory.MemoryConnector | None,
     base_tree: harness_tree.Tree,
     surface,
     pool_policy: str,
@@ -496,7 +491,7 @@ def _run_one_mode(
 ) -> None:
     """Run one recursion mode over the shared bases, select a final, and record it on `res`."""
     work_dir = n.task_dir(runs_root, task_id)
-    lib_dir = mode_lib.context_dir() if mode_lib else None
+    lib_dir = mode_lib.context_dir() if mode_lib is not None else None
     r = recursion.run_mode(
         mode,
         task_id,
@@ -526,7 +521,7 @@ def _run_one_mode(
             work_dir=work_dir,
             pool_kind="finals",
         )
-    if mode_lib and sel.ok:
+    if mode_lib is not None and sel.ok:
         selection.reflect_adoption(
             task_id,
             sel,
@@ -552,8 +547,9 @@ def _run_one_mode(
     chosen = candidates.get(sel.chosen_label)
     if sel.ok and chosen is not None and not chosen.delivered:
         res.errors.append(f"{mode}: selected run {chosen.run_id} produced no deliverable")
-    if mode_lib and sel.ok and library_store.has_experience(sel.experience):
-        mode_lib.add(
+    if mode_lib is not None and sel.ok:
+        memory.store(
+            mode_lib,
             task_id,
             chosen_tree,
             why=sel.why,
@@ -573,8 +569,8 @@ def run_task(
     modes: Sequence[str] = MODES,
     seed: int | None = None,
     tag: str = "",
-    library: library_store.Library | None = None,
-    libraries: dict[str, library_store.Library] | None = None,
+    library: memory.MemoryConnector | None = None,
+    libraries: dict[str, memory.MemoryConnector] | None = None,
     selector_prop: Proposer | None = None,
     pool_policy: str = "finals",
 ) -> TaskResult:
@@ -684,8 +680,7 @@ def run_domain(
     """Every task in one domain, in `stream_order()` order, threading the library forward."""
     surface = adapter.substrate.surface()
     libs = {
-        mode: library_store.Library(root=Path(library_root) / mode, domain=domain, surface=surface)
-        for mode in modes
+        mode: memory.connector_for(Path(library_root) / mode, domain, surface) for mode in modes
     }
     out = {
         "domain": domain,
