@@ -15,22 +15,26 @@
 """Memory connectors: interchangeable backends for the per-domain experience library.
 
 A connector is anything with the surface the scheduler uses on a library: `domain`,
-`entries()`, `retain()`, `add()` and `context_dir()`. Connectors are found by name.
+`entries()`, `retain()`, `add()` and `context_dir()`. A connector may also define an optional
+`close()`; the public `close` calls it when present, so a backend holding a connection, a
+session or a file can release it. Connectors are found by name.
 `connector_name` picks the name: an explicit name, then the `HARNESS2_MEMORY_CONNECTOR`
 environment variable, then the default `file`. `resolve_factory` turns the name into a
 factory: a built-in registration (`register`; only the bundled `file` connector by default),
 then an entry point of the same name in the group `harness2.memory_connectors`, then, for a
 name containing `:`, a `module:Attr` import path. An entry point's `load()` and a
 `module:Attr` target are both factories: callables called as `factory(root=Path,
-domain=str, surface=SurfaceSpec)` that return a MemoryConnector. `store` runs the
-grader-verdict checks before handing an experience to any connector, so the checks hold
-whatever the backend does.
+domain=str, surface=SurfaceSpec, **options)` that return a MemoryConnector. `options` holds
+the connector-specific settings; `check_options` checks their names against the factory's
+signature before a run starts. `store` runs the grader-verdict checks before handing an
+experience to any connector, so the checks hold whatever the backend does.
 """
 
 from __future__ import annotations
 
 import importlib
 import importlib.metadata
+import inspect
 import os
 from pathlib import Path
 from typing import Any, Callable, Mapping, Protocol, Sequence, runtime_checkable
@@ -44,7 +48,12 @@ from .tree import SurfaceSpec
 
 @runtime_checkable
 class MemoryConnector(Protocol):
-    """One (run, domain) memory: read before each task, appended after."""
+    """One (run, domain) memory: read before each task, appended after.
+
+    `close()` is optional: a connector that holds a resource may define it to release the
+    resource, and `memory.close` calls it after the domain's tasks. A connector without one is
+    still a MemoryConnector.
+    """
 
     domain: str
 
@@ -71,6 +80,8 @@ FileConnector = Library
 ENV_VAR = "HARNESS2_MEMORY_CONNECTOR"
 DEFAULT = "file"
 ENTRY_POINT_GROUP = "harness2.memory_connectors"
+
+_RESERVED_OPTIONS = ("root", "domain", "surface")
 
 Factory = Callable[..., MemoryConnector]
 
@@ -187,23 +198,79 @@ def connector_for(
     *,
     name: str | None = None,
     env: Mapping[str, str] | None = None,
+    options: Mapping[str, Any] | None = None,
 ) -> MemoryConnector:
     """Build the connector for one (root, domain).
 
     The name comes from `connector_name` and the factory from `resolve_factory` (built-in
     registration, then entry point, then `module:Attr`); the factory is called as
-    `factory(root=Path, domain=str, surface=SurfaceSpec)`. A name found nowhere raises
-    ValueError; a factory result that is not a MemoryConnector raises TypeError.
+    `factory(root=Path, domain=str, surface=SurfaceSpec, **options)`. `options` carries the
+    connector-specific settings and must not set `root`, `domain` or `surface`: harness2
+    supplies those, and a factory cannot override them. A name found nowhere raises ValueError;
+    a factory result that is not a MemoryConnector raises TypeError.
     """
     name = connector_name(name=name, env=env)
     factory = resolve_factory(name)
-    conn = factory(root=Path(root), domain=domain, surface=surface)
+    extra = dict(options or {})
+    reserved = sorted(key for key in extra if key in _RESERVED_OPTIONS)
+    if reserved:
+        raise ValueError(
+            f"memory connector {name!r} options must not set {reserved}; "
+            "harness2 supplies root, domain and surface itself"
+        )
+    conn = factory(root=Path(root), domain=domain, surface=surface, **extra)
     if not isinstance(conn, MemoryConnector):
         raise TypeError(
             f"memory connector {name!r} factory returned {type(conn).__name__}, "
             f"which is not a MemoryConnector"
         )
     return conn
+
+
+def check_options(name: str, options: Mapping[str, Any]) -> None:
+    """Check that the factory of connector `name` accepts every key in `options`.
+
+    `resolve_factory` finds the factory and `inspect.signature` reads its parameters: the keys
+    must name parameters the factory can take as keywords (a `**kwargs` parameter takes
+    anything). A key the factory cannot take raises ValueError naming the connector and the
+    keys, sorted. `root`, `domain` and `surface` raise ValueError too, because harness2 supplies
+    them. A factory whose signature cannot be read is not checked: it may accept anything.
+    """
+    reserved = sorted(key for key in options if key in _RESERVED_OPTIONS)
+    if reserved:
+        raise ValueError(
+            f"memory connector {name!r} options must not set {reserved}; "
+            "harness2 supplies root, domain and surface itself"
+        )
+    factory = resolve_factory(name)
+    try:
+        params = inspect.signature(factory).parameters.values()
+    except (TypeError, ValueError):
+        return
+    if any(p.kind is p.VAR_KEYWORD for p in params):
+        return
+    accepted = {p.name for p in params if p.kind in (p.POSITIONAL_OR_KEYWORD, p.KEYWORD_ONLY)}
+    unknown = sorted(set(options) - accepted)
+    if unknown:
+        raise ValueError(
+            f"memory connector {name!r} factory does not accept option(s) {unknown}; "
+            f"it takes {sorted(accepted)}"
+        )
+
+
+def close(conn: MemoryConnector) -> None:
+    """Call the connector's optional `close()`, once, to release what it holds.
+
+    A connector without `close`, or with `close` set to None, needs no cleanup and is left
+    alone. A `close` that is present but not callable raises TypeError, so a broken connector
+    fails loudly instead of being skipped.
+    """
+    fn = getattr(conn, "close", None)
+    if fn is None:
+        return
+    if not callable(fn):
+        raise TypeError(f"memory connector close must be a method or None, got {type(fn).__name__}")
+    fn()
 
 
 def store(
