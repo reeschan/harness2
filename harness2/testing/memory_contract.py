@@ -15,22 +15,25 @@
 """Contract checks for memory connectors, for connector authors to run from their own tests.
 
 The memory connector contract is described in `harness2.core.memory`: the five members of
-`MemoryConnector` (`domain`, `entries()`, `retain()`, `add()` and `context_dir()`), plus the
-optional `recall(task_id, limit_chars)` capability read by `memory.recall()`. `memory.store`
-runs the grader-verdict checks before handing an experience to any connector, so those checks
-hold whatever the backend does.
+`MemoryConnector` (`domain`, `entries()`, `retain()`, `add()` and `context_dir()`), plus two
+optional capabilities read through `memory`: `recall(task_id, limit_chars)` and `close()`.
+`memory.store` runs the grader-verdict checks before handing an experience to any connector, so
+those checks hold whatever the backend does.
 
 - `check_memory_connector(conn)` raises AssertionError when `conn` is not a MemoryConnector:
-  `domain` must be a str, `entries` / `retain` / `add` / `context_dir` must be callable, and a
-  `recall` attribute, when present, must be callable too. The message names the missing or
-  invalid members.
+  `domain` must be a str, `entries` / `retain` / `add` / `context_dir` must be callable, and the
+  optional `recall` and `close` attributes, when present (even as None), must be callable too.
+  The message names the missing or invalid members.
 - `MemoryConnectorContractTests` is a unittest mixin that runs these checks, and a few more,
   against the connector your test builds: `check_memory_connector`; a new connector has no
   entries and its `context_dir()` is None or an existing directory; storing two complete
   experiences gives their `library.slug` names in ascending order; `retain()` drops the other
   entries; storing the same task_id twice keeps one entry; `recall()` (if any) is empty before
   anything is stored, returns str afterwards, and is cut to the requested limit; an incomplete
-  experience adds no entry.
+  experience adds no entry. Each test closes its connector with `memory.close` afterwards.
+  `close()` is optional: a connector without it meets the contract, and
+  `test_memory_contract_close_is_optional_and_callable` passes too. A `close` that is present
+  must be callable; `check_memory_connector` rejects one set to None.
 
 Example::
 
@@ -47,7 +50,10 @@ Example::
 
 The mixin does not inherit from `unittest.TestCase`, so unittest does not collect it on its
 own; list `unittest.TestCase` after it in your test class. Each test calls `make_connector`
-with a fresh temporary directory and the domain `contract`.
+with a fresh temporary directory and the domain `contract`. The mixin passes no settings of its
+own: a subclass whose connector needs more writes the values inside `make_connector`, for
+example `return MyConnector(root=root, domain=domain, timeout=30)`, because harness2's
+`--memory-opt` values do not reach a contract test.
 """
 
 from __future__ import annotations
@@ -60,6 +66,8 @@ from harness2.core import library, memory
 from harness2.core.tree import SurfaceSpec
 
 _DOMAIN = "contract"
+
+_MISSING = object()
 
 _SURFACE = SurfaceSpec(
     name="contract",
@@ -88,9 +96,9 @@ _EXPERIENCE_B = {"cue": "beta cue", "lesson": "beta lesson", "evidence": "beta e
 def check_memory_connector(conn: Any) -> None:
     """Assert that `conn` meets the memory connector contract.
 
-    `domain` must be a str; `entries`, `retain`, `add` and `context_dir` must be callable. A
-    `recall` attribute, when present, must be callable. A missing or invalid member raises
-    AssertionError whose message names it.
+    `domain` must be a str; `entries`, `retain`, `add` and `context_dir` must be callable. The
+    optional `recall` and `close` attributes, when present (even as None), must be callable. A
+    missing or invalid member raises AssertionError whose message names it.
     """
     problems: list[str] = []
     if not isinstance(getattr(conn, "domain", None), str):
@@ -98,9 +106,12 @@ def check_memory_connector(conn: Any) -> None:
     for name in ("entries", "retain", "add", "context_dir"):
         if not callable(getattr(conn, name, None)):
             problems.append(name)
-    recall = getattr(conn, "recall", None)
-    if recall is not None and not callable(recall):
+    recall = getattr(conn, "recall", _MISSING)
+    if recall is not _MISSING and not callable(recall):
         problems.append("recall (callable)")
+    close = getattr(conn, "close", _MISSING)
+    if close is not _MISSING and not callable(close):
+        problems.append("close (callable)")
     if problems or not isinstance(conn, memory.MemoryConnector):
         detail = ", ".join(problems) or "the MemoryConnector Protocol check failed"
         raise AssertionError(
@@ -112,7 +123,8 @@ class MemoryConnectorContractTests:
     """A unittest mixin that checks a connector against the memory connector contract.
 
     Subclass it together with `unittest.TestCase` and implement `make_connector(root, domain)`.
-    Each test passes a fresh, empty temporary directory as `root` and `"contract"` as `domain`.
+    Each test passes a fresh, empty temporary directory as `root` and `"contract"` as `domain`,
+    and closes the connector it built with `memory.close` afterwards.
     """
 
     def make_connector(self, root: Path, domain: str) -> memory.MemoryConnector:
@@ -139,10 +151,13 @@ class MemoryConnectorContractTests:
     # -- tests ---------------------------------------------------------------------------
 
     def test_memory_contract_check_memory_connector(self) -> None:
-        check_memory_connector(self._connector(self._tmp()))
+        conn = self._connector(self._tmp())
+        self.addCleanup(memory.close, conn)
+        check_memory_connector(conn)
 
     def test_memory_contract_empty(self) -> None:
         conn = self._connector(self._tmp())
+        self.addCleanup(memory.close, conn)
         entries = conn.entries()
         if entries != []:
             raise AssertionError(f"entries() must be [] for a new connector, got {entries!r}")
@@ -154,6 +169,7 @@ class MemoryConnectorContractTests:
 
     def test_memory_contract_stored_entries_are_sorted(self) -> None:
         conn = self._connector(self._tmp())
+        self.addCleanup(memory.close, conn)
         self._store(conn, "t1", _EXPERIENCE_A)
         self._store(conn, "t2", _EXPERIENCE_B)
         expected = sorted([library.slug("t1"), library.slug("t2")])
@@ -164,6 +180,7 @@ class MemoryConnectorContractTests:
 
     def test_memory_contract_retain_keeps_only_listed(self) -> None:
         conn = self._connector(self._tmp())
+        self.addCleanup(memory.close, conn)
         self._store(conn, "t1", _EXPERIENCE_A)
         self._store(conn, "t2", _EXPERIENCE_B)
         conn.retain(["t1"])
@@ -175,6 +192,7 @@ class MemoryConnectorContractTests:
 
     def test_memory_contract_same_task_id_stores_one_entry(self) -> None:
         conn = self._connector(self._tmp())
+        self.addCleanup(memory.close, conn)
         self._store(conn, "t1", _EXPERIENCE_A)
         self._store(conn, "t1", _EXPERIENCE_B)
         expected = [library.slug("t1")]
@@ -185,6 +203,7 @@ class MemoryConnectorContractTests:
 
     def test_memory_contract_recall(self) -> None:
         conn = self._connector(self._tmp())
+        self.addCleanup(memory.close, conn)
         if not callable(getattr(conn, "recall", None)):
             return
         empty = memory.recall(conn, "t3", 10_000)
@@ -201,6 +220,7 @@ class MemoryConnectorContractTests:
 
     def test_memory_contract_incomplete_experience_is_not_stored(self) -> None:
         conn = self._connector(self._tmp())
+        self.addCleanup(memory.close, conn)
         result = memory.store(conn, "t1", _TREE, experience={"cue": "a cue", "lesson": "a lesson"})
         if result is not None:
             raise AssertionError(f"an incomplete experience must store nothing, got {result!r}")
@@ -208,3 +228,7 @@ class MemoryConnectorContractTests:
             raise AssertionError(
                 f"an incomplete experience must add no entry, got {conn.entries()!r}"
             )
+
+    def test_memory_contract_close_is_optional_and_callable(self) -> None:
+        conn = self._connector(self._tmp())
+        memory.close(conn)
