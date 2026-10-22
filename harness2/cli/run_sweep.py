@@ -70,7 +70,35 @@ def _build_parser() -> argparse.ArgumentParser:
         help="print the stream order, the namespaces and the split's domains, then "
         "exit — no rollouts, no sessions, nothing written",
     )
+    g.add_argument(
+        "--memory-opt",
+        action="append",
+        default=[],
+        metavar="KEY=VALUE",
+        help="a memory connector option passed to its factory as a keyword; repeatable",
+    )
     return p
+
+
+def _parse_memory_opts(parser: argparse.ArgumentParser, raw: list[str]) -> dict[str, str]:
+    """Split each KEY=VALUE at the first `=`; a later repeat of a key wins."""
+    opts: dict[str, str] = {}
+    for item in raw:
+        key, sep, value = item.partition("=")
+        if not sep or not key:
+            parser.error(f"--memory-opt must be KEY=VALUE, got {item!r}")
+        opts[key] = value
+    return opts
+
+
+def _check_memory_opts(parser: argparse.ArgumentParser, options: dict[str, str]) -> None:
+    """Reject, as an argument error (exit 2), options the memory factory cannot take."""
+    if not options:
+        return
+    try:
+        memory.check_options(memory.connector_name(), options)
+    except ValueError as exc:
+        parser.error(str(exc))
 
 
 def _csv(raw: str) -> tuple[str, ...]:
@@ -122,25 +150,30 @@ def _print_stream(adapter, args, modes) -> int:
 
 def main(argv: list[str] | None = None) -> int:
     """Parse, then run `_main`, printing a misconfiguration as one remediation line."""
-    args = _build_parser().parse_args(argv)
+    parser = _build_parser()
+    args = parser.parse_args(argv)
+    args.memory_options = _parse_memory_opts(parser, args.memory_opt)
     try:
-        return _main(args)
+        return _main(args, parser)
     except (config.ConfigError, RuntimeError, ValueError, FileNotFoundError) as e:
         print(f"error: {e}", file=sys.stderr)
         return 1
 
 
-def _main(args: argparse.Namespace) -> int:
+def _main(args: argparse.Namespace, parser: argparse.ArgumentParser | None = None) -> int:
+    parser = parser or _build_parser()
+    options = getattr(args, "memory_options", None) or {}
     if args.k < 1 or args.workers < 1:
         raise ValueError("--k and --workers must be positive")
     modes = C.parse_modes(args.modes)
 
     if args.dry_run:
-        return _print_stream(
-            C.make_adapter(args.bench, args.subset, args.substrate, args.split_file), args, modes
-        )
+        adapter = C.make_adapter(args.bench, args.subset, args.substrate, args.split_file)
+        _check_memory_opts(parser, options)
+        return _print_stream(adapter, args, modes)
 
     adapter = C.make_adapter(args.bench, args.subset, args.substrate, args.split_file)
+    _check_memory_opts(parser, options)
     _stream_for(adapter, args)
     from ..preflight import require_ready
 
@@ -155,7 +188,9 @@ def _main(args: argparse.Namespace) -> int:
 
     only = _csv(args.only_domains)
     lanes = args.workers
-    warning = _memory_warning(memory.connector_name(), scope, recall=config.MEMORY_RECALL)
+    warning = _memory_warning(
+        memory.connector_name(), scope, recall=config.MEMORY_RECALL, options=options
+    )
     if warning:
         print(warning, flush=True)
     print(
@@ -178,6 +213,7 @@ def _main(args: argparse.Namespace) -> int:
         pool_policy="finals",
         memory_scope=scope,
         memory_recall=config.MEMORY_RECALL,
+        memory_options=options or None,
     )
 
     stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
@@ -214,15 +250,19 @@ def _main(args: argparse.Namespace) -> int:
     return 2 if failed else 0
 
 
-def _memory_warning(connector: str, scope: str, recall: bool = False) -> str | None:
+def _memory_warning(
+    connector: str, scope: str, recall: bool = False, options: dict[str, str] | None = None
+) -> str | None:
     """One `warning:` line when the memory setting is not the default (file, no scope,
-    no recall)."""
-    if connector == memory.DEFAULT and not scope and not recall:
+    no recall, no options). The option keys are listed in ascending order, never the values:
+    a value may be a secret."""
+    if connector == memory.DEFAULT and not scope and not recall and not options:
         return None
     on = " recall=on" if recall else ""
+    keys = f" options: {', '.join(sorted(options))}" if options else ""
     off = ", no recall" if recall else ""
     return (
-        f"warning: memory connector={connector!r} scope={scope!r}{on}; results are not "
+        f"warning: memory connector={connector!r} scope={scope!r}{on}{keys}; results are not "
         f"comparable with the published per-run setting (connector 'file', no scope{off})"
     )
 
