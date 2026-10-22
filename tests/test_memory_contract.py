@@ -62,6 +62,37 @@ class InMemoryConnectorContractTest(MemoryConnectorContractTests, unittest.TestC
         return InMemoryConnector(root, domain, SURFACE)
 
 
+class _QueryRecordingConnector(InMemoryConnector):
+    """An in-memory connector that records the `query` its `recall` receives."""
+
+    def __init__(self, root: Path, domain: str, surface: SurfaceSpec | None = None) -> None:
+        super().__init__(root, domain, surface)
+        self.queries: list[str] = []
+
+    def recall(self, task_id: str, limit_chars: int, *, query: str = "") -> str:
+        self.queries.append(query)
+        return super().recall(task_id, limit_chars)
+
+
+class QueryConnectorContractTest(MemoryConnectorContractTests, unittest.TestCase):
+    """An in-memory connector whose `recall` takes a query against the contract."""
+
+    def setUp(self) -> None:
+        InMemoryConnector.reset()
+        self.addCleanup(InMemoryConnector.reset)
+
+    def make_connector(self, root: Path, domain: str) -> _QueryRecordingConnector:
+        return _QueryRecordingConnector(root, domain, SURFACE)
+
+    def test_memory_contract_query_reaches_recall(self) -> None:
+        conn = self._connector(self._tmp())
+        self.addCleanup(memory.close, conn)
+        self._store(conn, "t1", {"cue": "alpha cue", "lesson": "alpha", "evidence": "alpha"})
+        text = memory.recall(conn, "t3", 10_000, query="some task text")
+        self.assertIsInstance(text, str)
+        self.assertEqual(conn.queries, ["some task text"])
+
+
 class _CountingCloseConnector(InMemoryConnector):
     """An in-memory connector that counts how often `close()` is called."""
 

@@ -544,9 +544,12 @@ These five members are required:
 | `add(task_id, harness, *, why, label, run_id, experience) -> Path \| None` | Stores one adopted harness and its experience; returns the entry directory, or None when it stores nothing |
 | `context_dir() -> Path \| None` | The directory handed to an improver session, or None when the domain has nothing to show |
 
-`recall(task_id, limit_chars)` is optional. When a connector offers it as a
-callable, `memory.recall` returns its text cut to `limit_chars`. A connector
-without it, or a `limit_chars` of zero or less, gives `""`.
+`recall(task_id, limit_chars, *, query="")` is optional. When a connector offers
+it as a callable, `memory.recall` returns its text cut to `limit_chars`. `query`
+is the current task's prompt; `memory.recall` passes it only to a recall that
+accepts the keyword (a `query` parameter or `**kwargs`), so the two-argument
+form keeps working. A connector without it, or a `limit_chars` of zero or less,
+gives `""`.
 
 `close()` is optional. When a connector defines it as a callable, `run_domain`
 calls `memory.close` on every connector it built once the domain's tasks are
@@ -621,6 +624,10 @@ that mode's starting harness, at the end of the surface's always-on file and
 within its cap. The injected text is recorded on the summary, and a re-run reuses
 the recorded text instead of recalling again. Any other value leaves recall
 injection off.
+
+When recall runs, the task's prompt is handed to the connector as `query`, so a
+connector whose `recall` accepts it can pick the entries that relate to the
+current task.
 
 ### Contract tests
 

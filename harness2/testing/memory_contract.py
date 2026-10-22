@@ -16,9 +16,11 @@
 
 The memory connector contract is described in `harness2.core.memory`: the five members of
 `MemoryConnector` (`domain`, `entries()`, `retain()`, `add()` and `context_dir()`), plus two
-optional capabilities read through `memory`: `recall(task_id, limit_chars)` and `close()`.
-`memory.store` runs the grader-verdict checks before handing an experience to any connector, so
-those checks hold whatever the backend does.
+optional capabilities read through `memory`: `recall(task_id, limit_chars, *, query="")` and
+`close()`. `query` is the current task prompt; `memory.recall` passes it only to a `recall` that
+accepts the keyword, so the two-argument form keeps working. `memory.store` runs the
+grader-verdict checks before handing an experience to any connector, so those checks hold
+whatever the backend does.
 
 - `check_memory_connector(conn)` raises AssertionError when `conn` is not a MemoryConnector:
   `domain` must be a str, `entries` / `retain` / `add` / `context_dir` must be callable, and the
@@ -29,8 +31,9 @@ those checks hold whatever the backend does.
   entries and its `context_dir()` is None or an existing directory; storing two complete
   experiences gives their `library.slug` names in ascending order; `retain()` drops the other
   entries; storing the same task_id twice keeps one entry; `recall()` (if any) is empty before
-  anything is stored, returns str afterwards, and is cut to the requested limit; an incomplete
-  experience adds no entry. Each test closes its connector with `memory.close` afterwards.
+  anything is stored, returns str afterwards, and is cut to the requested limit, also when it is
+  called with a `query`; an incomplete experience adds no entry. Each test closes its connector
+  with `memory.close` afterwards.
   `close()` is optional: a connector without it meets the contract, and
   `test_memory_contract_close_is_optional_and_callable` passes too. A `close` that is present
   must be callable; `check_memory_connector` rejects one set to None.
@@ -217,6 +220,19 @@ class MemoryConnectorContractTests:
         short = memory.recall(conn, "t3", 5)
         if len(short) > 5:
             raise AssertionError(f"recall(limit_chars=5) returned {len(short)} characters")
+
+    def test_memory_contract_recall_takes_a_query(self) -> None:
+        conn = self._connector(self._tmp())
+        self.addCleanup(memory.close, conn)
+        if not callable(getattr(conn, "recall", None)):
+            return
+        self._store(conn, "t1", _EXPERIENCE_A)
+        full = memory.recall(conn, "t3", 10_000, query="some task text")
+        if not isinstance(full, str):
+            raise AssertionError(f"recall with a query must return str, got {type(full).__name__}")
+        short = memory.recall(conn, "t3", 5, query="some task text")
+        if len(short) > 5:
+            raise AssertionError(f"recall with a query returned {len(short)} characters")
 
     def test_memory_contract_incomplete_experience_is_not_stored(self) -> None:
         conn = self._connector(self._tmp())
