@@ -15,5 +15,5 @@
 """Helpers for people who build on harness2, for use from their own tests.
 
 `harness2.testing.connector_contract` checks that a task connector meets the public task
-connector contract.
+connector contract. `harness2.testing.memory_contract` does the same for memory connectors.
 """
