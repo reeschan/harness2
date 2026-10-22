@@ -507,6 +507,7 @@ def _recall_tree(
     surface,
     base_tree: harness_tree.Tree,
     mode_lib: memory.MemoryConnector,
+    query: str,
     recorded: Mapping | None,
     res: TaskResult,
 ) -> harness_tree.Tree:
@@ -515,10 +516,12 @@ def _recall_tree(
     A text recorded on an earlier summary is reused (its sha256 checked, and it must still fit
     the room left by `base_tree`) instead of recalling again, so a re-run starts from the same
     tree. Only a missing (None) or empty record recalls afresh; any other record without a
-    string text raises ValueError rather than silently changing the starting tree.
+    string text raises ValueError rather than silently changing the starting tree. `query` is
+    the task prompt, handed to a connector's `recall` when it can take one.
     """
     if recorded is None or (isinstance(recorded, Mapping) and not recorded):
-        text = memory.recall(mode_lib, task_id, recall_block.room(surface, base_tree))
+        room = recall_block.room(surface, base_tree)
+        text = memory.recall(mode_lib, task_id, room, query=query)
     else:
         if not isinstance(recorded, Mapping) or not isinstance(recorded.get("text"), str):
             raise ValueError(f"recorded memory_recall for {mode} has no text")
@@ -654,6 +657,7 @@ def run_task(
     `memory_scope`; None (the default setting) adds no keys.
     `memory_recall` True injects each mode's library recall into that mode's starting tree
     and records the text on the summary as `memory_recall`; a re-run reuses the recorded text.
+    A fresh recall also gets the task prompt as `query` when the connector accepts one.
     """
     if int(k) < 1:
         raise ValueError(f"k must be positive, got {k!r}")
@@ -711,19 +715,27 @@ def run_task(
         _write_summary(summary_path, res)
         return res
 
+    prompt: str | None = None
     for mode in modes:
         n = Namespace(bench, sub, mode, k, seed, tag)
         try:
             mode_lib = mode_libs.get(mode)
             mode_tree = base_tree
             if memory_recall and mode_lib is not None:
+                recorded = recorded_recall.get(mode)
+                if prompt is None and not recorded:
+                    try:
+                        prompt = adapter.task_prompt(task_id)
+                    except Exception:
+                        prompt = ""
                 mode_tree = _recall_tree(
                     mode,
                     task_id,
                     surface=surface,
                     base_tree=base_tree,
                     mode_lib=mode_lib,
-                    recorded=recorded_recall.get(mode),
+                    query=prompt or "",
+                    recorded=recorded,
                     res=res,
                 )
             _run_one_mode(

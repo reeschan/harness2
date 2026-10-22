@@ -17,7 +17,11 @@
 A connector is anything with the surface the scheduler uses on a library: `domain`,
 `entries()`, `retain()`, `add()` and `context_dir()`. A connector may also define an optional
 `close()`; the public `close` calls it when present, so a backend holding a connection, a
-session or a file can release it. Connectors are found by name.
+session or a file can release it. A connector may also define an optional
+`recall(task_id, limit_chars)`: the module-level `recall` returns its text cut to the limit and
+passes the current task prompt as the keyword `query` when the connector's `recall` accepts one
+(a `query` parameter or `**kwargs`), so the two-argument form keeps working. Connectors are
+found by name.
 `connector_name` picks the name: an explicit name, then the `HARNESS2_MEMORY_CONNECTOR`
 environment variable, then the default `file`. `resolve_factory` turns the name into a
 factory: a built-in registration (`register`; only the bundled `file` connector by default),
@@ -297,16 +301,33 @@ def store(
     return conn.add(task_id, harness, why=why, label=label, run_id=run_id, experience=experience)
 
 
-def recall(conn: MemoryConnector, task_id: str, limit_chars: int) -> str:
+def recall(conn: MemoryConnector, task_id: str, limit_chars: int, *, query: str = "") -> str:
     """The connector's recall text for `task_id`, cut to `limit_chars`.
 
     Recall is optional: a connector without a callable `recall`, or a `limit_chars` of zero or
-    less, gives "".
+    less, gives "". `query` is the current task prompt; it is passed as `query=query` only when
+    the connector's `recall` can take it as a keyword (a `query` parameter or `**kwargs`), so a
+    connector with the two-argument form keeps working. A signature that cannot be read is
+    treated as not taking a `query`.
     """
     fn = getattr(conn, "recall", None)
     if not callable(fn) or limit_chars <= 0:
         return ""
-    return (fn(task_id, limit_chars) or "")[:limit_chars]
+    try:
+        params = inspect.signature(fn).parameters.values()
+    except (TypeError, ValueError):
+        params = ()
+    takes_query = any(p.kind is p.VAR_KEYWORD for p in params)
+    if not takes_query:
+        takes_query = any(
+            p.name == "query" and p.kind in (p.POSITIONAL_OR_KEYWORD, p.KEYWORD_ONLY)
+            for p in params
+        )
+    if takes_query:
+        text = fn(task_id, limit_chars, query=query)
+    else:
+        text = fn(task_id, limit_chars)
+    return (text or "")[:limit_chars]
 
 
 register(DEFAULT, FileConnector)
