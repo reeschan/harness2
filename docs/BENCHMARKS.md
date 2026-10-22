@@ -523,3 +523,111 @@ finally:
   redirects; a redirect answer raises `McpError`.
 - Each client runs its calls one after another under a lock, so one client may
   be shared between threads, for example by a judge that is called in parallel.
+
+## Writing a memory connector
+
+A memory connector holds the experience library for one domain. It replaces where
+that library lives, and harness2 needs no change to use it. The default is `file`:
+`FileConnector` (`harness2.core.library.Library`) keeps each domain's entries as
+files under the library root.
+
+### The contract
+
+A connector meets the `MemoryConnector` protocol in `harness2/core/memory.py`.
+These five members are required:
+
+| Member | Does |
+|---|---|
+| `domain: str` | The domain whose entries this connector holds |
+| `entries() -> list[str]` | The stored entries, by name and in ascending order |
+| `retain(task_ids) -> None` | Keeps the entries for these task ids and drops every other entry |
+| `add(task_id, harness, *, why, label, run_id, experience) -> Path \| None` | Stores one adopted harness and its experience; returns the entry directory, or None when it stores nothing |
+| `context_dir() -> Path \| None` | The directory handed to an improver session, or None when the domain has nothing to show |
+
+`recall(task_id, limit_chars)` is optional. When a connector offers it as a
+callable, `memory.recall` returns its text cut to `limit_chars`. A connector
+without it, or a `limit_chars` of zero or less, gives `""`.
+
+The connector is built by a factory: a callable called as `factory(root=Path,
+domain=str, surface=SurfaceSpec)` with those three keyword arguments. `SurfaceSpec`
+comes from `harness2.core.tree` and describes the harness's file layout. A factory
+whose result does not meet the protocol raises TypeError.
+
+`memory.store` runs its checks before it calls `add`, so they hold whatever the
+backend does. An incomplete experience (a `cue`, `lesson` and `evidence` that are
+not all non-empty strings) stores nothing and returns None. Otherwise `store`
+strips every recall block from the tree, checks the stripped tree and the
+experience text for grader verdicts, and then calls `add`. A connector's `add` can
+therefore assume a complete experience and a tree with no recall blocks.
+
+### Choosing and registering the connector
+
+The connector's name is the explicit name when one is given, else
+`HARNESS2_MEMORY_CONNECTOR`, else the default `file`. `memory.resolve_factory`
+turns the name into a factory in this order:
+
+1. The built-in registrations (`memory.register`). By default only `file` is
+   registered.
+2. An entry point with the same name in the group `harness2.memory_connectors`.
+3. A `module:Attr` import path, for a name that contains `:`. `Attr` may be a
+   dotted chain.
+
+A name found nowhere raises ValueError listing the registered and entry point
+names.
+
+A package makes its factory available by name with an entry point in its
+`pyproject.toml`:
+
+```toml
+[project.entry-points."harness2.memory_connectors"]
+my-memory = "my_package.memory:make_connector"
+```
+
+After `pip install`, set `HARNESS2_MEMORY_CONNECTOR=my-memory` to use it. Before
+installing, `HARNESS2_MEMORY_CONNECTOR=my_package.memory:make_connector` loads the
+same factory.
+
+### Scope and recall
+
+`HARNESS2_MEMORY_SCOPE` is empty by default. Each run then derives its library
+root from k, substrate and seed. A non-empty name makes the root
+`<runs_root>/library/<benchmark>/scope-<name>`, whatever k, substrate and seed
+are, and runs of that benchmark with the same name share it. With a named scope,
+before each task
+the library keeps this stream's preceding tasks and every entry that belongs to
+no task of this stream, so entries written by other runs survive.
+
+`HARNESS2_MEMORY_RECALL` is `0` by default. `1` injects each mode's recall into
+that mode's starting harness, at the end of the surface's always-on file and
+within its cap. The injected text is recorded on the summary, and a re-run reuses
+the recorded text instead of recalling again. Any other value leaves recall
+injection off.
+
+### Contract tests
+
+`harness2.testing.memory_contract` checks a connector from your own tests.
+`check_memory_connector(conn)` raises AssertionError naming a missing or invalid
+member. `MemoryConnectorContractTests` is a unittest mixin that runs those checks
+and a few more against the connector your test builds: a new connector has no
+entries and a `context_dir()` that is None or an existing directory; two complete
+experiences give their `library.slug` names in ascending order; `retain()` keeps
+only the listed entries; storing the same task id twice keeps one entry;
+`recall()` (if any) is empty before anything is stored, returns str afterwards,
+and is cut to the requested limit; and an incomplete experience adds no entry.
+
+```python
+import unittest
+from pathlib import Path
+
+from harness2.testing.memory_contract import MemoryConnectorContractTests
+from my_package.memory import MyConnector
+
+
+class MyConnectorContractTest(MemoryConnectorContractTests, unittest.TestCase):
+    def make_connector(self, root: Path, domain: str):
+        return MyConnector(root=root, domain=domain)
+```
+
+List `unittest.TestCase` after the mixin, so unittest collects the mixin's tests.
+Each test calls `make_connector` with a fresh temporary directory and the domain
+`contract`.
