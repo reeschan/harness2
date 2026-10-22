@@ -15,20 +15,25 @@
 """Memory connectors: interchangeable backends for the per-domain experience library.
 
 A connector is anything with the surface the scheduler uses on a library: `domain`,
-`entries()`, `retain()`, `add()` and `context_dir()`. Connectors are registered by name;
-`connector_for` picks one by explicit name, then by the `HARNESS2_MEMORY_CONNECTOR`
-environment variable, then the on-disk default `file`. A name that is not registered but
-has the form `module:Attr` is imported and used as the factory. `store` runs the grader-verdict
-checks before handing an experience to any connector, so the checks hold whatever the
-backend does.
+`entries()`, `retain()`, `add()` and `context_dir()`. Connectors are found by name.
+`connector_name` picks the name: an explicit name, then the `HARNESS2_MEMORY_CONNECTOR`
+environment variable, then the default `file`. `resolve_factory` turns the name into a
+factory: a built-in registration (`register`; only the bundled `file` connector by default),
+then an entry point of the same name in the group `harness2.memory_connectors`, then, for a
+name containing `:`, a `module:Attr` import path. An entry point's `load()` and a
+`module:Attr` target are both factories: callables called as `factory(root=Path,
+domain=str, surface=SurfaceSpec)` that return a MemoryConnector. `store` runs the
+grader-verdict checks before handing an experience to any connector, so the checks hold
+whatever the backend does.
 """
 
 from __future__ import annotations
 
 import importlib
+import importlib.metadata
 import os
 from pathlib import Path
-from typing import Callable, Mapping, Protocol, Sequence, runtime_checkable
+from typing import Any, Callable, Mapping, Protocol, Sequence, runtime_checkable
 
 from . import context, library
 from . import recall as recall_block
@@ -65,6 +70,7 @@ FileConnector = Library
 
 ENV_VAR = "HARNESS2_MEMORY_CONNECTOR"
 DEFAULT = "file"
+ENTRY_POINT_GROUP = "harness2.memory_connectors"
 
 Factory = Callable[..., MemoryConnector]
 
@@ -79,14 +85,20 @@ def register(name: str, factory: Factory) -> None:
     _REGISTRY[name] = factory
 
 
+def _entry_points() -> list[Any]:
+    """The installed entry points of `ENTRY_POINT_GROUP`."""
+    return list(importlib.metadata.entry_points(group=ENTRY_POINT_GROUP))
+
+
 def names() -> list[str]:
-    """The registered connector names, sorted."""
-    return sorted(_REGISTRY)
+    """The built-in registered names plus the entry point names of `ENTRY_POINT_GROUP`,
+    sorted and without duplicates."""
+    return sorted(set(_REGISTRY) | {ep.name for ep in _entry_points()})
 
 
 def connector_name(*, name: str | None = None, env: Mapping[str, str] | None = None) -> str:
     """The connector name: `name` when given, else `ENV_VAR` from `env` (or `os.environ` when
-    `env` is None), else `DEFAULT`.
+    `env` is None), else `DEFAULT`. `resolve_factory` turns the name into a factory.
     """
     if name is not None:
         return name
@@ -124,6 +136,50 @@ def _import_factory(name: str) -> Factory:
     return target
 
 
+def _load_entry_point(name: str, ep: Any) -> Factory:
+    """Load an entry point as a factory; a failed load raises ValueError, a target that is not
+    callable raises TypeError."""
+    try:
+        target = ep.load()
+    except Exception as exc:
+        raise ValueError(
+            f"memory connector {name!r}: cannot load entry point {ENTRY_POINT_GROUP}/{name}: {exc}"
+        ) from exc
+    if not callable(target):
+        raise TypeError(
+            f"memory connector {name!r} entry point is {type(target).__name__}, "
+            "which is not callable"
+        )
+    return target
+
+
+def resolve_factory(name: str) -> Factory:
+    """The factory for the connector `name`.
+
+    Looked up in this order: the built-in registrations (`register`), an entry point named
+    `name` in the group `ENTRY_POINT_GROUP` (`harness2.memory_connectors`), and, for a name
+    containing `:`, a `module:Attr` import path (see `_import_factory`). An entry point's
+    `load()` must return a factory, the same as a `module:Attr` target: a callable called as
+    `factory(root=Path, domain=str, surface=SurfaceSpec)`. A name found nowhere raises
+    ValueError listing the registered and entry point names.
+    """
+    factory = _REGISTRY.get(name)
+    if factory is not None:
+        return factory
+    eps = _entry_points()
+    for ep in eps:
+        if ep.name == name:
+            return _load_entry_point(name, ep)
+    if ":" in name:
+        return _import_factory(name)
+    registered = ", ".join(sorted(_REGISTRY)) or "(none)"
+    entry_names = ", ".join(sorted({ep.name for ep in eps})) or "(none)"
+    raise ValueError(
+        f"unknown memory connector {name!r}; registered: {registered}; "
+        f"entry points ({ENTRY_POINT_GROUP}): {entry_names}"
+    )
+
+
 def connector_for(
     root: Path | str,
     domain: str,
@@ -134,19 +190,13 @@ def connector_for(
 ) -> MemoryConnector:
     """Build the connector for one (root, domain).
 
-    The name comes from `connector_name`. A registered name is used first; otherwise a name
-    containing `:` is loaded as a `module:Attr` import path (see `_import_factory`). Any other
-    unregistered name raises ValueError; a factory result that is not a MemoryConnector raises
-    TypeError.
+    The name comes from `connector_name` and the factory from `resolve_factory` (built-in
+    registration, then entry point, then `module:Attr`); the factory is called as
+    `factory(root=Path, domain=str, surface=SurfaceSpec)`. A name found nowhere raises
+    ValueError; a factory result that is not a MemoryConnector raises TypeError.
     """
     name = connector_name(name=name, env=env)
-    factory = _REGISTRY.get(name)
-    if factory is None:
-        if ":" not in name:
-            raise ValueError(
-                f"unknown memory connector {name!r}; registered: {', '.join(names()) or '(none)'}"
-            )
-        factory = _import_factory(name)
+    factory = resolve_factory(name)
     conn = factory(root=Path(root), domain=domain, surface=surface)
     if not isinstance(conn, MemoryConnector):
         raise TypeError(
