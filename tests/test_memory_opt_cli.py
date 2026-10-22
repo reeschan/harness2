@@ -71,11 +71,27 @@ class MemoryOptCliTest(unittest.TestCase):
         self.assertEqual(self.sweep.call_args.kwargs["memory_options"], {"a": "2"})
 
     def test_malformed_option_is_an_argument_error(self):
-        for bad in ("nokey", "=x"):
+        code, _, err = self._run("--memory-opt", "nokey")
+        self.assertEqual(code, 2)
+        self.assertIn("--memory-opt must be KEY=VALUE", err)
+        code, _, err = self._run("--memory-opt", "=x")
+        self.assertEqual(code, 2)
+        self.assertIn("--memory-opt has an empty key", err)
+        self.sweep.assert_not_called()
+
+    def test_malformed_option_error_hides_the_value_and_names_its_position(self):
+        cases = (
+            ("=topsecret", "--memory-opt has an empty key"),
+            ("topsecret", "--memory-opt must be KEY=VALUE"),
+        )
+        for bad, message in cases:
             with self.subTest(bad=bad):
-                code, _, err = self._run("--memory-opt", bad)
+                code, out, err = self._run("--memory-opt", "a=1", "--memory-opt", bad)
                 self.assertEqual(code, 2)
-                self.assertIn("--memory-opt must be KEY=VALUE", err)
+                self.assertIn(message, err)
+                self.assertIn("number 2", err)
+                self.assertNotIn("topsecret", err)
+                self.assertNotIn("topsecret", out)
         self.sweep.assert_not_called()
 
     def test_option_the_factory_cannot_take_stops_before_any_task(self):

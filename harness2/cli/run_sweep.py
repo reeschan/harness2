@@ -83,10 +83,13 @@ def _build_parser() -> argparse.ArgumentParser:
 def _parse_memory_opts(parser: argparse.ArgumentParser, raw: list[str]) -> dict[str, str]:
     """Split each KEY=VALUE at the first `=`; a later repeat of a key wins."""
     opts: dict[str, str] = {}
-    for item in raw:
+    for n, item in enumerate(raw, 1):
         key, sep, value = item.partition("=")
-        if not sep or not key:
-            parser.error(f"--memory-opt must be KEY=VALUE, got {item!r}")
+        # The argument may carry a secret: name its position, never its text.
+        if not sep:
+            parser.error(f"--memory-opt must be KEY=VALUE (--memory-opt number {n})")
+        if not key:
+            parser.error(f"--memory-opt has an empty key (--memory-opt number {n})")
         opts[key] = value
     return opts
 
