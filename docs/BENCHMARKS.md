@@ -548,9 +548,19 @@ These five members are required:
 callable, `memory.recall` returns its text cut to `limit_chars`. A connector
 without it, or a `limit_chars` of zero or less, gives `""`.
 
+`close()` is optional. When a connector defines it as a callable, `run_domain`
+calls `memory.close` on every connector it built once the domain's tasks are
+done, continuing past a `close` that fails and raising the first error after
+they have all run; a connector without `close`, or with `close` set to None, is
+left alone.
+
 The connector is built by a factory: a callable called as `factory(root=Path,
-domain=str, surface=SurfaceSpec)` with those three keyword arguments. `SurfaceSpec`
-comes from `harness2.core.tree` and describes the harness's file layout. A factory
+domain=str, surface=SurfaceSpec)` with those three keyword arguments. A factory
+that needs settings takes them as further keyword arguments: `--memory-opt
+key=value` (repeatable) supplies each one, and every value arrives as a `str`.
+`root`, `domain` and `surface` may not be overridden, and a key the factory
+cannot accept is an argument error before the run starts. `SurfaceSpec` comes
+from `harness2.core.tree` and describes the harness's file layout. A factory
 whose result does not meet the protocol raises TypeError.
 
 `memory.store` runs its checks before it calls `add`, so they hold whatever the
@@ -586,6 +596,15 @@ my-memory = "my_package.memory:make_connector"
 After `pip install`, set `HARNESS2_MEMORY_CONNECTOR=my-memory` to use it. Before
 installing, `HARNESS2_MEMORY_CONNECTOR=my_package.memory:make_connector` loads the
 same factory.
+
+Settings for that factory come from `--memory-opt`, as in this made-up example:
+
+```bash
+harness2 ... --memory-opt url=http://127.0.0.1:9000 --memory-opt timeout=30
+```
+
+Each value is passed as a string keyword, so the factory above would declare
+`url` and `timeout` parameters and receive `"http://127.0.0.1:9000"` and `"30"`.
 
 ### Scope and recall
 
