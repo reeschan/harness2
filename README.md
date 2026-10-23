@@ -76,10 +76,18 @@ benchmark- and executor-independent), the **substrate** that executes a rollout
 (OpenCode or Codex), and the **benchmark** adapter that supplies tasks,
 launchers, and grading.
 
+Three kinds of connector follow the same pattern: a **memory connector** for the
+experience library (`harness2.memory_connectors`), a **task connector** for the
+tasks to run (`harness2.task_connectors`), and a **model connector** for the
+models the executor and the improver use (`harness2.model_connectors`). Each is
+chosen by name, from an installed package's entry point or from a `module:Attr`
+plug-in, and the bundled defaults (`file`, `local`, `env`) keep the previous
+behavior.
+
 <p align="center">
   <picture>
     <source media="(prefers-color-scheme: dark)" srcset="assets/architecture/architecture-dark.svg">
-    <img src="assets/architecture/architecture-light.svg" alt="Harness² architecture. The CLI (harness2-setup/-check, harness2, harness2-demo, harness2-judge/-report) drives harness2.core. In core, schedule runs k shared base rollouts per task; task-level recursion runs Propose, Probe and Compose using the c1..c8 harness tree and an answer-free evidence tree; selection blindly picks one of the k finals and reflects on it; the adopted harness and lesson go into the per-domain library, a MemoryConnector (FileConnector by default, swappable for an installed package registered under the harness2.memory_connectors entry point or a module:Attr plug-in), which guides the next task. Core calls out to execution and evaluation: benchmark adapters (JobBench, LAB, WorkBuddy-Bench) launch rollouts on a substrate (OpenCode or Codex CLI), which calls Vertex AI models (Gemini executor and judge; Claude or Gemini improver). Task intake brings in external tasks: any task connector (the bundled local folder, an installed package registered under the harness2.task_connectors entry point, or a module:Attr plug-in) passes raw tasks to a normalizer that turns them into a TaskSpec; the IntakeAdapter runs them like a benchmark adapter with private criteria visible only to the judge; for code tasks each rollout runs in its own git worktree, and only the chosen run's diff is applied to the source repo after the connector's workspace policy check. Outputs are written to runs/." width="100%">
+    <img src="assets/architecture/architecture-light.svg" alt="Harness² architecture. The CLI (harness2-setup/-check, harness2, harness2-demo, harness2-judge/-report) drives harness2.core. In core, schedule runs k shared base rollouts per task; task-level recursion runs Propose, Probe and Compose using the c1..c8 harness tree and an answer-free evidence tree; selection blindly picks one of the k finals and reflects on it; the adopted harness and lesson go into the per-domain library, a MemoryConnector (FileConnector by default, swappable for an installed package registered under the harness2.memory_connectors entry point or a module:Attr plug-in), which guides the next task. A ModelConnector (env by default, swappable for an installed package registered under the harness2.model_connectors entry point or a module:Attr plug-in) gives the executor its model candidates with fallback on a fixed substrate, and can run fenced improver sessions. Core calls out to execution and evaluation: benchmark adapters (JobBench, LAB, WorkBuddy-Bench) launch rollouts on a substrate (OpenCode or Codex CLI), which calls Vertex AI models (Gemini executor and judge; Claude or Gemini improver). Task intake brings in external tasks: any task connector (the bundled local folder, an installed package registered under the harness2.task_connectors entry point, or a module:Attr plug-in) passes raw tasks to a normalizer that turns them into a TaskSpec; the IntakeAdapter runs them like a benchmark adapter with private criteria visible only to the judge; for code tasks each rollout runs in its own git worktree, and only the chosen run's diff is applied to the source repo after the connector's workspace policy check. Outputs are written to runs/." width="100%">
   </picture>
 </p>
 
@@ -245,13 +253,14 @@ for details; each command also supports `--help`.
 | [`harness2/core/intake.py`](harness2/core/intake.py) | Task intake: RawTask, TaskSpec and its schema, and the TaskConnector registry |
 | [`harness2/core/normalize.py`](harness2/core/normalize.py) | Normalizers that turn a raw task into a TaskSpec (passthrough and model) |
 | [`harness2/core/intake_local.py`](harness2/core/intake_local.py) | The local folder task connector (inbox, outbox, failed) |
+| [`harness2/core/models.py`](harness2/core/models.py) | Model connectors: the `ModelConnector` contract, `ModelChoice`, the session and outcome types, the default `env` connector, and the `harness2.model_connectors` registry |
 | [`harness2/substrate/`](harness2/substrate) | Executors behind one interface: OpenCode and Codex CLI |
 | [`harness2/benchmarks/`](harness2/benchmarks) | Adapters for JobBench, LAB, and WorkBuddy-Bench |
 | [`harness2/benchmarks/intake.py`](harness2/benchmarks/intake.py) | IntakeAdapter and `run_intake` for non-benchmark tasks |
 | [`harness2/cli/intake.py`](harness2/cli/intake.py) | `harness2-intake`: takes in tasks from any task connector, runs them in git worktrees, and hands back only the chosen run's diff ([guide](docs/BENCHMARKS.md#connecting-a-task-source)) |
 | [`harness2/cli/`](harness2/cli) | The `harness2-*` commands |
 | [`harness2/plugins/mcp/`](harness2/plugins/mcp) | Optional standard-library MCP client (HTTP on loopback only, stdio) for task connectors that talk to an MCP task server; the core does not import it |
-| [`harness2/testing/`](harness2/testing) | Contract tests for task connector authors (`connector_contract`; [guide](docs/BENCHMARKS.md#writing-a-task-connector)) |
+| [`harness2/testing/`](harness2/testing) | Contract tests for connector authors (`connector_contract` for task connectors, `model_contract` for model connectors; [task guide](docs/BENCHMARKS.md#writing-a-task-connector), [model guide](docs/BENCHMARKS.md#writing-a-model-connector)) |
 | [`harness2/demo.py`](harness2/demo.py) | Deterministic local adapter used by `harness2-demo` |
 | [`docs/`](docs) | Setup, benchmark, and experiment guides |
 | [`scripts/`](scripts) | End-to-end run scripts and setup/provenance checks |

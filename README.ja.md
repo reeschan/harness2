@@ -58,10 +58,12 @@ Harness² が想定するのは**オープンワールド**、つまりハーネ
 
 コードは互いに独立した 3 つの軸に分かれています。**手法**（`harness2/core`、ベンチマークにも実行器にも依存しない）、ロールアウトを実行する**サブストレート**（OpenCode または Codex）、タスク・起動処理・採点を提供する**ベンチマーク**アダプタです。
 
+コネクターにも同じ作りが 3 種類あります。経験ライブラリの**メモリコネクター**（`harness2.memory_connectors`）、実行するタスクの**タスクコネクター**（`harness2.task_connectors`）、実行器と改善役が使うモデルの**モデルコネクター**（`harness2.model_connectors`）です。どれも名前で選び、インストール済みパッケージの entry point か `module:Attr` の差し込みから読み込みます。同梱の既定（`file`・`local`・`env`）を使えば、これまでどおりに動きます。
+
 <p align="center">
   <picture>
     <source media="(prefers-color-scheme: dark)" srcset="assets/architecture/architecture-dark.svg">
-    <img src="assets/architecture/architecture-light.svg" alt="Harness² のアーキテクチャ図。CLI（harness2-setup/-check、harness2、harness2-demo、harness2-judge/-report）が harness2.core を動かす。core では schedule がタスクごとに k 回の共有ベースロールアウトを実行し、タスクレベルの再帰が c1..c8 のハーネスツリーと正解を含まない証拠ツリーを使って Propose・Probe・Compose を行い、selection が k 個の最終候補から 1 つを盲目的に選んで振り返る。採用されたハーネスと教訓はドメイン別ライブラリ（MemoryConnector。既定は FileConnector で、entry point の harness2.memory_connectors に登録したインストール済みのパッケージや、module:Attr で差し込むものに差し替えられる）に入り、次のタスクを導く。core は実行・評価側を呼び出す。ベンチマークアダプタ（JobBench、LAB、WorkBuddy-Bench）がサブストレート（OpenCode または Codex CLI）上でロールアウトを起動し、サブストレートは Vertex AI のモデル（実行器・採点用の Gemini、改善用の Claude または Gemini）を呼ぶ。タスクの取り込みでは、任意のタスクコネクター（同梱のローカルのフォルダ、entry point の harness2.task_connectors に登録したインストール済みのパッケージ、または module:Attr で差し込むもの）が受け取ったタスクを正規化に渡して TaskSpec にし、IntakeAdapter がベンチマークのアダプターと同じように実行する（private_criteria は採点者だけが読む）。コードのタスクでは、ロールアウトはそれぞれ専用の git worktree で動き、コネクターの workspace policy の確認を通ったあと、選ばれた実行の diff だけをソースのリポジトリに当てる。出力は runs/ に保存される。" width="100%">
+    <img src="assets/architecture/architecture-light.svg" alt="Harness² のアーキテクチャ図。CLI（harness2-setup/-check、harness2、harness2-demo、harness2-judge/-report）が harness2.core を動かす。core では schedule がタスクごとに k 回の共有ベースロールアウトを実行し、タスクレベルの再帰が c1..c8 のハーネスツリーと正解を含まない証拠ツリーを使って Propose・Probe・Compose を行い、selection が k 個の最終候補から 1 つを盲目的に選んで振り返る。採用されたハーネスと教訓はドメイン別ライブラリ（MemoryConnector。既定は FileConnector で、entry point の harness2.memory_connectors に登録したインストール済みのパッケージや、module:Attr で差し込むものに差し替えられる）に入り、次のタスクを導く。ModelConnector（既定は env で、entry point の harness2.model_connectors に登録したインストール済みのパッケージや、module:Attr で差し込むものに差し替えられる）が、固定したサブストレートの上で実行役のモデルの候補と切り替えの順を決め、柵を掛けた改善役のセッションを回すこともできる。core は実行・評価側を呼び出す。ベンチマークアダプタ（JobBench、LAB、WorkBuddy-Bench）がサブストレート（OpenCode または Codex CLI）上でロールアウトを起動し、サブストレートは Vertex AI のモデル（実行器・採点用の Gemini、改善用の Claude または Gemini）を呼ぶ。タスクの取り込みでは、任意のタスクコネクター（同梱のローカルのフォルダ、entry point の harness2.task_connectors に登録したインストール済みのパッケージ、または module:Attr で差し込むもの）が受け取ったタスクを正規化に渡して TaskSpec にし、IntakeAdapter がベンチマークのアダプターと同じように実行する（private_criteria は採点者だけが読む）。コードのタスクでは、ロールアウトはそれぞれ専用の git worktree で動き、コネクターの workspace policy の確認を通ったあと、選ばれた実行の diff だけをソースのリポジトリに当てる。出力は runs/ に保存される。" width="100%">
   </picture>
 </p>
 
@@ -193,13 +195,14 @@ harness2-report --bench lab --k 1 --mode parallel
 | [`harness2/core/intake.py`](harness2/core/intake.py) | タスクの取り込み: RawTask、TaskSpec とそのスキーマ、TaskConnector の登録 |
 | [`harness2/core/normalize.py`](harness2/core/normalize.py) | 受け取ったタスクを TaskSpec に直す正規化（passthrough と model） |
 | [`harness2/core/intake_local.py`](harness2/core/intake_local.py) | ローカルのフォルダのタスクコネクター（inbox、outbox、failed） |
+| [`harness2/core/models.py`](harness2/core/models.py) | モデルのコネクター: `ModelConnector` の契約、`ModelChoice`、セッションと結果の型、既定の `env` コネクター、`harness2.model_connectors` の登録 |
 | [`harness2/substrate/`](harness2/substrate) | 共通インターフェースの背後にある実行器: OpenCode と Codex CLI |
 | [`harness2/benchmarks/`](harness2/benchmarks) | JobBench、LAB、WorkBuddy-Bench のアダプタ |
 | [`harness2/benchmarks/intake.py`](harness2/benchmarks/intake.py) | ベンチマーク以外のタスク向けの IntakeAdapter と `run_intake` |
 | [`harness2/cli/intake.py`](harness2/cli/intake.py) | `harness2-intake`: 任意のタスクコネクターからタスクを取り込み、git worktree で回し、選ばれた実行の diff だけを戻す（[手順](docs/BENCHMARKS.md#connecting-a-task-source)） |
 | [`harness2/cli/`](harness2/cli) | `harness2-*` コマンド群 |
 | [`harness2/plugins/mcp/`](harness2/plugins/mcp) | 任意の MCP クライアント（標準ライブラリだけで書かれ、ループバックだけの HTTP と stdio に対応）。MCP のタスクサーバーにつなぐタスクコネクターが使う。core は import しない |
-| [`harness2/testing/`](harness2/testing) | タスクコネクターの作者向けの契約テストの道具（`connector_contract`。[手順](docs/BENCHMARKS.md#writing-a-task-connector)） |
+| [`harness2/testing/`](harness2/testing) | コネクターの作者向けの契約テストの道具（タスクコネクター用の `connector_contract` とモデルコネクター用の `model_contract`。[タスクの手順](docs/BENCHMARKS.md#writing-a-task-connector)、[モデルの手順](docs/BENCHMARKS.md#writing-a-model-connector)） |
 | [`harness2/demo.py`](harness2/demo.py) | `harness2-demo` が使う決定的なローカルアダプタ |
 | [`docs/`](docs) | セットアップ、ベンチマーク、実験のガイド（英語） |
 | [`scripts/`](scripts) | 一括実行スクリプト、セットアップと出所の検査 |
