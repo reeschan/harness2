@@ -663,6 +663,9 @@ Each test calls `make_connector` with a fresh temporary directory and the domain
 
 ## Writing a model connector
 
+The whole picture of how a model connector is called is in
+[Model connectors](MODEL_CONNECTORS.md).
+
 A model connector supplies the models of the executor and the improver, per role and
 per task. It replaces where those models come from, and harness2 needs no change to
 use it. The default is `env` (`EnvModelConnector` in `harness2/core/models.py`),
