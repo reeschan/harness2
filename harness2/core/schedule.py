@@ -247,6 +247,8 @@ class TaskResult:
     errors: list[str] = field(default_factory=list)
     memory_meta: Mapping[str, str] | None = None
     memory_recall: dict = field(default_factory=dict)
+    models: dict = field(default_factory=dict)
+    model_connector: str = ""
 
     def to_dict(self) -> dict:
         out = {
@@ -265,7 +267,32 @@ class TaskResult:
             out["memory_scope"] = str(self.memory_meta.get("memory_scope", ""))
         if self.memory_recall:
             out["memory_recall"] = {mode: dict(rec) for mode, rec in self.memory_recall.items()}
+        if self.models:
+            out["models"] = self.models
+        if self.model_connector:
+            out["model_connector"] = self.model_connector
         return out
+
+
+def _adapter_models(adapter: BenchmarkAdapter, task_id: str) -> tuple[dict, str]:
+    """The `models` payload and connector name an adapter offers, or empty when it has none.
+
+    A `model_records` that raises (or returns something unpackable) is reported on stderr
+    before the empty payload is returned, so a broken adapter does not silently drop
+    `models` and `model_connector` from the summary.
+    """
+    getter = getattr(adapter, "model_records", None)
+    if not callable(getter):
+        return {}, ""
+    try:
+        payload, name = getter(task_id)
+    except Exception as exc:
+        print(
+            f"warning: model_records failed for task {task_id}: {type(exc).__name__}: {exc}",
+            file=sys.stderr,
+        )
+        return {}, ""
+    return dict(payload or {}), str(name or "")
 
 
 def _memory_meta(memory_scope: str) -> dict[str, str] | None:
@@ -322,6 +349,8 @@ def _write_summary(summary_path: Path, res: TaskResult) -> None:
                 prev_recall.update(merged.get("memory_recall") or {})
                 if prev_recall:
                     merged["memory_recall"] = prev_recall
+                # `models` and `model_connector` are never merged from the old summary:
+                # this write's executor record replaces them (and drops them when empty).
 
                 merged["errors"] = list(merged.get("errors") or [])
                 seen = {json.dumps(e, sort_keys=True, default=str) for e in merged["errors"]}
@@ -436,6 +465,8 @@ def _resume(
     res.selections = cached_sels
     res.errors = got.get("errors", [])
     res.memory_recall = dict(got.get("memory_recall") or {})
+    res.models = dict(got.get("models") or {})
+    res.model_connector = str(got.get("model_connector") or "")
     _restore_libraries(task_id, k, adapter, runs_root, modes, seed, tag, mode_libs, res.selections)
     return True
 
@@ -709,6 +740,7 @@ def run_task(
     base: list[RunView] = [rolled[label] for label in labels]
 
     res.base = [{"label": b.label, "run_id": b.run_id, "run_dir": str(b.run_dir)} for b in base]
+    res.models, res.model_connector = _adapter_models(adapter, task_id)
     if not any(b.ok for b in base):
         res.status = "base-failed"
         res.errors.append("no base rollout produced anything")
@@ -762,9 +794,11 @@ def run_task(
             }
             res.errors.append(f"{mode}: {type(exc).__name__}: {exc}")
         res.status = "partial"
+        res.models, res.model_connector = _adapter_models(adapter, task_id)
         _write_summary(summary_path, res)
 
     res.status = _merged_status(res.to_dict())
+    res.models, res.model_connector = _adapter_models(adapter, task_id)
     _write_summary(summary_path, res)
     return res
 

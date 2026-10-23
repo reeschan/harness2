@@ -18,10 +18,12 @@ A fake launcher and a fake improver stand in for the agent and the model, so the
 no network. The private criteria carry a password that must reach only the judge.
 """
 
+import io
 import json
 import os
 import tempfile
 import unittest
+from contextlib import redirect_stderr
 from pathlib import Path
 from unittest.mock import patch
 
@@ -57,7 +59,7 @@ class FakeLauncher:
         self.calls = 0
         self.link_output = link_output
 
-    def launch(self, *, workspace, prompt, install, run_dir, timeout):
+    def launch(self, *, workspace, prompt, install, run_dir, timeout, task_id=""):
         self.calls += 1
         attachments = sorted(
             p
@@ -182,7 +184,7 @@ class IntakeEndToEndTest(unittest.TestCase):
             encoding="utf-8",
         )
 
-    def _adapter(self, launcher, judge=None, connector=None) -> IntakeAdapter:
+    def _adapter(self, launcher, judge=None, connector=None, **kwargs) -> IntakeAdapter:
         return IntakeAdapter(
             self.root,
             connector if connector is not None else LocalFileConnector(self.inbox_root),
@@ -190,6 +192,7 @@ class IntakeEndToEndTest(unittest.TestCase):
             launcher=launcher,
             channel=CHANNEL,
             judge=judge,
+            **kwargs,
         )
 
     def _assert_no_secret(self, texts: dict[str, str]) -> None:
@@ -453,7 +456,7 @@ class IntakeEndToEndTest(unittest.TestCase):
 
     def test_empty_output_is_failed(self) -> None:
         class SilentLauncher(FakeLauncher):
-            def launch(self, *, workspace, prompt, install, run_dir, timeout):
+            def launch(self, *, workspace, prompt, install, run_dir, timeout, task_id=""):
                 self.calls += 1
                 (run_dir / "trajectory.md").write_text("[ERROR] nothing\n", encoding="utf-8")
 
@@ -465,6 +468,159 @@ class IntakeEndToEndTest(unittest.TestCase):
         self.assertNotEqual(results[0].status, "ok")
         self.assertFalse((self.inbox_root / "outbox" / "ledger-1").exists())
         self.assertTrue((self.inbox_root / "failed" / "ledger-1.json").is_file())
+
+    def test_default_connector_summary_has_no_models(self) -> None:
+        adapter = self._adapter(FakeLauncher())
+        run_intake(adapter, FakeImprover(CHANNEL), k=1, runs_root=self.runs_root, modes=("agg",))
+        summary = json.loads(
+            (self.inbox_root / "outbox" / "ledger-1" / "summary.json").read_text(encoding="utf-8")
+        )
+        self.assertNotIn("models", summary)
+        self.assertNotIn("model_connector", summary)
+
+    def test_no_executor_model_fails_the_task_with_that_reason(self) -> None:
+        class NoModelLauncher(FakeLauncher):
+            def launch(self, *, workspace, prompt, install, run_dir, timeout, task_id=""):
+                raise RuntimeError(
+                    "no executor model for substrate opencode from model connector fake"
+                )
+
+        adapter = self._adapter(NoModelLauncher())
+        results = run_intake(
+            adapter, FakeImprover(CHANNEL), k=1, runs_root=self.runs_root, modes=("agg",)
+        )
+        self.assertEqual([r.task_id for r in results], ["ledger-1"])
+        self.assertNotEqual(results[0].status, "ok")
+        self.assertFalse((self.inbox_root / "outbox" / "ledger-1").exists())
+        reason = json.loads(
+            (self.inbox_root / "failed" / "ledger-1.json").read_text(encoding="utf-8")
+        )["reason"]
+        self.assertIn("no executor model", reason)
+
+    def test_model_records_error_warns_and_keeps_the_summary_without_models(self) -> None:
+        output = self.root / "executions" / "records-error" / "workspace" / "output"
+        output.mkdir(parents=True)
+        (output / "answer.txt").write_text("ok\n", encoding="utf-8")
+        run_dir = output.parent.parent
+        adapter = self._adapter(FakeLauncher(), model_connector="fake-connector")
+
+        def fake_run_task(task_id, k, **kwargs):
+            return schedule.TaskResult(
+                task_id=task_id,
+                domain="accounting",
+                k=k,
+                status="ok",
+                selections={"agg": {"chosen_run_dir": str(run_dir)}},
+            )
+
+        stderr = io.StringIO()
+        with (
+            patch.object(intake_mod.schedule, "run_task", side_effect=fake_run_task),
+            patch.object(adapter, "model_records", side_effect=RuntimeError("records down")),
+            redirect_stderr(stderr),
+        ):
+            results = run_intake(
+                adapter, FakeImprover(CHANNEL), k=1, runs_root=self.runs_root, modes=("agg",)
+            )
+        self.assertEqual([r.task_id for r in results], ["ledger-1"])
+        self.assertIn(
+            "warning: model_records failed for task ledger-1: RuntimeError: records down",
+            stderr.getvalue(),
+        )
+        summary = json.loads(
+            (self.inbox_root / "outbox" / "ledger-1" / "summary.json").read_text(encoding="utf-8")
+        )
+        self.assertNotIn("models", summary)
+        self.assertNotIn("model_connector", summary)
+
+    def test_summary_has_the_executor_records_of_the_model_connector(self) -> None:
+        rows = [
+            {
+                "runner": "opencode",
+                "model": "first/model",
+                "effort": "low",
+                "ok": False,
+                "unavailable": True,
+                "cost_usd": 0.01,
+                "tokens": {"input": 5, "output": 2},
+                "n": 1,
+            },
+            {
+                "runner": "opencode",
+                "model": "second/model",
+                "effort": "",
+                "ok": True,
+                "unavailable": False,
+                "cost_usd": 0.02,
+                "tokens": {"input": 7, "output": 3},
+                "n": 1,
+            },
+        ]
+
+        class FakeExecutor:
+            def records_for(self, task_id):
+                return [dict(row) for row in rows] if task_id == "ledger-1" else []
+
+        adapter = self._adapter(
+            FakeLauncher(), executor=FakeExecutor(), model_connector="fake-connector"
+        )
+        run_intake(adapter, FakeImprover(CHANNEL), k=1, runs_root=self.runs_root, modes=("agg",))
+        summary = json.loads(
+            (self.inbox_root / "outbox" / "ledger-1" / "summary.json").read_text(encoding="utf-8")
+        )
+        self.assertEqual(summary["model_connector"], "fake-connector")
+        self.assertEqual(summary["models"]["executor"], rows)
+
+        runs_summary = json.loads(
+            (self.runs_root / "intake-oc-agg1" / "ledger-1" / "summary.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        self.assertEqual(runs_summary["models"]["executor"], rows)
+
+    def _delivered_summary_with(self, status: str) -> dict:
+        """Deliver ledger-1 under connector B with run_task returning connector A's record."""
+        output = self.root / "executions" / f"resume-{status}" / "workspace" / "output"
+        output.mkdir(parents=True)
+        (output / "answer.txt").write_text("ok\n", encoding="utf-8")
+        run_dir = output.parent.parent
+        old = {"executor": [{"runner": "opencode", "model": "a/model", "n": 1}]}
+        new = {"executor": [{"runner": "opencode", "model": "b/model", "n": 1}]}
+
+        class FakeExecutor:
+            def records_for(self, task_id):
+                return [dict(row) for row in new["executor"]]
+
+        adapter = self._adapter(FakeLauncher(), executor=FakeExecutor(), model_connector="conn-b")
+
+        def fake_run_task(task_id, k, **kwargs):
+            return schedule.TaskResult(
+                task_id=task_id,
+                domain="accounting",
+                k=k,
+                status=status,
+                selections={"agg": {"chosen_run_dir": str(run_dir)}},
+                models=old,
+                model_connector="conn-a",
+            )
+
+        with patch.object(intake_mod.schedule, "run_task", side_effect=fake_run_task):
+            run_intake(
+                adapter, FakeImprover(CHANNEL), k=1, runs_root=self.runs_root, modes=("agg",)
+            )
+        return json.loads(
+            (self.inbox_root / "outbox" / "ledger-1" / "summary.json").read_text(encoding="utf-8")
+        )
+
+    def test_resumed_task_keeps_the_models_and_connector_of_the_earlier_run(self) -> None:
+        summary = self._delivered_summary_with("skipped")
+        self.assertEqual(summary["model_connector"], "conn-a")
+        self.assertEqual(summary["models"]["executor"][0]["model"], "a/model")
+
+    def test_fresh_run_updates_models_and_connector_together(self) -> None:
+        summary = self._delivered_summary_with("ok")
+        self.assertEqual(summary["model_connector"], "conn-b")
+        self.assertEqual(summary["models"]["executor"][0]["model"], "b/model")
 
 
 if __name__ == "__main__":

@@ -45,6 +45,15 @@ to `global`. Your account must have access to each configured model.
 | `HARNESS2_JUDGE_MODEL` | Bare judge model ID; the adapter supplies the Vertex prefix |
 | `HARNESS2_RUNS_DIR` | Output root; defaults to `runs/` |
 
+These settings select the models when no model connector is given. With a model
+connector (`--model-connector`, else `HARNESS2_MODEL_CONNECTOR`), the connector
+chooses the executor model per task, and the improver model per task when it runs the
+sessions itself (`run_session`); a connector without `run_session` chooses the
+improver once, at start-up. `HARNESS2_SOLVER_MODEL`, `HARNESS2_IMPROVER_MODEL` and the
+improver channel apply only to the default connector (`env`). See
+[Writing a model connector](BENCHMARKS.md#writing-a-model-connector) for the
+contract and how to register one.
+
 The provided configuration uses Vertex Gemini executors and judges, and supports
 either Vertex Claude or Gemini as the improver. LAB also supports the upstream
 judge's direct providers when their credentials are configured. For WorkBuddy,

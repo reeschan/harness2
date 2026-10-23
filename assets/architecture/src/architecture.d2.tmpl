@@ -104,7 +104,7 @@ core: "harness2.core  ·  the method (benchmark-independent)" {
       height: 170
     }
     selection: "selection\nblind pick of a final\n+ reflection" {class: box}
-    routes: "model connector  ·  config.ROLES\nrole → route table\nexecutor: oc · cx\nimprover: opencode · claude_cli\njudge: jb · lab · wb" {
+    routes: "ModelConnector  ·  env (default)\nrole → model candidates\nexecutor: model + fallback\nimprover: session (fenced)\njudge: config.ROLES" {
       class: box
       width: 290
     }
@@ -118,6 +118,11 @@ core: "harness2.core  ·  the method (benchmark-independent)" {
     file: "FileConnector (default)\nfiles under the library root" {class: box}
     plug: "pluggable connector\nentry point · module:Attr" {
       class: box
+      style.stroke-dash: 4
+    }
+    modelplug: "external model connector\nentry point · module:Attr\nruns fenced improver sessions" {
+      class: box
+      width: 300
       style.stroke-dash: 4
     }
   }
@@ -257,6 +262,7 @@ core.outputs.library -> core.task: "guides the next task\n(harnessing-level recu
 }
 core.outputs.library -> core.impls.file: "default" {style.stroke-dash: 4}
 core.outputs.library -> core.impls.plug: "HARNESS2_MEMORY_CONNECTOR\nname, entry point or module:Attr" {style.stroke-dash: 4}
+core.outputs.routes -> core.impls.modelplug: "HARNESS2_MODEL_CONNECTOR\nname, entry point or module:Attr" {style.stroke-dash: 4}
 
 core -> exec: "rollouts ·\nimprover calls" {style.stroke-width: 3}
 exec.bench -> exec.substrate: "launch rollout"

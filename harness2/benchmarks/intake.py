@@ -75,6 +75,7 @@ class Launcher(Protocol):
         install: Install | None,
         run_dir: Path,
         timeout: int,
+        task_id: str = "",
     ) -> None: ...
 
 
@@ -129,18 +130,34 @@ class IntakeAdapter:
         channel: ChannelSpec,
         judge: Judge | None = None,
         domains: Sequence[str] = (),
+        executor: Any = None,
+        model_connector: str = "",
+        improver: Any = None,
     ):
         self.root = Path(root)
         self.connector = connector
         self.normalizer = normalizer
         self.launcher = launcher
         self.substrate = substrate if substrate is not None else OpencodeSubstrate()
-        if not str(channel.model).strip():
+        if channel.kind != "connector" and not str(channel.model).strip():
             raise ValueError(
                 "IntakeAdapter needs a channel with a model (ChannelSpec.model is empty)"
             )
         self.judge = judge
         self.domains = tuple(domains)
+        # The executor choose/record object of a model connector (None for the default one).
+        # It keeps, per task, the candidates tried and how each rollout ended; `model_records`
+        # turns that into the `models` payload of summary.json. An empty connector name means
+        # the default connector, whose summary keeps the old shape (no `models` key).
+        self.executor = executor
+        self.model_connector = str(model_connector or "")
+        # The last error of each rollout that raised (run_id -> "Type: message"). A base
+        # rollout that never produced a run leaves no run directory to read, so the reason
+        # the task connector receives comes from here (see `_deliverable_dir`).
+        self.rollout_errors: dict[str, str] = {}
+        # The improver's ModelSession (None unless a model connector runs the improver
+        # sessions); its per-task rows go to `models.improver` of summary.json.
+        self.improver = improver
         self.spec = BenchSpec(
             name="intake",
             runs_root=self.root / "runs",
@@ -286,6 +303,27 @@ class IntakeAdapter:
         """A generic workspace has no harness invariants of its own."""
         return None
 
+    def model_records(self, task_id: str) -> tuple[dict, str]:
+        """The executor `models` payload and connector name for `task_id`'s summary.
+
+        Empty for the default connector, so that summary.json keeps its old shape. With a
+        model connector the payload is `{"executor": [...]}`, the candidates in the order they
+        were first tried (see `intake_worktree.ExecutorModels.records_for`). When a model
+        connector ran improver sessions, `"improver": [...]` follows in the same form.
+        """
+        if not self.model_connector:
+            return {}, ""
+        payload: dict = {}
+        if self.executor is not None:
+            rows = self.executor.records_for(task_id)
+            if rows:
+                payload["executor"] = rows
+        if self.improver is not None:
+            rows = self.improver.records_for(task_id)
+            if rows:
+                payload["improver"] = rows
+        return payload, self.model_connector
+
     def execute(
         self, task_id: str, harness_dir: Path | None, run_id: str, *, timeout: int | None = None
     ) -> Path:
@@ -327,10 +365,13 @@ class IntakeAdapter:
                 install=install,
                 run_dir=run_dir,
                 timeout=int(timeout or DEFAULT_TIMEOUT),
+                task_id=task_id,
             )
         except Exception as exc:
+            message = f"{type(exc).__name__}: {exc}"
+            self.rollout_errors[str(run_id)] = message
             raise RuntimeError(
-                f"intake rollout {run_id} for task {task_id!r} failed: {type(exc).__name__}: {exc}"
+                f"intake rollout {run_id} for task {task_id!r} failed: {message}"
             ) from exc
         finally:
             if install is not None:
@@ -415,7 +456,21 @@ def _deliverable_dir(adapter: IntakeAdapter, res: schedule.TaskResult, mode: str
     selection = (res.selections or {}).get(mode) or {}
     chosen = str(selection.get("chosen_run_dir") or "")
     if not chosen:
-        raise ValueError(f"no run was selected for mode {mode!r} (status {res.status})")
+        # Carry the rollout's own errors (e.g. "no executor model for substrate opencode")
+        # into the reason the task connector receives, not just the generic status line. The
+        # base rollouts that raised left no run directory behind, so their errors come from
+        # the adapter's record of this run; `schedule` is not touched for this.
+        detail = [str(e) for e in (res.errors or ())]
+        errors = getattr(adapter, "rollout_errors", {})
+        for entry in res.base or ():
+            if not isinstance(entry, dict):
+                continue
+            run_id = str(entry.get("run_id") or "")
+            error = errors.get(run_id, "")
+            if error:
+                detail.append(f"{entry.get('label') or run_id}: {error}")
+        suffix = f": {'; '.join(detail)}" if detail else ""
+        raise ValueError(f"no run was selected for mode {mode!r} (status {res.status}){suffix}")
     output = Path(chosen) / "workspace" / "output"
     if output.is_symlink():
         raise ValueError(f"the selected run's workspace/output is a symbolic link: {output}")
@@ -452,6 +507,17 @@ def _check_run_args(
                 "a shared mutable library would leak one mode into another; "
                 "pass libraries={'agg': ..., 'seq': ...} instead"
             )
+
+
+def _set_improver_task(task_id: str, *props: Proposer | None) -> None:
+    """Tell the ModelSession of each proposer (once per session) which task is current."""
+    seen: set[int] = set()
+    for prop in props:
+        session = getattr(prop, "models", None)
+        if session is None or id(session) in seen:
+            continue
+        seen.add(id(session))
+        session.for_task(task_id)
 
 
 def run_intake(
@@ -497,6 +563,8 @@ def run_intake(
         handled.add(task_id)
         if _is_marked_handled(adapter, task_id):
             continue
+        # Tell the improver sessions (proposer and selector) which task they now work for.
+        _set_improver_task(task_id, prop, selector_prop)
         try:
             res = schedule.run_task(
                 task_id,
@@ -517,6 +585,18 @@ def run_intake(
             )
             _write_handled_mark(adapter, task_id, "failed")
             continue
+        # A skipped (resumed) task keeps the executor record stored on its old summary; this
+        # process has run no rollout, so the adapter offers nothing to replace it with. The
+        # getter is the same one `run_task` uses (`schedule._adapter_models`), including its
+        # warning when `model_records` raises.
+        # A skipped task keeps both `models` and `model_connector` as restored (they describe
+        # the earlier run's connector); otherwise the two are updated together, never one alone.
+        if res.status != "skipped":
+            payload, name = schedule._adapter_models(adapter, task_id)
+            if payload:
+                res.models = payload
+                if name:
+                    res.model_connector = name
         try:
             output = _deliverable_dir(adapter, res, modes[0])
         except ValueError as exc:

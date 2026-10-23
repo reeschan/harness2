@@ -284,7 +284,10 @@ errors.
 | `--k` | `1` | Task-level recursion budget (`R = 4k` rollouts per task) |
 | `--modes` | `agg` | `parallel` or `sequential` (`agg` / `seq` are the on-disk tokens), or a comma list; the report follows the first mode |
 | `--seed`, `--tag` | none, empty | Enter the run namespace |
-| `--model` | `config.SOLVER_MODEL_OC` | The OpenCode model of the agent |
+| `--model` | `config.SOLVER_MODEL_OC` | The OpenCode model of the agent; only with the default model connector |
+| `--model-connector` | `$HARNESS2_MODEL_CONNECTOR`, else `env` | A built-in name (`env`), an entry point name of `harness2.model_connectors`, or a `module:Attr` import path of a factory. The improver of a connector without `run_session` is chosen once, at start-up |
+| `--model-connector-opt KEY=VALUE` | none | A keyword argument of the model connector factory; repeatable |
+| `--session-root DIR` | `<work-root>/_sessions` | Where the model connector's improver sessions get their working directories; a connector that runs the sessions must allow this directory |
 | `--timeout` | `3600` | Seconds offered to the connector as its `timeout` keyword (for its own calls), and the timeout of the model channel the improver uses (proposer and selector) |
 
 `--timeout` does not limit a rollout: the agent's run in each rollout is limited
@@ -657,3 +660,227 @@ class MyConnectorContractTest(MemoryConnectorContractTests, unittest.TestCase):
 List `unittest.TestCase` after the mixin, so unittest collects the mixin's tests.
 Each test calls `make_connector` with a fresh temporary directory and the domain
 `contract`.
+
+## Writing a model connector
+
+A model connector supplies the models of the executor and the improver, per role and
+per task. It replaces where those models come from, and harness2 needs no change to
+use it. The default is `env` (`EnvModelConnector` in `harness2/core/models.py`),
+which returns the models the environment already selects.
+
+### The contract
+
+A connector meets the `ModelConnector` protocol in `harness2/core/models.py`. One
+member is required:
+
+| Member | Does |
+|---|---|
+| `routes(role, *, task_id, substrate) -> list[ModelChoice]` | Returns the candidates for `role` (`executor` or `improver`), best first. For the executor, `substrate` is the runner harness2 fixed and every candidate's `runner` must equal it; for the improver it is `""`. An empty list is allowed |
+
+Four more members are optional. `capabilities(connector)` reads them with getattr and
+fills in the defaults; an attribute that is present but None counts as missing, and
+one that is present but not callable raises TypeError naming it. A connector that
+defines `run_session` must also define `fences`, or `capabilities` raises TypeError:
+
+| Capability | Does |
+|---|---|
+| `run_session(role, request) -> SessionResult` | Runs one session itself, on the runner and model of `request.choice` only; default None, so harness2 runs every session |
+| `fences() -> Mapping[str, FenceDeclaration]` | The fence it applies to each runner it executes, by the runner's name; default `{}` |
+| `record(role, task_id, choice, outcome) -> None` | Called once for each use of a candidate, with an `Outcome`. A skipped candidate is not a use, so `record` is not called for it. A `record` that raises is a warning on standard error, never a failed run; default None |
+| `close() -> None` | Releases connections and processes; `harness2-intake` calls it once at the end, also when the run fails; the default does nothing |
+
+These dataclasses carry the values:
+
+| Type | Fields |
+|---|---|
+| `ModelChoice` | `runner` (the runner's name; for the executor, the substrate), `model`, and `effort` (default `""`) |
+| `SessionRequest` | `cwd`, `mission`, `system`, `wall` (seconds), `label` and `choice` (the `ModelChoice` harness2 picked: a session runs on `choice.runner` and `choice.model` only) |
+| `SessionResult` | `text`, `ok`, `cost_usd` (default `0.0`), `tokens` (a `Tokens` with `input` and `output`, each None when the backend does not report it), `wall_s` (default `0.0`), `error` (default `""`), `unavailable` (default False; true for a failure that should move on to the next candidate, such as a usage limit, an authentication failure, or a model or variant that does not exist) and `runner` (the runner that actually ran the session; empty means `choice.runner`, and a non-empty value that differs from it makes harness2 treat the result as a failure) |
+| `Outcome` | What `record` receives for one use: `ok`, `unavailable`, `cost_usd`, `tokens`, `wall_s`, `error`, and `run_id` (executor) or `label` (improver) |
+| `FenceDeclaration` | `capabilities` (the kinds of tool the session has: `read`, `write`, `search`, `commands`, `network`, `mcp`), `workdir_only`, `asks_human`, `harness_credentials`, and `runner` (optional, for the record) |
+
+A `SessionResult` that is `ok` with an empty `text` counts as a failure (`empty reply`).
+
+### Executor and improver
+
+For the executor, harness2 fixes the substrate: `harness2-intake` always runs
+`opencode`, because the refinement changes that substrate's harness. The connector
+chooses only the model and effort of each candidate, and their order. `routes` is
+called once per task with the substrate. A candidate whose `runner` is not the
+substrate is not run: it is kept as a summary row with `skipped_reason` (`runner
+<runner> is not <substrate>`) and `n` 0.
+
+A failure that means the model could not be used — a usage limit, an authentication
+failure, or a model or variant that does not exist — moves the task's position to
+the next candidate. Only the rollout whose candidate is still the current one moves
+the position, so parallel rollouts that failed on the same candidate do not skip one.
+When a next candidate exists, the failed rollout is retried once, in the same run
+directory on the candidate now current, after its worktree is put back at the base
+commit (`git reset --hard` and `git clean -fdx`); the failed attempt's
+`events.1.jsonl`, `opencode.1.stderr` and `trajectory.1.md` stay beside the retry's
+files. A second unavailable failure ends the rollout; the position has been moved
+when a later candidate exists, so the remaining rollouts run that one. Any other
+failure ends the rollout at once. When the candidates are used up, the rollout fails;
+an empty list fails the task without running a model, with the reason handed to the
+task connector's `fail`.
+
+Only these failures count as unavailable: an error event whose numeric
+`data.statusCode` is 401, 403, 429 or 529, whose `name` is one of
+`ProviderAuthError`, `ProviderAuthenticationError`, `ProviderModelNotFoundError`,
+`ProviderRateLimitError`, `ProviderQuotaExceededError` or
+`ProviderUsageLimitError`, or whose `data.message`/`message` holds a specific phrase
+such as `rate limit`, `quota`, `invalid api key`, `variant unavailable` or `model not
+found`. The rest of the event (headers, provider ids, token limits, other numbers, a
+status written as a string) is not inspected, so an ordinary failure is not mistaken
+for an unusable model.
+
+For the improver, a connector with `run_session` runs the sessions itself. harness2
+hands it the working directory, the mission, the system prompt, the wall clock, a
+label and the `choice`. The working directory is a fresh directory under
+`--session-root` (default `<work-root>/_sessions`); `harness2-intake` prints that
+root at start-up, and a connector that accepts only its own directories must allow
+it. harness2 still prepares and caches the working directory, retries, copies the
+context in and harvests the rewritten tree. It tries the candidates in order: a
+candidate whose runner has no declaration that meets the condition is skipped and noted (`skipped_reason`
+`no fence`); an `unavailable` session moves on to the next candidate; any other
+failure counts as the attempt's failure. When `SessionResult.runner` is not empty and
+differs from `choice.runner`, the result is a failure (`connector ran <runner> instead
+of <choice.runner>`), not an unavailable one.
+
+A connector without `run_session` keeps a channel of ours: harness2 runs the improver
+on the first improver candidate's runner and model through the existing `opencode` or
+`claude_cli` channel, chosen once at start-up, not per task. For this the candidate's
+`runner` is the channel's name, written as it is (`claude_cli` or `opencode`); any
+other name is an argument error. When the connector offers no improver candidate, the
+environment's channel is used.
+
+### Fences
+
+harness2 puts one condition on the improver sessions a connector runs. It names no
+runner and no provider: the connector sets up its side, and harness2 only checks what
+the connector declares. A connector that runs sessions declares the fence it applies
+with `fences()`, a mapping from the name of the runner it uses to a `FenceDeclaration`.
+The name only ties a candidate (`ModelChoice.runner`) to its declaration; it plays no
+part in the check.
+
+A `FenceDeclaration` says, in terms that do not depend on the runner:
+
+| Field | Meaning |
+|---|---|
+| `capabilities` | The kinds of tool the session has, each one of `read` (read files), `write` (write or edit files), `search` (find files or text), `commands` (run commands), `network` (reach outside, such as fetching from the Web) and `mcp` (tools from MCP servers) |
+| `workdir_only` | The session cannot reach files outside the working directory it is given; no other directory is added |
+| `asks_human` | The session may stop to ask a person for confirmation |
+| `harness_credentials` | harness2's own API credentials (environment variables) reach the child process |
+| `runner` | Optional. The name of the runner the connector uses, for the record; it is not checked |
+
+The condition is `models.IMPROVER_FENCE`: `capabilities` is a subset of `read`,
+`write` and `search`, `workdir_only` is true, `asks_human` is false and
+`harness_credentials` is false. A declaration meets it when it is a `FenceDeclaration`
+with well-typed fields and every value is within the condition; a `capabilities` value
+outside the six names is a problem too (`models.satisfies`; `models.fence_problems`
+lists what is wrong). A declaration of the wrong type does not meet it. A candidate
+whose runner has no declaration that meets the condition is never used for the
+improver; it is noted with `skipped_reason` `no fence` in the summary.
+
+When a connector defines `run_session` but no declared runner meets the condition,
+`harness2-intake` stops at start-up with exit code 2 and the reasons
+(`models.fence_report` names each runner and what it misses). The declaration is
+trusted: harness2 does not inspect the connector's processes.
+
+### Choosing and registering the connector
+
+The connector's name is the explicit name when one is given, else
+`HARNESS2_MODEL_CONNECTOR`, else the default `env`. `models.resolve_factory` turns
+the name into a factory in this order:
+
+1. The built-in registrations (`models.register`). By default only `env` is
+   registered.
+2. An entry point with the same name in the group `harness2.model_connectors`.
+3. A `module:Attr` import path, for a name that contains `:`. `Attr` may be a dotted
+   chain.
+
+A name found nowhere raises ValueError listing the registered and entry point names.
+
+The factory is called with keyword arguments: every `--model-connector-opt KEY=VALUE`
+(repeatable; each value arrives as a `str`), and nothing else. `check_options` checks
+the keys against the factory's signature before the run starts, and a key the factory
+cannot accept is an argument error. A factory whose result does not meet the protocol
+raises TypeError.
+
+A package makes its factory available by name with an entry point in its
+`pyproject.toml`:
+
+```toml
+[project.entry-points."harness2.model_connectors"]
+my-models = "my_package.models:make_connector"
+```
+
+After `pip install`, `harness2-intake --model-connector my-models` uses it, with the
+connector's own settings passed as `--model-connector-opt KEY=VALUE`. Before
+installing, `--model-connector my_package.models:make_connector` loads the same
+factory. Without `--model-connector` the name comes from
+`HARNESS2_MODEL_CONNECTOR`, else `env`. `--model` sets the executor model only with
+the default connector: with any other connector the two are an argument error,
+because the connector chooses the executor model.
+
+### What is recorded
+
+With a connector other than the default, `summary.json` gains `model_connector`, the
+connector's name, and, when the run recorded one, `models`: one list per role that has
+rows (`executor`, `improver`). The list holds the candidates in the order they were
+first tried, each with `runner`, `model`, `effort`, `ok`, `unavailable`, `cost_usd`,
+`tokens` (input and output) and `n`, the number of times it was tried. Only a
+candidate that was skipped has `skipped_reason`, and its `n` stays 0; a candidate that
+was tried never has that key. The connector's `record` receives each use as an
+`Outcome` as it happens. With the default connector neither key is written, so
+`summary.json` keeps its old shape.
+
+### Contract tests
+
+`harness2.testing.model_contract` checks a connector against the contract from your
+own tests. `check_model_connector(conn)`,
+`check_choices(choices, *, role, substrate)` and `check_session_result(result)` raise
+AssertionError on a mismatch, and `ModelConnectorContractTests` is a unittest mixin
+that runs them, and a few more, against the connector your test builds: `routes`
+returns a list of `ModelChoice` for both roles (an empty list is fine) with the
+executor's runner equal to the substrate; `fences()` (if any) is read through
+`models.fenced_runners`, and a connector that has both `run_session` and `fences()`
+fails that check when no runner meets the condition, with `models.fence_report` in the
+message; `run_session`
+(if any) is called once, with a request from `make_session_request(tmp, choice)` for
+the first improver candidate on the first runner harness2 accepts, and passes
+`check_session_result` (skipped when there is no accepted runner, no such candidate,
+or `make_session_request` is not implemented); `record` (if any) accepts an
+`Outcome`; and `close` (if any) can be called twice. `check_session_result` requires
+`text` and `runner` to be str, an `ok` result to carry a non-empty `text` and not be
+`unavailable`, and a non-negative cost and wall time.
+
+```python
+import unittest
+from pathlib import Path
+
+from harness2.core.models import ModelChoice, SessionRequest
+from harness2.testing.model_contract import ModelConnectorContractTests
+from my_package.models import MyConnector
+
+
+class MyConnectorContractTest(ModelConnectorContractTests, unittest.TestCase):
+    def make_connector(self):
+        return MyConnector()
+
+    def make_session_request(self, tmp: Path, choice: ModelChoice) -> SessionRequest:
+        return SessionRequest(
+            cwd=tmp,
+            mission="say hello",
+            system="be brief",
+            wall=30,
+            label="contract",
+            choice=choice,
+        )
+```
+
+List `unittest.TestCase` after the mixin, so unittest collects the mixin's tests. Each
+test calls `make_connector()` with no arguments and closes the connector afterwards; a
+connector without `run_session`, or a test that does not implement
+`make_session_request`, skips the session check; a connector with `run_session` but no
+accepted runner fails the fence check, and skips the session check.
