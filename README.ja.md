@@ -58,7 +58,7 @@ Harness² が想定するのは**オープンワールド**、つまりハーネ
 
 コードは互いに独立した 3 つの軸に分かれています。**手法**（`harness2/core`、ベンチマークにも実行器にも依存しない）、ロールアウトを実行する**サブストレート**（OpenCode または Codex）、タスク・起動処理・採点を提供する**ベンチマーク**アダプタです。
 
-コネクターにも同じ作りが 3 種類あります。経験ライブラリの**メモリコネクター**（`harness2.memory_connectors`）、実行するタスクの**タスクコネクター**（`harness2.task_connectors`）、実行器と改善役が使うモデルの**モデルコネクター**（`harness2.model_connectors`）です。どれも名前で選び、インストール済みパッケージの entry point か `module:Attr` の差し込みから読み込みます。同梱の既定（`file`・`local`・`env`）を使えば、これまでどおりに動きます。
+コネクターにも同じ作りが 3 種類あります。経験ライブラリの**メモリコネクター**（`harness2.memory_connectors`）、実行するタスクの**タスクコネクター**（`harness2.task_connectors`）、実行器と改善役が使うモデルの**モデルコネクター**（`harness2.model_connectors`）です。どれも名前で選び、インストール済みパッケージの entry point か `module:Attr` の差し込みから読み込みます。同梱の既定（`file`・`local`・`env`）を使えば、これまでどおりに動きます。モデルのコネクターの契約とその呼ばれ方は[モデルのコネクター](docs/MODEL_CONNECTORS.ja.md)にあります。
 
 <p align="center">
   <picture>
@@ -195,7 +195,7 @@ harness2-report --bench lab --k 1 --mode parallel
 | [`harness2/core/intake.py`](harness2/core/intake.py) | タスクの取り込み: RawTask、TaskSpec とそのスキーマ、TaskConnector の登録 |
 | [`harness2/core/normalize.py`](harness2/core/normalize.py) | 受け取ったタスクを TaskSpec に直す正規化（passthrough と model） |
 | [`harness2/core/intake_local.py`](harness2/core/intake_local.py) | ローカルのフォルダのタスクコネクター（inbox、outbox、failed） |
-| [`harness2/core/models.py`](harness2/core/models.py) | モデルのコネクター: `ModelConnector` の契約、`ModelChoice`、セッションと結果の型、既定の `env` コネクター、`harness2.model_connectors` の登録 |
+| [`harness2/core/models.py`](harness2/core/models.py) | モデルのコネクター: `ModelConnector` の契約、`ModelChoice`、セッションと結果の型、既定の `env` コネクター、`harness2.model_connectors` の登録 ([手順](docs/MODEL_CONNECTORS.ja.md)) |
 | [`harness2/substrate/`](harness2/substrate) | 共通インターフェースの背後にある実行器: OpenCode と Codex CLI |
 | [`harness2/benchmarks/`](harness2/benchmarks) | JobBench、LAB、WorkBuddy-Bench のアダプタ |
 | [`harness2/benchmarks/intake.py`](harness2/benchmarks/intake.py) | ベンチマーク以外のタスク向けの IntakeAdapter と `run_intake` |

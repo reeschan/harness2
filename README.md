@@ -82,7 +82,8 @@ tasks to run (`harness2.task_connectors`), and a **model connector** for the
 models the executor and the improver use (`harness2.model_connectors`). Each is
 chosen by name, from an installed package's entry point or from a `module:Attr`
 plug-in, and the bundled defaults (`file`, `local`, `env`) keep the previous
-behavior.
+behavior. The [model connector guide](docs/MODEL_CONNECTORS.md) covers the
+contract and how a connector is called.
 
 <p align="center">
   <picture>
@@ -253,7 +254,7 @@ for details; each command also supports `--help`.
 | [`harness2/core/intake.py`](harness2/core/intake.py) | Task intake: RawTask, TaskSpec and its schema, and the TaskConnector registry |
 | [`harness2/core/normalize.py`](harness2/core/normalize.py) | Normalizers that turn a raw task into a TaskSpec (passthrough and model) |
 | [`harness2/core/intake_local.py`](harness2/core/intake_local.py) | The local folder task connector (inbox, outbox, failed) |
-| [`harness2/core/models.py`](harness2/core/models.py) | Model connectors: the `ModelConnector` contract, `ModelChoice`, the session and outcome types, the default `env` connector, and the `harness2.model_connectors` registry |
+| [`harness2/core/models.py`](harness2/core/models.py) | Model connectors: the `ModelConnector` contract, `ModelChoice`, the session and outcome types, the default `env` connector, and the `harness2.model_connectors` registry ([guide](docs/MODEL_CONNECTORS.md)) |
 | [`harness2/substrate/`](harness2/substrate) | Executors behind one interface: OpenCode and Codex CLI |
 | [`harness2/benchmarks/`](harness2/benchmarks) | Adapters for JobBench, LAB, and WorkBuddy-Bench |
 | [`harness2/benchmarks/intake.py`](harness2/benchmarks/intake.py) | IntakeAdapter and `run_intake` for non-benchmark tasks |

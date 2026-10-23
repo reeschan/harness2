@@ -1,0 +1,88 @@
+# How harness2-intake calls a model connector
+# __MONO__ is the color of single-color logos. render.py draws a light (000000) and a dark (ffffff) copy.
+# Render: python <arch-diagram>/scripts/render.py assets/model-connectors/model-connectors.d2
+# Solid lines are the calls of one task; dashed lines are optional (only with a connector that has the capability).
+direction: right
+
+vars: {
+  d2-config: {
+    layout-engine: elk
+    pad: 40
+  }
+}
+
+classes: {
+  svc: {
+    shape: rectangle
+    style: {
+      border-radius: 12
+      font-size: 15
+    }
+  }
+  zone: {
+    style.border-radius: 16
+  }
+  saas: {
+    style: {
+      border-radius: 16
+      stroke-dash: 3
+    }
+  }
+}
+
+intake: "harness2-intake" {
+  class: zone
+  icon: https://cdn.simpleicons.org/python
+
+  executor: "executor\nOpencodeAgent · fixed substrate\ncandidates per task, one retry" {
+    class: svc
+  }
+  proposer: "improver (Proposer)\nconnector channel\ncache · retries · harvest" {
+    class: svc
+  }
+  fence: "fence check\nIMPROVER_FENCE\nread · write · search only" {
+    class: svc
+  }
+  summary: "summary.json\nmodels · model_connector" {
+    class: svc
+    shape: page
+  }
+  sessions: "--session-root\nsession directories" {
+    class: svc
+    icon: https://icons.terrastruct.com/essentials%2F245-folder.svg
+  }
+}
+
+port: "model connector port\nharness2.core.models" {
+  class: zone
+
+  contract: "routes (required)\nrun_session · fences · record · close (optional)" {
+    class: svc
+  }
+  default: "env (default)\nconfig.ROLES" {
+    class: svc
+  }
+}
+
+external: "an external connector\nentry point harness2.model_connectors\nor module:Attr" {
+  class: saas
+
+  conn: "connector\n--model-connector-opt KEY=VALUE" {
+    class: svc
+  }
+  runners: "its runners\n(sessions in the session directory)" {
+    class: svc
+  }
+}
+
+intake.executor -> port.contract: "routes(executor, substrate)"
+intake.proposer -> port.contract: "routes(improver)\nrun_session(request with choice)"
+port.contract -> intake.fence: "fences()" {style.stroke-dash: 4}
+intake.fence -> intake.proposer: "only runners whose\ndeclaration meets the fence"
+intake.executor -> port.contract: "record(outcome)" {style.stroke-dash: 4}
+port.contract -> port.default: "no connector given"
+port.contract -> external.conn: "--model-connector NAME"
+external.conn -> external.runners: "run one session" {style.stroke-dash: 4}
+external.runners -> intake.sessions: "works only here" {style.stroke-dash: 4}
+intake.executor -> intake.summary: "attempts"
+intake.proposer -> intake.summary: "attempts"
