@@ -30,12 +30,15 @@ from .tree import SurfaceSpec
 
 ModelId = str
 
-CHANNELS = ("claude_cli", "opencode")
+CHANNELS = ("claude_cli", "opencode", "connector")
 
 
 @dataclass(frozen=True)
 class ChannelSpec:
-    """How to reach one model, on one proposer/selector channel."""
+    """How to reach one model, on one proposer/selector channel.
+
+    The "connector" kind has an empty model: a model connector picks the model per session.
+    """
 
     kind: str
     model: ModelId
@@ -65,8 +68,10 @@ def resolve_channel_model(
         )
     if kind is None:
         kind = config.DEFAULT_PROPOSER_CHANNEL
-    if kind not in CHANNELS:
-        raise ValueError(f"unknown channel {kind!r}; expected one of {CHANNELS}")
+    # The connector channel has no model of its own, so it is not resolved here.
+    resolvable = tuple(c for c in CHANNELS if c != "connector")
+    if kind not in resolvable:
+        raise ValueError(f"unknown channel {kind!r}; expected one of {resolvable}")
     if model is None:
         # The dict wins when it holds the channel (tests patch it); otherwise the role table.
         model = config.PROPOSER_MODEL_BY_CHANNEL.get(kind)

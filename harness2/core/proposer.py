@@ -27,11 +27,13 @@ import os
 import re
 import shutil
 import subprocess
+import sys
 import tempfile
 import threading
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Any
 
 from .. import config
 from .spec import ChannelSpec
@@ -40,6 +42,8 @@ SYSTEM_ARG_MAX = 120_000
 
 # The only tools a claude_cli session gets: file tools, no command or web tools.
 CLAUDE_CLI_TOOLS = "Read,Edit,Write,Glob,Grep"
+# The permission mode of a claude_cli session: edits are accepted without asking.
+CLAUDE_CLI_PERMISSION_MODE = "acceptEdits"
 
 
 MAX_CONCURRENCY = int(config.PROPOSER_CONCURRENCY)
@@ -85,23 +89,156 @@ class Reply:
     error: str = ""
     audit: Path | None = None
     workspace: Path | None = None
+    # The candidate a model connector ran this session on (empty on the other channels).
+    runner: str = ""
+    model: str = ""
+    effort: str = ""
 
     def __bool__(self) -> bool:
         return self.ok
 
 
+class ModelSession:
+    """The improver side of a model connector: which task is current, which runners are fenced
+    well enough, and what happened to each candidate (the `models.improver` rows of summary.json).
+
+    The fenced runners are always the connector's declared fences checked against the
+    requirements (`models.fenced_runners`). The connector must have `run_session`. `for_task`
+    sets the task the next sessions belong to. `session_root` is the directory the connector
+    channel creates its session working directories in (the system temporary directory when
+    not given).
+
+    For a caller that runs the tasks one after another (harness2-intake). Not for a caller that
+    runs tasks in parallel: the current task is shared state.
+    """
+
+    def __init__(self, connector: Any, name: str = "", *, session_root: Path | str | None = None):
+        from . import models
+
+        caps = models.capabilities(connector)
+        if caps.run_session is None:
+            raise ValueError(f"model connector {name or connector!r} has no run_session")
+        self.connector = connector
+        self.name = name or models.DEFAULT
+        self.fenced: dict = dict(models.fenced_runners(connector))
+        self.session_root = Path(session_root) if session_root else Path(tempfile.gettempdir())
+        self.run_session = caps.run_session
+        self.record = caps.record
+        self.task_id = ""
+        self._lock = threading.Lock()
+        self._records: dict[str, list[dict]] = {}
+
+    def for_task(self, task_id: str) -> "ModelSession":
+        """Make `task_id` the current task; returns self."""
+        with self._lock:
+            self.task_id = str(task_id)
+        return self
+
+    def candidates(self) -> list:
+        """The connector's improver candidates for the current task, best first."""
+        from . import models
+
+        with self._lock:
+            task_id = self.task_id
+        return list(self.connector.routes(models.Role.IMPROVER, task_id=task_id, substrate=""))
+
+    def _row(self, choice: Any) -> dict:
+        rows = self._records.setdefault(self.task_id, [])
+        key = (choice.runner, choice.model, choice.effort)
+        for row in rows:
+            if (row["runner"], row["model"], row["effort"]) == key:
+                return row
+        row = {
+            "runner": choice.runner,
+            "model": choice.model,
+            "effort": choice.effort,
+            "ok": False,
+            "unavailable": False,
+            "cost_usd": 0.0,
+            "tokens": {"input": None, "output": None},
+            "n": 0,
+        }
+        rows.append(row)
+        return row
+
+    def skip(self, choice: Any, reason: str) -> None:
+        """Note a candidate that was not run, with why."""
+        with self._lock:
+            self._row(choice)["skipped_reason"] = reason
+
+    def settle(
+        self,
+        choice: Any,
+        label: str,
+        *,
+        ok: bool,
+        unavailable: bool = False,
+        cost_usd: float = 0.0,
+        tokens: Any = None,
+        wall_s: float = 0.0,
+        error: str = "",
+    ) -> None:
+        """Note one session on `choice` and hand it to the connector's `record`."""
+        from . import models
+
+        outcome = models.Outcome(
+            ok=bool(ok),
+            unavailable=bool(unavailable),
+            cost_usd=float(cost_usd or 0.0),
+            tokens=tokens or models.Tokens(),
+            wall_s=float(wall_s or 0.0),
+            error=str(error or ""),
+            label=label,
+        )
+        with self._lock:
+            row = self._row(choice)
+            row["n"] += 1
+            row["ok"] = row["ok"] or outcome.ok
+            row["unavailable"] = row["unavailable"] or outcome.unavailable
+            row["cost_usd"] = round(row["cost_usd"] + outcome.cost_usd, 6)
+            for name in ("input", "output"):
+                value = getattr(outcome.tokens, name, None)
+                if value is not None:
+                    row["tokens"][name] = (row["tokens"][name] or 0) + int(value)
+        if self.record is None:
+            return
+        try:
+            self.record(models.Role.IMPROVER, self.task_id, choice, outcome)
+        except Exception as exc:
+            print(
+                f"warning: model connector record failed: {type(exc).__name__}: {exc}",
+                file=sys.stderr,
+            )
+
+    def records_for(self, task_id: str) -> list[dict]:
+        """The summary rows of `task_id` (copies), in the order the candidates were first seen."""
+        with self._lock:
+            return [
+                {**row, "tokens": dict(row.get("tokens") or {})}
+                for row in self._records.get(task_id, [])
+            ]
+
+
 @dataclass
 class Proposer:
-    """Runs agentic sessions on one channel, with an audit trail and a cache."""
+    """Runs agentic sessions on one channel, with an audit trail and a cache.
+
+    On the "connector" channel `models` (a ModelSession) is required and runs the sessions.
+    """
 
     spec: ChannelSpec
     audit_dir: Path | None = None
     attempts: int = 2
     project: str = field(default_factory=lambda: config.VERTEX_PROJECT)
     region: str = field(default_factory=lambda: config.VERTEX_REGION)
+    models: ModelSession | None = None
     _calls: list[Reply] = field(default_factory=list)
 
     def __post_init__(self) -> None:
+        if self.spec.kind == "connector":
+            if self.models is None:
+                raise ValueError("the connector channel needs a ModelSession (models=...)")
+            return
         if not self.spec.model.strip():
             raise ValueError("Set HARNESS2_IMPROVER_MODEL before starting model sessions")
 
@@ -157,14 +294,23 @@ class Proposer:
         for attempt in range(1, tries + 1):
             if attempt > 1:
                 time.sleep(10 * (attempt - 1))
-            tmp = Path(tempfile.mkdtemp(prefix="harness2-prop-"))
+            if self.spec.kind == "connector":
+                assert self.models is not None
+                self.models.session_root.mkdir(parents=True, exist_ok=True)
+                tmp = Path(tempfile.mkdtemp(prefix="harness2-prop-", dir=self.models.session_root))
+            else:
+                tmp = Path(tempfile.mkdtemp(prefix="harness2-prop-"))
             try:
                 if context_dir and Path(context_dir).is_dir():
                     shutil.copytree(context_dir, tmp / "context", dirs_exist_ok=True)
+                choice = None
                 with _SEM if _SEM is not None else contextlib.nullcontext():
-                    text, cost, err = (
-                        self._claude_cli if self.spec.kind == "claude_cli" else self._opencode
-                    )(tmp, mission, system, wall)
+                    if self.spec.kind == "connector":
+                        text, cost, err, choice = self._connector(tmp, mission, system, wall, label)
+                    else:
+                        text, cost, err = (
+                            self._claude_cli if self.spec.kind == "claude_cli" else self._opencode
+                        )(tmp, mission, system, wall)
                 spent_usd += cost
                 if not text.strip():
                     last = err or "empty reply"
@@ -178,6 +324,8 @@ class Proposer:
                     attempts=attempt,
                     channel=self.spec.kind,
                 )
+                if choice is not None:
+                    r.runner, r.model, r.effort = choice.runner, choice.model, choice.effort
                 if harvest:
                     r.workspace = self._harvest(tmp, harvest, label, cache_key)
                     if r.workspace is None:
@@ -188,6 +336,8 @@ class Proposer:
             except subprocess.TimeoutExpired:
                 last = f"timeout after {wall}s"
             except Exception as exc:
+                # `_connector` carries the cost of the candidates that ran before it raised.
+                spent_usd += float(getattr(exc, "harness2_cost_usd", 0.0) or 0.0)
                 last = f"{type(exc).__name__}: {exc}"
             finally:
                 shutil.rmtree(tmp, ignore_errors=True)
@@ -210,6 +360,63 @@ class Proposer:
             cost_usd=spent_usd,
         )
 
+    def _connector(
+        self, cwd: Path, mission: str, system: str, wall: int, label: str
+    ) -> tuple[str, float, str, Any]:
+        """One attempt through the model connector: (text, cost, error, the candidate used).
+
+        The connector's improver candidates are tried in order. One whose runner has no
+        satisfied fence is skipped (and noted); `unavailable` moves on to the next; any other
+        failure is this attempt's failure.
+        """
+        from . import models
+
+        session = self.models
+        assert session is not None
+        cost = 0.0
+        last = ""
+        for choice in session.candidates():
+            if choice.runner not in session.fenced:
+                session.skip(choice, "no fence")
+                continue
+            request = models.SessionRequest(
+                cwd=cwd, mission=mission, system=system, wall=wall, label=label, choice=choice
+            )
+            try:
+                res = session.run_session(models.Role.IMPROVER, request)
+            except BaseException as exc:
+                session.settle(choice, label, ok=False, error=f"{type(exc).__name__}: {exc}")
+                with contextlib.suppress(Exception):
+                    exc.harness2_cost_usd = cost  # type: ignore[attr-defined]
+                raise
+            cost += float(res.cost_usd or 0.0)
+            ran = res.runner or choice.runner
+            error, ok, unavailable = res.error, res.ok, res.unavailable
+            if ran != choice.runner:
+                ok, unavailable = False, False
+                error = f"connector ran {ran} instead of {choice.runner}"
+            elif ok and not (res.text or "").strip():
+                ok = False
+                error = "empty reply"
+            session.settle(
+                choice,
+                label,
+                ok=ok,
+                unavailable=unavailable,
+                cost_usd=res.cost_usd,
+                tokens=res.tokens,
+                wall_s=res.wall_s,
+                error=error,
+            )
+            if ok:
+                return res.text, cost, error, choice
+            if unavailable:
+                last = error or "unavailable"
+                continue
+            return "", cost, error or "session failed", choice
+        detail = f": {last}" if last else ""
+        return "", cost, f"no fenced improver model{detail}", None
+
     def _claude_cli(
         self, cwd: Path, mission: str, system: str, wall: int
     ) -> tuple[str, float, str]:
@@ -223,7 +430,7 @@ class Proposer:
             "--tools",
             CLAUDE_CLI_TOOLS,
             "--permission-mode",
-            "acceptEdits",
+            CLAUDE_CLI_PERMISSION_MODE,
             "--permission-prompts",
             "none",
             "--strict-mcp-config",
@@ -380,21 +587,21 @@ class Proposer:
         if system:
             p["system"].write_text(system, encoding="utf-8")
         p["response"].write_text(r.text, encoding="utf-8")
+        meta = {
+            "label": r.label,
+            "ok": r.ok,
+            "channel": r.channel,
+            "model": r.model or self.spec.model,
+            "effort": r.effort or self.spec.effort,
+            "attempts": r.attempts,
+            "wall_s": r.wall_s,
+            "cost_usd": r.cost_usd,
+            "error": r.error,
+        }
+        if r.runner:
+            meta["runner"] = r.runner
         p["meta"].write_text(
-            json.dumps(
-                {
-                    "label": r.label,
-                    "ok": r.ok,
-                    "channel": r.channel,
-                    "model": self.spec.model,
-                    "effort": self.spec.effort,
-                    "attempts": r.attempts,
-                    "wall_s": r.wall_s,
-                    "cost_usd": r.cost_usd,
-                    "error": r.error,
-                },
-                indent=2,
-            ),
+            json.dumps(meta, indent=2),
             encoding="utf-8",
         )
         r.audit = p["response"]
