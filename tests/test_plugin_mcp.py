@@ -35,6 +35,7 @@ from harness2.plugins.mcp import (
     McpToolError,
     StdioMcpClient,
     client_from,
+    tool_result,
 )
 
 SESSION_ID = "session-abc"
@@ -52,6 +53,8 @@ def _tool_result(name, arguments):
         }, None
     if name == "text_only":
         return {"content": [{"type": "text", "text": json.dumps({"from": "text"})}]}, None
+    if name == "list":
+        return {"content": [{"type": "text", "text": json.dumps([{"id": "a"}, {"id": "b"}])}]}, None
     if name == "fail":
         return {
             "content": [{"type": "text", "text": "task PBI-9 is already claimed"}],
@@ -168,6 +171,35 @@ def _call_from_two_threads(client):
     return results, errors
 
 
+class ToolResultTest(unittest.TestCase):
+    def test_text_json_array_is_returned(self):
+        result = {"content": [{"type": "text", "text": '[{"id": "a"}, {"id": "b"}]'}]}
+        self.assertEqual(tool_result(result), [{"id": "a"}, {"id": "b"}])
+
+    def test_structured_content_array_is_returned(self):
+        result = {
+            "content": [{"type": "text", "text": "[1, 2]"}],
+            "structuredContent": [{"id": "a"}, {"id": "b"}],
+        }
+        self.assertEqual(tool_result(result), [{"id": "a"}, {"id": "b"}])
+
+    def test_scalar_text_raises_mcp_error(self):
+        for text in ("5", '"x"', "null", "true"):
+            with self.subTest(text=text):
+                with self.assertRaises(McpError) as caught:
+                    tool_result({"content": [{"type": "text", "text": text}]})
+                self.assertNotIsInstance(caught.exception, McpToolError)
+
+    def test_non_json_text_raises_mcp_error(self):
+        with self.assertRaises(McpError) as caught:
+            tool_result({"content": [{"type": "text", "text": "not JSON"}]})
+        self.assertIn("not JSON", str(caught.exception))
+
+    def test_no_structured_content_no_text_raises_mcp_error(self):
+        with self.assertRaises(McpError):
+            tool_result({"content": []})
+
+
 class HttpClientTest(unittest.TestCase):
     def setUp(self):
         self.server, self.thread = _start_server()
@@ -196,6 +228,10 @@ class HttpClientTest(unittest.TestCase):
     def test_text_json_without_structured_content(self):
         with HttpMcpClient(self.url, timeout=5) as client:
             self.assertEqual(client.call_tool("text_only", {}), {"from": "text"})
+
+    def test_text_json_array_is_returned(self):
+        with HttpMcpClient(self.url, timeout=5) as client:
+            self.assertEqual(client.call_tool("list", {}), [{"id": "a"}, {"id": "b"}])
 
     def test_is_error_raises_tool_error(self):
         with HttpMcpClient(self.url, timeout=5) as client:
@@ -351,6 +387,9 @@ while True:
         result = {"content": [{"type": "text", "text": "overlapping request"}], "isError": True}
     elif name == "fail":
         result = {"content": [{"type": "text", "text": "report is unknown"}], "isError": True}
+    elif name == "list":
+        result = {"content": [{"type": "text",
+                               "text": json.dumps([{"id": "a"}, {"id": "b"}])}]}
     else:
         payload = {"echo": message["params"]["arguments"], "id": message["id"]}
         result = {"content": [{"type": "text", "text": json.dumps(payload)}],
@@ -375,6 +414,10 @@ class StdioClientTest(unittest.TestCase):
             with self.assertRaises(McpToolError) as caught:
                 client.call_tool("fail", {})
         self.assertIn("report is unknown", str(caught.exception))
+
+    def test_text_json_array_is_returned(self):
+        with _stdio("normal") as client:
+            self.assertEqual(client.call_tool("list", {}), [{"id": "a"}, {"id": "b"}])
 
     def test_child_exit_raises_mcp_error(self):
         with _stdio("exit") as client:

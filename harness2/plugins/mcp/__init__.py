@@ -27,11 +27,11 @@ a request never leaves the loopback address it was given; a redirect answer rais
 Each client serializes its calls with a lock, so one client may be shared between threads: the
 calls run one after another, each getting its own response.
 
-`call_tool` returns the tool's structured result: `structuredContent` when it is a dict, or else
-the first text content parsed as a JSON object. A result marked `isError` raises
-`McpToolError`; transport and protocol failures (no connection, not JSON, a JSON-RPC error, a
-response id that does not match, a redirect, a timeout) raise `McpError`. `client_from` picks
-the transport from either a url or a command.
+`call_tool` returns the tool's structured result: `structuredContent` when it is a dict or a
+list, or else the first text content parsed as a JSON object or array. A result marked `isError`
+raises `McpToolError`; transport and protocol failures (no connection, not JSON, a JSON-RPC
+error, a response id that does not match, a redirect, a timeout) raise `McpError`. `client_from`
+picks the transport from either a url or a command.
 """
 
 from __future__ import annotations
@@ -77,7 +77,7 @@ class McpToolError(McpError):
 class McpClient(Protocol):
     """Calls tools on one MCP server."""
 
-    def call_tool(self, name: str, arguments: Mapping[str, Any]) -> dict: ...
+    def call_tool(self, name: str, arguments: Mapping[str, Any]) -> dict | list: ...
 
     def close(self) -> None: ...
 
@@ -106,15 +106,20 @@ def _content_text(result: Mapping[str, Any]) -> list[str]:
     ]
 
 
-def tool_result(result: Any) -> dict:
-    """The dict a tools/call result carries; raises McpToolError or McpError when there is none."""
+def tool_result(result: Any) -> dict | list:
+    """The structured result a tools/call result carries: a dict or a list.
+
+    `structuredContent` is returned when it is a dict or a list; otherwise the first text content
+    is parsed as JSON and returned when it is a dict or a list. A result marked `isError` raises
+    `McpToolError`; anything else that carries no such value raises `McpError`.
+    """
     if not isinstance(result, dict):
         raise McpError(f"tools/call result is not an object: {result!r}")
     if result.get("isError") is True:
         reason = "\n".join(_content_text(result)) or "tool call failed"
         raise McpToolError(reason)
     structured = result.get("structuredContent")
-    if isinstance(structured, dict):
+    if isinstance(structured, (dict, list)):
         return structured
     texts = _content_text(result)
     if texts:
@@ -122,9 +127,9 @@ def tool_result(result: Any) -> dict:
             value = json.loads(texts[0])
         except json.JSONDecodeError as exc:
             raise McpError(f"tool result text is not JSON: {texts[0][:200]!r}") from exc
-        if isinstance(value, dict):
+        if isinstance(value, (dict, list)):
             return value
-    raise McpError("tool result has neither structuredContent nor a JSON object text")
+    raise McpError("tool result has neither structuredContent nor a JSON object or array text")
 
 
 def _response_result(message: Any, request_id: int) -> Any:
@@ -180,7 +185,7 @@ class _BaseClient:
         self._send_notification({"jsonrpc": "2.0", "method": "notifications/initialized"})
         self._initialized = True
 
-    def call_tool(self, name: str, arguments: Mapping[str, Any]) -> dict:
+    def call_tool(self, name: str, arguments: Mapping[str, Any]) -> dict | list:
         with self._lock:
             self._ensure_initialized()
             result = self._request("tools/call", {"name": name, "arguments": dict(arguments)})

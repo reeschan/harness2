@@ -25,13 +25,14 @@ import json
 import os
 import random
 import re
+import sys
 import traceback
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Mapping, Sequence
+from typing import Any, Mapping, Sequence
 
 from . import library, memory, recursion, runmark, selection
 from . import recall as recall_block
@@ -506,6 +507,7 @@ def _recall_tree(
     surface,
     base_tree: harness_tree.Tree,
     mode_lib: memory.MemoryConnector,
+    query: str,
     recorded: Mapping | None,
     res: TaskResult,
 ) -> harness_tree.Tree:
@@ -514,10 +516,12 @@ def _recall_tree(
     A text recorded on an earlier summary is reused (its sha256 checked, and it must still fit
     the room left by `base_tree`) instead of recalling again, so a re-run starts from the same
     tree. Only a missing (None) or empty record recalls afresh; any other record without a
-    string text raises ValueError rather than silently changing the starting tree.
+    string text raises ValueError rather than silently changing the starting tree. `query` is
+    the task prompt, handed to a connector's `recall` when it can take one.
     """
     if recorded is None or (isinstance(recorded, Mapping) and not recorded):
-        text = memory.recall(mode_lib, task_id, recall_block.room(surface, base_tree))
+        room = recall_block.room(surface, base_tree)
+        text = memory.recall(mode_lib, task_id, room, query=query)
     else:
         if not isinstance(recorded, Mapping) or not isinstance(recorded.get("text"), str):
             raise ValueError(f"recorded memory_recall for {mode} has no text")
@@ -653,6 +657,7 @@ def run_task(
     `memory_scope`; None (the default setting) adds no keys.
     `memory_recall` True injects each mode's library recall into that mode's starting tree
     and records the text on the summary as `memory_recall`; a re-run reuses the recorded text.
+    A fresh recall also gets the task prompt as `query` when the connector accepts one.
     """
     if int(k) < 1:
         raise ValueError(f"k must be positive, got {k!r}")
@@ -710,19 +715,27 @@ def run_task(
         _write_summary(summary_path, res)
         return res
 
+    prompt: str | None = None
     for mode in modes:
         n = Namespace(bench, sub, mode, k, seed, tag)
         try:
             mode_lib = mode_libs.get(mode)
             mode_tree = base_tree
             if memory_recall and mode_lib is not None:
+                recorded = recorded_recall.get(mode)
+                if prompt is None and not recorded:
+                    try:
+                        prompt = adapter.task_prompt(task_id)
+                    except Exception:
+                        prompt = ""
                 mode_tree = _recall_tree(
                     mode,
                     task_id,
                     surface=surface,
                     base_tree=base_tree,
                     mode_lib=mode_lib,
-                    recorded=recorded_recall.get(mode),
+                    query=prompt or "",
+                    recorded=recorded,
                     res=res,
                 )
             _run_one_mode(
@@ -756,6 +769,26 @@ def run_task(
     return res
 
 
+def _close_libraries(libs: Mapping[str, memory.MemoryConnector], *, suppress: bool) -> None:
+    """Close every library, continuing past errors.
+
+    With `suppress` (the run body is already raising) each error is reported on stderr and
+    nothing is raised, so the body's exception wins. Otherwise the first error is raised after
+    every library has been closed.
+    """
+    first: Exception | None = None
+    for lib in libs.values():
+        try:
+            memory.close(lib)
+        except Exception as exc:
+            if first is None:
+                first = exc
+            if suppress:
+                print(f"warning: memory connector close failed: {exc}", file=sys.stderr)
+    if first is not None and not suppress:
+        raise first
+
+
 def run_domain(
     domain: str,
     task_ids: Sequence[str],
@@ -772,17 +805,19 @@ def run_domain(
     pool_policy: str = "finals",
     memory_scope: str = "",
     memory_recall: bool = False,
+    memory_options: Mapping[str, Any] | None = None,
 ) -> dict:
     """Every task in one domain, in `stream_order()` order, threading the library forward.
 
     With a non-empty `memory_scope` the library root is shared across runs: before each task
     the library keeps this stream's preceding tasks and every entry that belongs to no task of
-    this stream, so other runs' entries survive.
+    this stream, so other runs' entries survive. `memory_options` goes to every connector
+    factory as its connector-specific keywords. Every connector built here is closed in a
+    `finally`, in this domain's thread (see `memory.close`): a close error is raised after all
+    are closed, unless the body is already raising, in which case each is reported on stderr
+    and the body's exception wins.
     """
     surface = adapter.substrate.surface()
-    libs = {
-        mode: memory.connector_for(Path(library_root) / mode, domain, surface) for mode in modes
-    }
     memory_meta = _memory_meta(memory_scope)
     stream_slugs = {library.slug(t) for t in task_ids}
     out = {
@@ -793,48 +828,60 @@ def run_domain(
         "failed": 0,
         "tasks": [],
     }
-    for i, tid in enumerate(task_ids, 1):
-        try:
-            for lib in libs.values():
-                if memory_scope:
-                    others = [e for e in lib.entries() if e not in stream_slugs]
-                    lib.retain([*task_ids[: i - 1], *others])
-                else:
-                    lib.retain(task_ids[: i - 1])
-            before = {mode: len(lib.entries()) for mode, lib in libs.items()}
-            r = run_task(
-                tid,
-                k,
-                adapter=adapter,
-                prop=prop,
-                runs_root=runs_root,
-                modes=modes,
-                seed=seed,
-                tag=tag,
-                libraries=libs,
-                selector_prop=selector_prop,
-                pool_policy=pool_policy,
-                memory_meta=memory_meta,
-                memory_recall=memory_recall,
+    libs: dict[str, memory.MemoryConnector] = {}
+    failed = False
+    try:
+        for mode in modes:
+            libs[mode] = memory.connector_for(
+                Path(library_root) / mode, domain, surface, options=memory_options
             )
-            if r.status in ("ok", "skipped"):
-                out["done"] += 1
-                row = {"task": tid, "status": r.status, "library_entries_before": before}
-            else:
+        for i, tid in enumerate(task_ids, 1):
+            try:
+                for lib in libs.values():
+                    if memory_scope:
+                        others = [e for e in lib.entries() if e not in stream_slugs]
+                        lib.retain([*task_ids[: i - 1], *others])
+                    else:
+                        lib.retain(task_ids[: i - 1])
+                before = {mode: len(lib.entries()) for mode, lib in libs.items()}
+                r = run_task(
+                    tid,
+                    k,
+                    adapter=adapter,
+                    prop=prop,
+                    runs_root=runs_root,
+                    modes=modes,
+                    seed=seed,
+                    tag=tag,
+                    libraries=libs,
+                    selector_prop=selector_prop,
+                    pool_policy=pool_policy,
+                    memory_meta=memory_meta,
+                    memory_recall=memory_recall,
+                )
+                if r.status in ("ok", "skipped"):
+                    out["done"] += 1
+                    row = {"task": tid, "status": r.status, "library_entries_before": before}
+                else:
+                    out["failed"] += 1
+                    row = {
+                        "task": tid,
+                        "status": r.status,
+                        "error": "; ".join(r.errors) if r.errors else r.status,
+                        "library_entries_before": before,
+                    }
+            except Exception as exc:
                 out["failed"] += 1
-                row = {
-                    "task": tid,
-                    "status": r.status,
-                    "error": "; ".join(r.errors) if r.errors else r.status,
-                    "library_entries_before": before,
-                }
-        except Exception as exc:
-            out["failed"] += 1
-            row = {"task": tid, "status": "exception", "error": f"{type(exc).__name__}: {exc}"}
-        out["tasks"].append(row)
-        err = f"  :: {row['error']}" if row.get("error") else ""
-        print(f"  [{domain}] {i}/{len(task_ids)} {row['status']:<12} {tid}{err}", flush=True)
-    return out
+                row = {"task": tid, "status": "exception", "error": f"{type(exc).__name__}: {exc}"}
+            out["tasks"].append(row)
+            err = f"  :: {row['error']}" if row.get("error") else ""
+            print(f"  [{domain}] {i}/{len(task_ids)} {row['status']:<12} {tid}{err}", flush=True)
+        return out
+    except BaseException:
+        failed = True
+        raise
+    finally:
+        _close_libraries(libs, suppress=failed)
 
 
 def task_stream(
@@ -900,8 +947,13 @@ def run_sweep(
     only_tasks: Sequence[str] = (),
     memory_scope: str = "",
     memory_recall: bool = False,
+    memory_options: Mapping[str, Any] | None = None,
 ) -> dict:
-    """Run domains concurrently, preserving task order after stream filters are applied."""
+    """Run domains concurrently, preserving task order after stream filters are applied.
+
+    `memory_options` is passed through to every domain's connector factories (see
+    `run_domain`).
+    """
     ordered_tasks = task_stream(
         adapter,
         split=split,
@@ -933,6 +985,7 @@ def run_sweep(
                 pool_policy=pool_policy,
                 memory_scope=memory_scope,
                 memory_recall=memory_recall,
+                memory_options=memory_options,
             ): d
             for d in order
         }
