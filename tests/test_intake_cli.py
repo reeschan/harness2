@@ -32,6 +32,7 @@ from pathlib import Path
 from unittest import mock
 
 from harness2.cli import intake as cli
+from harness2.core import models
 from harness2.core.intake import WorkspacePolicy
 from harness2.core.spec import ChannelSpec
 
@@ -111,6 +112,48 @@ def needs_url_factory(url):
     return _STATE["connector"]
 
 
+class FakeModelConnector:
+    def __init__(self) -> None:
+        self.routes_calls: list[tuple[str, str, str]] = []
+        self.closed = False
+
+    def routes(self, role, *, task_id, substrate):
+        self.routes_calls.append((role, task_id, substrate))
+        if role == models.Role.IMPROVER:
+            return []
+        return [models.ModelChoice(substrate, "fake/model")]
+
+    def close(self) -> None:
+        self.closed = True
+
+
+def model_factory(**kwargs):
+    _STATE["model_kwargs"] = kwargs
+    return _STATE["model_connector"]
+
+
+def model_url_factory(url):
+    _STATE["model_kwargs"] = {"url": url}
+    return _STATE["model_connector"]
+
+
+def model_not_a_connector(**kwargs):
+    _STATE["model_kwargs"] = kwargs
+    return object()
+
+
+def model_close_raises(**kwargs):
+    _STATE["model_kwargs"] = kwargs
+    connector = _STATE["model_connector"]
+
+    def close():
+        connector.closed = True
+        raise ConnectionError("model close failed")
+
+    connector.close = close
+    return connector
+
+
 def _ref(attr: str) -> str:
     return f"{__name__}:{attr}"
 
@@ -130,8 +173,10 @@ class IntakeCliTest(unittest.TestCase):
         subprocess.run(["git", "init", "-q", str(self.repo)], check=True, capture_output=True)
         self.work = self.tmp / "out" / "h2"
         self.connector = FakeConnector()
+        self.model_connector = FakeModelConnector()
         _STATE.clear()
         _STATE["connector"] = self.connector
+        _STATE["model_connector"] = self.model_connector
         self.addCleanup(_STATE.clear)
         self.launcher = mock.MagicMock(name="launcher")
         self.launcher_cls = mock.MagicMock(return_value=self.launcher)
@@ -518,6 +563,106 @@ class IntakeCliTest(unittest.TestCase):
         self._outcomes(("T-1", "DONE"), ("T-2", "BLOCKED"))
         code, _out, _err = self._run(self._args())
         self.assertEqual(code, 1)
+
+    # -- the model connector -----------------------------------------------------------
+
+    def test_model_with_a_non_default_model_connector_is_exit_2(self) -> None:
+        code, err = self._exit_code_and_err(
+            self._args("--model-connector", _ref("model_factory"), "--model", "prov/x")
+        )
+        self.assertEqual(code, 2)
+        self.assertIn("--model", err)
+        self.assertNotIn("model_kwargs", _STATE)
+        self.run_intake.assert_not_called()
+
+    def test_model_connector_opt_without_equals_is_exit_2(self) -> None:
+        code, err = self._exit_code_and_err(
+            self._args("--model-connector", _ref("model_factory"), "--model-connector-opt", "url")
+        )
+        self.assertEqual(code, 2)
+        self.assertIn("--model-connector-opt", err)
+
+    def test_unknown_model_connector_option_is_exit_2(self) -> None:
+        code, err = self._exit_code_and_err(
+            self._args(
+                "--model-connector",
+                _ref("model_url_factory"),
+                "--model-connector-opt",
+                "other=1",
+            )
+        )
+        self.assertEqual(code, 2)
+        self.assertIn("other", err)
+        self.run_intake.assert_not_called()
+
+    def test_unknown_model_connector_is_exit_2(self) -> None:
+        code, err = self._exit_code_and_err(self._args("--model-connector", "no-such-connector"))
+        self.assertEqual(code, 2)
+        self.assertIn("unknown model connector", err)
+
+    def test_model_not_a_connector_is_exit_2(self) -> None:
+        code, err = self._exit_code_and_err(
+            self._args("--model-connector", _ref("model_not_a_connector"))
+        )
+        self.assertEqual(code, 2)
+        self.assertIn("not a ModelConnector", err)
+
+    def test_model_connector_options_reach_the_factory(self) -> None:
+        code, _out, _err = self._run(
+            self._args(
+                "--model-connector",
+                _ref("model_url_factory"),
+                "--model-connector-opt",
+                "url=a=b",
+            )
+        )
+        self.assertEqual(code, 0)
+        self.assertEqual(_STATE["model_kwargs"], {"url": "a=b"})
+
+    def test_default_connector_with_model_forces_that_one_choice(self) -> None:
+        code, _out, _err = self._run(self._args("--model", "prov/model-z"))
+        self.assertEqual(code, 0)
+        executor = cli.OpencodeAgent.call_args.args[0]
+        self.assertIsInstance(executor, cli.ExecutorModels)
+        self.assertEqual(executor.current("t1"), models.ModelChoice("opencode", "prov/model-z"))
+        adapter = self.run_intake.call_args.args[0]
+        self.assertEqual(adapter.model_records("t1"), ({}, ""))
+
+    def test_default_connector_uses_the_configured_executor_model(self) -> None:
+        with mock.patch.object(
+            models.config, "route", return_value=mock.Mock(model="prov/env-model")
+        ):
+            code, _out, _err = self._run(self._args())
+            self.assertEqual(code, 0)
+            executor = cli.OpencodeAgent.call_args.args[0]
+            # The candidates are asked for lazily, on the first rollout of the task.
+            self.assertEqual(
+                executor.current("t1"), models.ModelChoice("opencode", "prov/env-model")
+            )
+        adapter = self.run_intake.call_args.args[0]
+        self.assertEqual(adapter.model_records("t1"), ({}, ""))
+
+    def test_custom_model_connector_is_closed_and_named_in_the_summary(self) -> None:
+        name = _ref("model_factory")
+        code, _out, _err = self._run(self._args("--model-connector", name))
+        self.assertEqual(code, 0)
+        self.assertTrue(self.model_connector.closed)
+        adapter = self.run_intake.call_args.args[0]
+        self.assertEqual(adapter.model_connector, name)
+        self.assertEqual(adapter.model_records("t1"), ({}, name))
+        self.assertEqual(
+            cli.OpencodeAgent.call_args.args[0].current("t1"),
+            models.ModelChoice("opencode", "fake/model"),
+        )
+
+    def test_model_connector_close_error_keeps_the_run_error(self) -> None:
+        self.connector.close = mock.MagicMock()
+        self.run_intake.side_effect = RuntimeError("boom")
+        code, _out, err = self._run(self._args("--model-connector", _ref("model_close_raises")))
+        self.assertEqual(code, 1)
+        self.assertIn("error: boom", err)
+        self.assertIn("error: model connector close: model close failed", err)
+        self.connector.close.assert_called_once()
 
 
 if __name__ == "__main__":

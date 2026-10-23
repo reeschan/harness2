@@ -57,7 +57,7 @@ class FakeLauncher:
         self.calls = 0
         self.link_output = link_output
 
-    def launch(self, *, workspace, prompt, install, run_dir, timeout):
+    def launch(self, *, workspace, prompt, install, run_dir, timeout, task_id=""):
         self.calls += 1
         attachments = sorted(
             p
@@ -182,7 +182,7 @@ class IntakeEndToEndTest(unittest.TestCase):
             encoding="utf-8",
         )
 
-    def _adapter(self, launcher, judge=None, connector=None) -> IntakeAdapter:
+    def _adapter(self, launcher, judge=None, connector=None, **kwargs) -> IntakeAdapter:
         return IntakeAdapter(
             self.root,
             connector if connector is not None else LocalFileConnector(self.inbox_root),
@@ -190,6 +190,7 @@ class IntakeEndToEndTest(unittest.TestCase):
             launcher=launcher,
             channel=CHANNEL,
             judge=judge,
+            **kwargs,
         )
 
     def _assert_no_secret(self, texts: dict[str, str]) -> None:
@@ -453,7 +454,7 @@ class IntakeEndToEndTest(unittest.TestCase):
 
     def test_empty_output_is_failed(self) -> None:
         class SilentLauncher(FakeLauncher):
-            def launch(self, *, workspace, prompt, install, run_dir, timeout):
+            def launch(self, *, workspace, prompt, install, run_dir, timeout, task_id=""):
                 self.calls += 1
                 (run_dir / "trajectory.md").write_text("[ERROR] nothing\n", encoding="utf-8")
 
@@ -465,6 +466,79 @@ class IntakeEndToEndTest(unittest.TestCase):
         self.assertNotEqual(results[0].status, "ok")
         self.assertFalse((self.inbox_root / "outbox" / "ledger-1").exists())
         self.assertTrue((self.inbox_root / "failed" / "ledger-1.json").is_file())
+
+    def test_default_connector_summary_has_no_models(self) -> None:
+        adapter = self._adapter(FakeLauncher())
+        run_intake(adapter, FakeImprover(CHANNEL), k=1, runs_root=self.runs_root, modes=("agg",))
+        summary = json.loads(
+            (self.inbox_root / "outbox" / "ledger-1" / "summary.json").read_text(encoding="utf-8")
+        )
+        self.assertNotIn("models", summary)
+        self.assertNotIn("model_connector", summary)
+
+    def test_no_executor_model_fails_the_task_with_that_reason(self) -> None:
+        class NoModelLauncher(FakeLauncher):
+            def launch(self, *, workspace, prompt, install, run_dir, timeout, task_id=""):
+                raise RuntimeError(
+                    "no executor model for substrate opencode from model connector fake"
+                )
+
+        adapter = self._adapter(NoModelLauncher())
+        results = run_intake(
+            adapter, FakeImprover(CHANNEL), k=1, runs_root=self.runs_root, modes=("agg",)
+        )
+        self.assertEqual([r.task_id for r in results], ["ledger-1"])
+        self.assertNotEqual(results[0].status, "ok")
+        self.assertFalse((self.inbox_root / "outbox" / "ledger-1").exists())
+        reason = json.loads(
+            (self.inbox_root / "failed" / "ledger-1.json").read_text(encoding="utf-8")
+        )["reason"]
+        self.assertIn("no executor model", reason)
+
+    def test_summary_has_the_executor_records_of_the_model_connector(self) -> None:
+        rows = [
+            {
+                "runner": "opencode",
+                "model": "first/model",
+                "effort": "low",
+                "ok": False,
+                "unavailable": True,
+                "cost_usd": 0.01,
+                "tokens": {"input": 5, "output": 2},
+                "n": 1,
+            },
+            {
+                "runner": "opencode",
+                "model": "second/model",
+                "effort": "",
+                "ok": True,
+                "unavailable": False,
+                "cost_usd": 0.02,
+                "tokens": {"input": 7, "output": 3},
+                "n": 1,
+            },
+        ]
+
+        class FakeExecutor:
+            def records_for(self, task_id):
+                return [dict(row) for row in rows] if task_id == "ledger-1" else []
+
+        adapter = self._adapter(
+            FakeLauncher(), executor=FakeExecutor(), model_connector="fake-connector"
+        )
+        run_intake(adapter, FakeImprover(CHANNEL), k=1, runs_root=self.runs_root, modes=("agg",))
+        summary = json.loads(
+            (self.inbox_root / "outbox" / "ledger-1" / "summary.json").read_text(encoding="utf-8")
+        )
+        self.assertEqual(summary["model_connector"], "fake-connector")
+        self.assertEqual(summary["models"]["executor"], rows)
+
+        runs_summary = json.loads(
+            (self.runs_root / "intake-oc-agg1" / "ledger-1" / "summary.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        self.assertEqual(runs_summary["models"]["executor"], rows)
 
 
 if __name__ == "__main__":

@@ -46,10 +46,10 @@ from typing import Any
 
 from .. import config
 from ..benchmarks.intake import IntakeAdapter, run_intake
-from ..benchmarks.intake_worktree import OpencodeAgent, WorktreeLauncher
-from ..core import intake, intake_report, normalize
-from ..core.proposer import Proposer
-from ..core.spec import resolve_channel_model
+from ..benchmarks.intake_worktree import ExecutorModels, OpencodeAgent, WorktreeLauncher
+from ..core import intake, intake_report, models, normalize
+from ..core.proposer import ModelSession, Proposer
+from ..core.spec import ChannelSpec, resolve_channel_model
 from ..core.worktree import WorktreeError, git_env
 from . import _common as C
 
@@ -82,7 +82,30 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument("--seed", type=int, default=None, help="enters the namespace")
     p.add_argument("--tag", default="", help="enters the namespace")
     p.add_argument(
-        "--model", default=None, help="OpenCode model of the agent; default from the config"
+        "--model",
+        default=None,
+        help="OpenCode model of the agent; default from the config "
+        "(not with a model connector other than the default)",
+    )
+    p.add_argument(
+        "--model-connector",
+        default=None,
+        help=f"model connector name or module:Attr; default ${models.ENV_VAR} or {models.DEFAULT}. "
+        "The improver of a connector without run_session is chosen once, at start-up",
+    )
+    p.add_argument(
+        "--session-root",
+        default=None,
+        metavar="DIR",
+        help="where the model connector's improver sessions get their working directories; "
+        "default <work-root>/_sessions",
+    )
+    p.add_argument(
+        "--model-connector-opt",
+        action="append",
+        default=[],
+        metavar="KEY=VALUE",
+        help="keyword argument of the model connector factory (repeatable)",
     )
     p.add_argument(
         "--timeout",
@@ -115,12 +138,14 @@ def _toplevel(repo: Path) -> Path | None:
     return Path(top).resolve()
 
 
-def _parse_opts(parser: argparse.ArgumentParser, raw: list[str]) -> dict[str, str]:
+def _parse_opts(
+    parser: argparse.ArgumentParser, raw: list[str], flag: str = "--connector-opt"
+) -> dict[str, str]:
     opts: dict[str, str] = {}
     for item in raw:
         key, sep, value = item.partition("=")
         if not sep or not key:
-            parser.error(f"--connector-opt must be KEY=VALUE, got {item!r}")
+            parser.error(f"{flag} must be KEY=VALUE, got {item!r}")
         opts[key] = value
     return opts
 
@@ -128,6 +153,7 @@ def _parse_opts(parser: argparse.ArgumentParser, raw: list[str]) -> dict[str, st
 def _check_args(parser: argparse.ArgumentParser, args: argparse.Namespace) -> None:
     """Argument errors exit with status 2 through parser.error, before any task is claimed."""
     args.opts = _parse_opts(parser, args.connector_opt)
+    args.model_opts = _parse_opts(parser, args.model_connector_opt, "--model-connector-opt")
     repo = Path(args.repo)
     if not repo.is_absolute():
         parser.error(f"--repo must be an absolute path, got {args.repo!r}")
@@ -137,6 +163,11 @@ def _check_args(parser: argparse.ArgumentParser, args: argparse.Namespace) -> No
     if top is None:
         parser.error(f"--repo is not in a git work tree: {args.repo}")
     work_root = Path(args.work_root).expanduser().resolve()
+    args.session_root = (
+        Path(args.session_root).expanduser().resolve()
+        if args.session_root
+        else work_root / "_sessions"
+    )
     if _inside(work_root, top):
         parser.error(f"--work-root {work_root} is inside the --repo work tree {top}")
     if repo.resolve() != top:
@@ -188,6 +219,37 @@ def _build_connector(
             f"which is not a TaskConnector"
         )
     return conn
+
+
+def _build_model_connector(
+    parser: argparse.ArgumentParser, name: str, options: Mapping[str, str]
+) -> models.ModelConnector:
+    """The model connector named by --model-connector; a bad name or option exits with 2."""
+    try:
+        factory = models.resolve_factory(name)
+    except (ValueError, TypeError) as exc:
+        parser.error(str(exc))
+    try:
+        models.check_options(factory, options)
+    except ValueError as exc:
+        parser.error(str(exc))
+    try:
+        conn = factory(**dict(options))
+    except (TypeError, ValueError) as exc:
+        parser.error(f"model connector {name!r}: {exc}")
+    if not isinstance(conn, models.ModelConnector):
+        parser.error(
+            f"model connector {name!r} factory returned {type(conn).__name__}, "
+            f"which is not a ModelConnector"
+        )
+    return conn
+
+
+def _close_quietly(connector: Any) -> None:
+    close = getattr(connector, "close", None)
+    if callable(close):
+        with contextlib.suppress(Exception):
+            close()
 
 
 class _Recorder:
@@ -244,8 +306,46 @@ def _main(parser: argparse.ArgumentParser, args: argparse.Namespace) -> int:
     work_root = Path(args.work_root).expanduser().resolve()
     runs_root = Path(args.runs_root) if args.runs_root else work_root / "runs"
     modes = args.mode_tokens
-    model = args.model or config.SOLVER_MODEL_OC
 
+    model_name = models.connector_name(name=args.model_connector)
+    if args.model is not None and model_name != models.DEFAULT:
+        parser.error(
+            "--model cannot be combined with --model-connector "
+            f"{model_name!r}: the connector chooses the executor model"
+        )
+    model_connector = _build_model_connector(parser, model_name, args.model_opts)
+
+    errors: list[str] = []
+    code = 1
+    try:
+        code = _run(
+            parser, args, repo, work_root, runs_root, modes, model_connector, model_name, errors
+        )
+    finally:
+        # The model connector is closed even when the task connector or the run raised; a
+        # failing close is reported after the run's own error, never instead of it.
+        close = getattr(model_connector, "close", None)
+        if callable(close):
+            try:
+                close()
+            except Exception as exc:
+                errors.append(f"error: model connector close: {exc}")
+        for line in errors:
+            print(line, file=sys.stderr)
+    return 1 if errors else code
+
+
+def _run(
+    parser: argparse.ArgumentParser,
+    args: argparse.Namespace,
+    repo: Path,
+    work_root: Path,
+    runs_root: Path,
+    modes: tuple[str, ...],
+    model_connector: models.ModelConnector,
+    model_name: str,
+    errors: list[str],
+) -> int:
     # The connector is built before the adapter whose names locate needs, so it forwards.
     target = None
 
@@ -260,27 +360,31 @@ def _main(parser: argparse.ArgumentParser, args: argparse.Namespace) -> int:
         caps = intake.capabilities(connector)
     except Exception as exc:
         # No caps yet, so close the connector directly; a failing close does not hide `exc`.
-        close = getattr(connector, "close", None)
-        if callable(close):
-            with contextlib.suppress(Exception):
-                close()
+        _close_quietly(connector)
         parser.error(str(exc))
     recorder = _Recorder(connector, modes[0])
 
     error: Exception | None = None
     launcher = None
     blocks: list[str] = []
-    errors: list[str] = []
     close_error: Exception | None = None
     try:
         try:
+            override = (
+                models.ModelChoice("opencode", args.model)
+                if model_name == models.DEFAULT and args.model
+                else None
+            )
+            executor = ExecutorModels(
+                model_connector, substrate="opencode", name=model_name, override=override
+            )
             launcher = WorktreeLauncher(
                 repo,
-                OpencodeAgent(model),
+                OpencodeAgent(executor),
                 exclude=caps.workspace_policy.exclude,
                 scrub_env=caps.scrub_env,
             )
-            channel = resolve_channel_model(None, None, effort="high", timeout=args.timeout)
+            channel, improver = _improver_channel(parser, args, model_connector, model_name)
             adapter = IntakeAdapter(
                 work_root,
                 recorder,
@@ -288,6 +392,9 @@ def _main(parser: argparse.ArgumentParser, args: argparse.Namespace) -> int:
                 launcher=launcher,
                 channel=channel,
                 judge=caps.judge,
+                executor=executor,
+                model_connector="" if model_name == models.DEFAULT else model_name,
+                improver=improver,
             )
             target = functools.partial(
                 intake_report.summary_locations,
@@ -298,8 +405,11 @@ def _main(parser: argparse.ArgumentParser, args: argparse.Namespace) -> int:
                 tag=args.tag,
             )
             summary_ns = C.summary_namespace(adapter, args.k, seed=args.seed, tag=args.tag)
+            extra = {} if improver is None else {"models": improver}
             prop = Proposer(
-                adapter.spec.channels["proposer"], audit_dir=runs_root / "_audit" / summary_ns
+                adapter.spec.channels["proposer"],
+                audit_dir=runs_root / "_audit" / summary_ns,
+                **extra,
             )
             run_intake(
                 adapter,
@@ -321,7 +431,8 @@ def _main(parser: argparse.ArgumentParser, args: argparse.Namespace) -> int:
                     if error is None:
                         error = exc
         # Before close: a connector may need what close lets go of to build its reports.
-        blocks, errors = _reports(caps, recorder.statuses)
+        blocks, report_errors = _reports(caps, recorder.statuses)
+        errors.extend(report_errors)
     finally:
         try:
             caps.close()
@@ -336,11 +447,72 @@ def _main(parser: argparse.ArgumentParser, args: argparse.Namespace) -> int:
         errors.append(f"error: {error}")
     if close_error is not None:
         errors.append(f"error: close: {close_error}")
-    for line in errors:
-        print(line, file=sys.stderr)
     if errors:
         return 1
     return 0 if all(s == intake_report.DONE for s in recorder.statuses.values()) else 1
+
+
+def _improver_channel(
+    parser: argparse.ArgumentParser,
+    args: argparse.Namespace,
+    model_connector: models.ModelConnector,
+    model_name: str,
+) -> tuple[ChannelSpec, ModelSession | None]:
+    """The improver's channel, and the ModelSession that runs it for a connector with sessions.
+
+    A model connector with `run_session` runs the improver sessions itself (the "connector"
+    channel); with no runner that satisfies the fence requirements that is an argument error.
+    One without it keeps a channel of ours: for the default connector the one the environment
+    selects, for another the runner and model of its first improver candidate (when it offers
+    none, the environment's). The improver of a connector without `run_session` is chosen
+    once, at start-up, not per task. Its runner is named as in `models.RUNNER_CHANNELS`.
+    """
+    try:
+        caps = models.capabilities(model_connector)
+    except TypeError as exc:
+        parser.error(f"model connector {model_name!r}: {exc}")
+    if caps.run_session is not None:
+        session_root = getattr(args, "session_root", None)
+        session = ModelSession(model_connector, model_name, session_root=session_root)
+        if not session.fenced:
+            report = models.fence_report(model_connector)
+            detail = "; ".join(
+                f"{runner}: {', '.join(problems) or 'accepted'}"
+                for runner, problems in report.items()
+            )
+            parser.error(
+                f"model connector {model_name!r} has run_session but declares no runner whose "
+                f"fence meets the requirements ({detail or 'no fences declared'})"
+            )
+        print(
+            f"harness2-intake: improver sessions run in directories under {session.session_root}"
+            " (allow this directory in the model connector)",
+            file=sys.stderr,
+        )
+        return (
+            ChannelSpec("connector", "", effort="high", timeout=args.timeout),
+            session,
+        )
+    if model_name != models.DEFAULT:
+        choices = model_connector.routes(models.Role.IMPROVER, task_id="", substrate="")
+        if choices:
+            first = choices[0]
+            channel_name = models.RUNNER_CHANNELS.get(first.runner)
+            if channel_name is None:
+                parser.error(
+                    f"model connector {model_name!r}: improver runner {first.runner!r} is "
+                    f"not one of {sorted(models.RUNNER_CHANNELS)}"
+                )
+            return (
+                resolve_channel_model(
+                    channel_name,
+                    first.model,
+                    effort=first.effort or "high",
+                    timeout=args.timeout,
+                ),
+                None,
+            )
+    return resolve_channel_model(None, None, effort="high", timeout=args.timeout), None
 
 
 def _reports(caps: intake.Capabilities, statuses: Mapping[str, str]) -> tuple[list[str], list[str]]:

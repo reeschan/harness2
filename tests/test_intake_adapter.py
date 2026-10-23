@@ -89,7 +89,7 @@ class FakeLauncher:
         self.calls: list[dict] = []
         self.error = error
 
-    def launch(self, *, workspace, prompt, install, run_dir, timeout):
+    def launch(self, *, workspace, prompt, install, run_dir, timeout, task_id=""):
         self.calls.append(
             {
                 "workspace": workspace,
@@ -97,6 +97,7 @@ class FakeLauncher:
                 "install": install,
                 "run_dir": run_dir,
                 "timeout": timeout,
+                "task_id": task_id,
                 "staging_exists": install is not None and install.staging_dir.is_dir(),
                 "workspace_files": sorted(
                     p.relative_to(workspace).as_posix() for p in workspace.rglob("*")
