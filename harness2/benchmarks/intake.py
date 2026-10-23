@@ -589,11 +589,14 @@ def run_intake(
         # process has run no rollout, so the adapter offers nothing to replace it with. The
         # getter is the same one `run_task` uses (`schedule._adapter_models`), including its
         # warning when `model_records` raises.
-        payload, name = schedule._adapter_models(adapter, task_id)
-        if payload:
-            res.models = payload
-        if name:
-            res.model_connector = name
+        # A skipped task keeps both `models` and `model_connector` as restored (they describe
+        # the earlier run's connector); otherwise the two are updated together, never one alone.
+        if res.status != "skipped":
+            payload, name = schedule._adapter_models(adapter, task_id)
+            if payload:
+                res.models = payload
+                if name:
+                    res.model_connector = name
         try:
             output = _deliverable_dir(adapter, res, modes[0])
         except ValueError as exc:

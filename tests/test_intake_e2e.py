@@ -578,6 +578,50 @@ class IntakeEndToEndTest(unittest.TestCase):
         )
         self.assertEqual(runs_summary["models"]["executor"], rows)
 
+    def _delivered_summary_with(self, status: str) -> dict:
+        """Deliver ledger-1 under connector B with run_task returning connector A's record."""
+        output = self.root / "executions" / f"resume-{status}" / "workspace" / "output"
+        output.mkdir(parents=True)
+        (output / "answer.txt").write_text("ok\n", encoding="utf-8")
+        run_dir = output.parent.parent
+        old = {"executor": [{"runner": "opencode", "model": "a/model", "n": 1}]}
+        new = {"executor": [{"runner": "opencode", "model": "b/model", "n": 1}]}
+
+        class FakeExecutor:
+            def records_for(self, task_id):
+                return [dict(row) for row in new["executor"]]
+
+        adapter = self._adapter(FakeLauncher(), executor=FakeExecutor(), model_connector="conn-b")
+
+        def fake_run_task(task_id, k, **kwargs):
+            return schedule.TaskResult(
+                task_id=task_id,
+                domain="accounting",
+                k=k,
+                status=status,
+                selections={"agg": {"chosen_run_dir": str(run_dir)}},
+                models=old,
+                model_connector="conn-a",
+            )
+
+        with patch.object(intake_mod.schedule, "run_task", side_effect=fake_run_task):
+            run_intake(
+                adapter, FakeImprover(CHANNEL), k=1, runs_root=self.runs_root, modes=("agg",)
+            )
+        return json.loads(
+            (self.inbox_root / "outbox" / "ledger-1" / "summary.json").read_text(encoding="utf-8")
+        )
+
+    def test_resumed_task_keeps_the_models_and_connector_of_the_earlier_run(self) -> None:
+        summary = self._delivered_summary_with("skipped")
+        self.assertEqual(summary["model_connector"], "conn-a")
+        self.assertEqual(summary["models"]["executor"][0]["model"], "a/model")
+
+    def test_fresh_run_updates_models_and_connector_together(self) -> None:
+        summary = self._delivered_summary_with("ok")
+        self.assertEqual(summary["model_connector"], "conn-b")
+        self.assertEqual(summary["models"]["executor"][0]["model"], "b/model")
+
 
 if __name__ == "__main__":
     unittest.main()
