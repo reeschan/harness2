@@ -275,13 +275,22 @@ class TaskResult:
 
 
 def _adapter_models(adapter: BenchmarkAdapter, task_id: str) -> tuple[dict, str]:
-    """The `models` payload and connector name an adapter offers, or empty when it has none."""
+    """The `models` payload and connector name an adapter offers, or empty when it has none.
+
+    A `model_records` that raises (or returns something unpackable) is reported on stderr
+    before the empty payload is returned, so a broken adapter does not silently drop
+    `models` and `model_connector` from the summary.
+    """
     getter = getattr(adapter, "model_records", None)
     if not callable(getter):
         return {}, ""
     try:
         payload, name = getter(task_id)
-    except Exception:
+    except Exception as exc:
+        print(
+            f"warning: model_records failed for task {task_id}: {type(exc).__name__}: {exc}",
+            file=sys.stderr,
+        )
         return {}, ""
     return dict(payload or {}), str(name or "")
 

@@ -18,10 +18,12 @@ A fake launcher and a fake improver stand in for the agent and the model, so the
 no network. The private criteria carry a password that must reach only the judge.
 """
 
+import io
 import json
 import os
 import tempfile
 import unittest
+from contextlib import redirect_stderr
 from pathlib import Path
 from unittest.mock import patch
 
@@ -494,6 +496,42 @@ class IntakeEndToEndTest(unittest.TestCase):
             (self.inbox_root / "failed" / "ledger-1.json").read_text(encoding="utf-8")
         )["reason"]
         self.assertIn("no executor model", reason)
+
+    def test_model_records_error_warns_and_keeps_the_summary_without_models(self) -> None:
+        output = self.root / "executions" / "records-error" / "workspace" / "output"
+        output.mkdir(parents=True)
+        (output / "answer.txt").write_text("ok\n", encoding="utf-8")
+        run_dir = output.parent.parent
+        adapter = self._adapter(FakeLauncher(), model_connector="fake-connector")
+
+        def fake_run_task(task_id, k, **kwargs):
+            return schedule.TaskResult(
+                task_id=task_id,
+                domain="accounting",
+                k=k,
+                status="ok",
+                selections={"agg": {"chosen_run_dir": str(run_dir)}},
+            )
+
+        stderr = io.StringIO()
+        with (
+            patch.object(intake_mod.schedule, "run_task", side_effect=fake_run_task),
+            patch.object(adapter, "model_records", side_effect=RuntimeError("records down")),
+            redirect_stderr(stderr),
+        ):
+            results = run_intake(
+                adapter, FakeImprover(CHANNEL), k=1, runs_root=self.runs_root, modes=("agg",)
+            )
+        self.assertEqual([r.task_id for r in results], ["ledger-1"])
+        self.assertIn(
+            "warning: model_records failed for task ledger-1: RuntimeError: records down",
+            stderr.getvalue(),
+        )
+        summary = json.loads(
+            (self.inbox_root / "outbox" / "ledger-1" / "summary.json").read_text(encoding="utf-8")
+        )
+        self.assertNotIn("models", summary)
+        self.assertNotIn("model_connector", summary)
 
     def test_summary_has_the_executor_records_of_the_model_connector(self) -> None:
         rows = [

@@ -481,18 +481,6 @@ def _deliverable_dir(adapter: IntakeAdapter, res: schedule.TaskResult, mode: str
     return output
 
 
-def _model_records(adapter: IntakeAdapter, task_id: str) -> tuple[dict, str]:
-    """The `models` payload and connector name for a delivered summary; empty when absent."""
-    getter = getattr(adapter, "model_records", None)
-    if not callable(getter):
-        return {}, ""
-    try:
-        payload, name = getter(task_id)
-    except Exception:
-        return {}, ""
-    return dict(payload or {}), str(name or "")
-
-
 def _check_run_args(
     k: int,
     modes: tuple[str, ...],
@@ -598,8 +586,10 @@ def run_intake(
             _write_handled_mark(adapter, task_id, "failed")
             continue
         # A skipped (resumed) task keeps the executor record stored on its old summary; this
-        # process has run no rollout, so the adapter offers nothing to replace it with.
-        payload, name = _model_records(adapter, task_id)
+        # process has run no rollout, so the adapter offers nothing to replace it with. The
+        # getter is the same one `run_task` uses (`schedule._adapter_models`), including its
+        # warning when `model_records` raises.
+        payload, name = schedule._adapter_models(adapter, task_id)
         if payload:
             res.models = payload
         if name:
