@@ -75,6 +75,21 @@ class SessionConnector:
         self.close_calls += 1
 
 
+class LooseFenceConnector:
+    """A connector with run_session but a fence harness2 does not accept."""
+
+    def routes(self, role: str, *, task_id: str, substrate: str) -> list[models.ModelChoice]:
+        if role == models.Role.EXECUTOR:
+            return []
+        return [models.ModelChoice(runner="claude", model="fake/improver")]
+
+    def run_session(self, role: str, request: models.SessionRequest) -> models.SessionResult:
+        return models.SessionResult(text="done", ok=True)
+
+    def fences(self) -> dict[str, models.FenceDeclaration]:
+        return {"claude": dataclasses.replace(FENCE, restricted=False)}
+
+
 class EnvConnectorContractTest(ModelConnectorContractTests, unittest.TestCase):
     """The default connector against the model connector contract."""
 
@@ -122,6 +137,61 @@ class SessionCheckTest(unittest.TestCase):
         self.assertEqual(request.choice, models.ModelChoice(runner="claude", model="fake/improver"))
         self.assertTrue(request.cwd.is_dir())
         case.doCleanups()
+
+
+class FenceCheckTest(unittest.TestCase):
+    """`test_model_contract_fences` rejects run_session without a fence harness2 accepts."""
+
+    def test_a_loose_fence_fails_with_the_fence_report(self) -> None:
+        class ContractTest(ModelConnectorContractTests, unittest.TestCase):
+            def make_connector(self) -> models.ModelConnector:
+                return LooseFenceConnector()
+
+        case = ContractTest("test_model_contract_fences")
+        with self.assertRaises(AssertionError) as caught:
+            case.test_model_contract_fences()
+        case.doCleanups()
+        self.assertIn("restricted", str(caught.exception))
+
+    def test_a_connector_without_run_session_does_not_check_fences(self) -> None:
+        class ContractTest(ModelConnectorContractTests, unittest.TestCase):
+            def make_connector(self) -> models.ModelConnector:
+                return CandidatesOnlyConnector()
+
+        case = ContractTest("test_model_contract_fences")
+        self.assertIsNone(case.test_model_contract_fences())
+        case.doCleanups()
+
+
+class SessionSkipTest(unittest.TestCase):
+    """`test_model_contract_run_session` skips when it cannot run a session."""
+
+    def test_no_accepted_runner_skips(self) -> None:
+        class ContractTest(ModelConnectorContractTests, unittest.TestCase):
+            def make_connector(self) -> models.ModelConnector:
+                return LooseFenceConnector()
+
+            def make_session_request(
+                self, tmp: Path, choice: models.ModelChoice
+            ) -> models.SessionRequest:
+                return make_request(tmp, choice)
+
+        case = ContractTest("test_model_contract_run_session")
+        with self.assertRaises(unittest.SkipTest) as caught:
+            case.test_model_contract_run_session()
+        case.doCleanups()
+        self.assertIn("fence", str(caught.exception))
+
+    def test_missing_make_session_request_skips(self) -> None:
+        class ContractTest(ModelConnectorContractTests, unittest.TestCase):
+            def make_connector(self) -> models.ModelConnector:
+                return SessionConnector()
+
+        case = ContractTest("test_model_contract_run_session")
+        with self.assertRaises(unittest.SkipTest) as caught:
+            case.test_model_contract_run_session()
+        case.doCleanups()
+        self.assertIn("make_session_request", str(caught.exception))
 
 
 class CloseCheckTest(unittest.TestCase):

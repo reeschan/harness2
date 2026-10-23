@@ -837,14 +837,17 @@ own tests. `check_model_connector(conn)`,
 AssertionError on a mismatch, and `ModelConnectorContractTests` is a unittest mixin
 that runs them, and a few more, against the connector your test builds: `routes`
 returns a list of `ModelChoice` for both roles (an empty list is fine) with the
-executor's runner equal to the substrate; `fences()` (if any) passes
-`models.fenced_runners`; `run_session` (if any) is called once, with a request from
-`make_session_request(tmp, choice)` for the first improver candidate on the first
-runner harness2 accepts, and passes `check_session_result` (skipped when there is no
-such candidate); `record` (if any) accepts an `Outcome`; and `close` (if any) can be
-called twice. `check_session_result` requires `text` and `runner` to be str, an `ok`
-result to carry a non-empty `text` and not be `unavailable`, and a non-negative cost
-and wall time.
+executor's runner equal to the substrate; `fences()` (if any) is read through
+`models.fenced_runners`, and a connector that has both `run_session` and `fences()`
+fails that check when no runner harness2 accepts, with `models.fence_report` in the
+message; `run_session`
+(if any) is called once, with a request from `make_session_request(tmp, choice)` for
+the first improver candidate on the first runner harness2 accepts, and passes
+`check_session_result` (skipped when there is no accepted runner, no such candidate,
+or `make_session_request` is not implemented); `record` (if any) accepts an
+`Outcome`; and `close` (if any) can be called twice. `check_session_result` requires
+`text` and `runner` to be str, an `ok` result to carry a non-empty `text` and not be
+`unavailable`, and a non-negative cost and wall time.
 
 ```python
 import unittest
@@ -873,4 +876,5 @@ class MyConnectorContractTest(ModelConnectorContractTests, unittest.TestCase):
 List `unittest.TestCase` after the mixin, so unittest collects the mixin's tests. Each
 test calls `make_connector()` with no arguments and closes the connector afterwards; a
 connector without `run_session`, or a test that does not implement
-`make_session_request`, skips the session check.
+`make_session_request`, skips the session check; a connector with `run_session` but no
+accepted runner fails the fence check, and skips the session check.
