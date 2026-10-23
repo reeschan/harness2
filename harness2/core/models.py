@@ -20,7 +20,7 @@ A connector is anything with `routes(role, *, task_id, substrate)`, which return
 fence it applies to each runner it can execute), `record(role, task_id, choice, outcome)` and
 `close()`. A connector that defines `run_session` must also define `fences`, so harness2 can
 check the fence before it hands the session over: `fenced_runners` keeps only the runners
-whose declared fence satisfies `FENCE_REQUIREMENTS`.
+whose declared fence meets `IMPROVER_FENCE`.
 
 `run_session` runs only on the runner and model of `request.choice`, the candidate harness2
 picked. If `SessionResult.runner` is not empty and differs from `choice.runner`, harness2 treats
@@ -46,7 +46,6 @@ from pathlib import Path
 from typing import Any, Callable, Mapping, Protocol, runtime_checkable
 
 from .. import config
-from .proposer import _DROP_ENV, CLAUDE_CLI_PERMISSION_MODE, CLAUDE_CLI_TOOLS
 
 
 class Role:
@@ -122,145 +121,119 @@ class Outcome:
     label: str = ""
 
 
+# The kinds of tool a session can have, as a fence declaration names them (runner-neutral).
+CAPABILITIES = ("read", "write", "search", "commands", "network", "mcp")
+
+
 @dataclass(frozen=True)
 class FenceDeclaration:
-    """The fence a connector says it applies to a runner it executes.
+    """The fence a connector says it applies to the sessions it executes, in runner-neutral terms.
 
-    `cwd_only` means the session sees only its working directory: no directory outside it is
-    added (no `--add-dir`). `restricted` is the runner's restricted mode, and `permission_mode`
-    is the permission mode the session runs in.
+    - `capabilities`: the kinds of tool the session has, each one of `CAPABILITIES`: "read"
+      (read files), "write" (write or edit files), "search" (find files or text), "commands"
+      (run commands), "network" (reach outside, e.g. fetch from the Web) and "mcp" (tools from
+      MCP servers).
+    - `workdir_only`: the session cannot reach files outside the working directory it is given
+      (no other directory is added).
+    - `asks_human`: the session may stop to ask a person for confirmation.
+    - `harness_credentials`: harness2's own API credentials (environment variables) reach the
+      child process.
+    - `runner`: the name of the runner the connector uses for this fence. It is for the record
+      and for tying a candidate (`ModelChoice.runner`) to the declaration; it is never checked.
     """
 
-    tools: tuple[str, ...]
-    cwd_only: bool
-    strict_mcp: bool
-    no_prompts: bool
-    restricted: bool
-    permission_mode: str
-    dropped_env: tuple[str, ...]
+    capabilities: frozenset[str]
+    workdir_only: bool
+    asks_human: bool
+    harness_credentials: bool
+    runner: str = ""
 
 
 @dataclass(frozen=True)
-class FenceRequirement:
-    """The fence harness2 requires for a runner: the tools allowed (a ceiling), and the
-    switches, the permission mode and dropped environment variables that must all be present."""
+class FenceLimit:
+    """The most a declared fence may allow: the ceiling of `capabilities`, and the values the
+    other three fields must have."""
 
-    tools: tuple[str, ...]
-    cwd_only: bool
-    strict_mcp: bool
-    no_prompts: bool
-    restricted: bool
-    permission_mode: str
-    dropped_env: tuple[str, ...]
+    capabilities: frozenset[str]
+    workdir_only: bool
+    asks_human: bool
+    harness_credentials: bool
 
 
-_SWITCHES = ("cwd_only", "strict_mcp", "no_prompts", "restricted")
+# The one condition harness2 puts on an improver session run by a connector: file tools only,
+# nothing outside the working directory, no MCP, no prompts, no harness credentials.
+IMPROVER_FENCE = FenceLimit(
+    capabilities=frozenset({"read", "write", "search"}),
+    workdir_only=True,
+    asks_human=False,
+    harness_credentials=False,
+)
 
 
-def _str_collection_problem(name: str, value: Any) -> str:
-    """Why `value` is not a tuple, list or frozenset of str; empty when it is."""
-    if not isinstance(value, (tuple, list, frozenset)):
-        return f"{name} must be a tuple, list or frozenset of str, got {type(value).__name__}"
-    if not all(isinstance(item, str) for item in value):
-        return f"{name} must contain only str"
-    return ""
+def fence_problems(declaration: Any) -> list[str]:
+    """Why `declaration` does not meet `IMPROVER_FENCE`; an empty list means it does.
 
-
-def fence_problems(declaration: Any, requirement: FenceRequirement) -> list[str]:
-    """Why `declaration` does not satisfy `requirement`; an empty list means it does.
-
-    The declaration must be a `FenceDeclaration` with well-typed fields. The declared tools must
-    be a subset of the required set, each switch (`cwd_only`, `strict_mcp`, `no_prompts`,
-    `restricted`) must be a bool equal to the required value, `permission_mode` must be the
-    required str, and the declared dropped environment variables must include every required one.
+    The declaration must be a `FenceDeclaration` with well-typed fields. Its `capabilities` must
+    be values of `CAPABILITIES` and a subset of the allowed ones, `workdir_only` must be true,
+    `asks_human` and `harness_credentials` must be false. Its `runner` is not checked, beyond
+    being a str.
     """
     if not isinstance(declaration, FenceDeclaration):
         return [f"declaration must be a FenceDeclaration, got {type(declaration).__name__}"]
     problems: list[str] = []
-    tools_problem = _str_collection_problem("tools", declaration.tools)
-    if tools_problem:
-        problems.append(tools_problem)
-    elif not set(declaration.tools) <= set(requirement.tools):
-        extra = sorted(set(declaration.tools) - set(requirement.tools))
-        problems.append(f"tools beyond the allowed set: {extra}")
-    for name in _SWITCHES:
+    caps = declaration.capabilities
+    if not isinstance(caps, (tuple, list, set, frozenset)):
+        problems.append(
+            f"capabilities must be a tuple, list, set or frozenset of str, got {type(caps).__name__}"
+        )
+    elif not all(isinstance(item, str) for item in caps):
+        problems.append("capabilities must contain only str")
+    else:
+        unknown = sorted(set(caps) - set(CAPABILITIES))
+        if unknown:
+            problems.append(f"capabilities outside {list(CAPABILITIES)}: {unknown}")
+        extra = sorted((set(caps) & set(CAPABILITIES)) - IMPROVER_FENCE.capabilities)
+        if extra:
+            problems.append(f"capabilities beyond the allowed set: {extra}")
+    for name in ("workdir_only", "asks_human", "harness_credentials"):
         value = getattr(declaration, name)
-        wanted = getattr(requirement, name)
+        wanted = getattr(IMPROVER_FENCE, name)
         if not isinstance(value, bool):
             problems.append(f"{name} must be a bool, got {type(value).__name__}")
         elif value is not wanted:
             problems.append(f"{name} must be {wanted}")
-    if not isinstance(declaration.permission_mode, str):
-        problems.append(
-            f"permission_mode must be a str, got {type(declaration.permission_mode).__name__}"
-        )
-    elif declaration.permission_mode != requirement.permission_mode:
-        problems.append(f"permission_mode must be {requirement.permission_mode!r}")
-    env_problem = _str_collection_problem("dropped_env", declaration.dropped_env)
-    if env_problem:
-        problems.append(env_problem)
-    elif not set(requirement.dropped_env) <= set(declaration.dropped_env):
-        missing = sorted(set(requirement.dropped_env) - set(declaration.dropped_env))
-        problems.append(f"dropped_env is missing: {missing}")
+    if not isinstance(declaration.runner, str):
+        problems.append(f"runner must be a str, got {type(declaration.runner).__name__}")
     return problems
 
 
-def satisfies(declaration: Any, requirement: FenceRequirement) -> bool:
-    """True when `declaration` is at least as strict as `requirement` (see `fence_problems`)."""
-    return not fence_problems(declaration, requirement)
-
-
-# Runner -> the fence harness2 requires of any connector that executes it. A runner that is not
-# listed cannot be executed by a connector.
-FENCE_REQUIREMENTS: Mapping[str, FenceRequirement] = {
-    "claude": FenceRequirement(
-        tools=tuple(CLAUDE_CLI_TOOLS.split(",")),
-        cwd_only=True,
-        strict_mcp=True,
-        no_prompts=True,
-        restricted=True,
-        permission_mode=CLAUDE_CLI_PERMISSION_MODE,
-        dropped_env=tuple(_DROP_ENV),
-    ),
-}
-
-# Runner name -> the improver channel (`config.IMPROVER_CHANNELS`) that runs it.
-RUNNER_CHANNELS: Mapping[str, str] = {"claude": "claude_cli", "opencode": "opencode"}
-
-
-def _runner_problems(runner: str, declaration: Any) -> list[str]:
-    """The problems of one declared runner: no requirement for it, or `fence_problems`."""
-    requirement = FENCE_REQUIREMENTS.get(runner)
-    if requirement is None:
-        return [f"no fence requirement for {runner}"]
-    return fence_problems(declaration, requirement)
+def satisfies(declaration: Any) -> bool:
+    """True when `declaration` meets `IMPROVER_FENCE` (see `fence_problems`)."""
+    return not fence_problems(declaration)
 
 
 def fence_report(connector: Any) -> dict[str, list[str]]:
     """Why each declared runner is or is not accepted: runner -> problems (empty when accepted).
 
-    A runner without a requirement reports `["no fence requirement for <runner>"]`. A `fences()`
+    The runner name is only the key of `fences()`; no runner is treated differently. A `fences()`
     that is not a Mapping reports nothing.
     """
     declared = capabilities(connector).fences()
     if not isinstance(declared, Mapping):
         return {}
-    return {runner: _runner_problems(runner, d) for runner, d in declared.items()}
+    return {runner: fence_problems(d) for runner, d in declared.items()}
 
 
 def fenced_runners(connector: Any) -> dict[str, FenceDeclaration]:
-    """The connector's declared fences for the runners that have a requirement and satisfy it.
+    """The connector's declarations that meet `IMPROVER_FENCE`, keyed by runner name.
 
-    A `fences()` that is not a Mapping gives `{}`; a declaration of the wrong type is dropped.
+    The runner name only ties a candidate (`ModelChoice.runner`) to its declaration. A
+    `fences()` that is not a Mapping gives `{}`; a declaration of the wrong type is dropped.
     """
     declared = capabilities(connector).fences()
     if not isinstance(declared, Mapping):
         return {}
-    return {
-        runner: declaration
-        for runner, declaration in declared.items()
-        if not _runner_problems(runner, declaration)
-    }
+    return {runner: d for runner, d in declared.items() if satisfies(d)}
 
 
 @runtime_checkable
@@ -310,7 +283,7 @@ def capabilities(connector: Any) -> ModelCapabilities:
     """Read the optional capabilities of `connector` with getattr, filling in the defaults.
 
     - `run_session(role, request)` (method): default None (harness2 runs the session itself).
-    - `fences()` (method): returns a mapping of runner -> FenceDeclaration; default `{}`.
+    - `fences()` (method): returns a mapping of runner name -> FenceDeclaration; default `{}`.
     - `record(role, task_id, choice, outcome)` (method): default None.
     - `close()` (method): default a function that does nothing.
 
@@ -500,8 +473,7 @@ class EnvModelConnector:
         if role == Role.IMPROVER:
             channel = config.DEFAULT_PROPOSER_CHANNEL
             model = config.route(f"improver.{channel}").model
-            runner = next((r for r, c in RUNNER_CHANNELS.items() if c == channel), channel)
-            return [ModelChoice(runner=runner, model=model)] if model else []
+            return [ModelChoice(runner=channel, model=model)] if model else []
         return []
 
 

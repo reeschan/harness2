@@ -28,7 +28,13 @@ from harness2.testing.model_contract import (
     check_session_result,
 )
 
-FENCE = models.FenceDeclaration(**dataclasses.asdict(models.FENCE_REQUIREMENTS["claude"]))
+FENCE = models.FenceDeclaration(
+    capabilities=frozenset({"read", "write", "search"}),
+    workdir_only=True,
+    asks_human=False,
+    harness_credentials=False,
+    runner="claude",
+)
 
 
 def make_request(tmp: Path, choice: models.ModelChoice) -> models.SessionRequest:
@@ -87,7 +93,7 @@ class LooseFenceConnector:
         return models.SessionResult(text="done", ok=True)
 
     def fences(self) -> dict[str, models.FenceDeclaration]:
-        return {"claude": dataclasses.replace(FENCE, restricted=False)}
+        return {"claude": dataclasses.replace(FENCE, asks_human=True)}
 
 
 class EnvConnectorContractTest(ModelConnectorContractTests, unittest.TestCase):
@@ -151,7 +157,7 @@ class FenceCheckTest(unittest.TestCase):
         with self.assertRaises(AssertionError) as caught:
             case.test_model_contract_fences()
         case.doCleanups()
-        self.assertIn("restricted", str(caught.exception))
+        self.assertIn("asks_human", str(caught.exception))
 
     def test_a_connector_without_run_session_does_not_check_fences(self) -> None:
         class ContractTest(ModelConnectorContractTests, unittest.TestCase):

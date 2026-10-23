@@ -465,7 +465,8 @@ def _improver_channel(
     One without it keeps a channel of ours: for the default connector the one the environment
     selects, for another the runner and model of its first improver candidate (when it offers
     none, the environment's). The improver of a connector without `run_session` is chosen
-    once, at start-up, not per task. Its runner is named as in `models.RUNNER_CHANNELS`.
+    once, at start-up, not per task. Its runner is the name of one of our channels
+    (`config.IMPROVER_CHANNELS`), used as it is.
     """
     try:
         caps = models.capabilities(model_connector)
@@ -497,15 +498,14 @@ def _improver_channel(
         choices = model_connector.routes(models.Role.IMPROVER, task_id="", substrate="")
         if choices:
             first = choices[0]
-            channel_name = models.RUNNER_CHANNELS.get(first.runner)
-            if channel_name is None:
+            if first.runner not in config.IMPROVER_CHANNELS:
                 parser.error(
                     f"model connector {model_name!r}: improver runner {first.runner!r} is "
-                    f"not one of {sorted(models.RUNNER_CHANNELS)}"
+                    f"not one of {sorted(config.IMPROVER_CHANNELS)}"
                 )
             return (
                 resolve_channel_model(
-                    channel_name,
+                    first.runner,
                     first.model,
                     effort=first.effort or "high",
                     timeout=args.timeout,

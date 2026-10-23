@@ -127,6 +127,42 @@ class FakeModelConnector:
         self.closed = True
 
 
+class ClaudeCliImproverConnector(FakeModelConnector):
+    """No run_session: its improver candidate names one of our channels, claude_cli."""
+
+    def routes(self, role, *, task_id, substrate):
+        if role == models.Role.IMPROVER:
+            return [models.ModelChoice("claude_cli", "opus", "low")]
+        return super().routes(role, task_id=task_id, substrate=substrate)
+
+
+class LooseSessionConnector(FakeModelConnector):
+    """run_session with a fence no runner of which meets the condition (it may run commands)."""
+
+    def run_session(self, role, request):
+        return models.SessionResult(text="x", ok=True)
+
+    def fences(self):
+        return {
+            name: models.FenceDeclaration(
+                capabilities=frozenset({"read", "write", "commands"}),
+                workdir_only=True,
+                asks_human=False,
+                harness_credentials=False,
+                runner=name,
+            )
+            for name in ("claude", "opencode", "anything")
+        }
+
+
+def claude_cli_improver_factory(**kwargs):
+    return ClaudeCliImproverConnector()
+
+
+def loose_session_factory(**kwargs):
+    return LooseSessionConnector()
+
+
 def model_factory(**kwargs):
     _STATE["model_kwargs"] = kwargs
     return _STATE["model_connector"]
@@ -654,6 +690,23 @@ class IntakeCliTest(unittest.TestCase):
             cli.OpencodeAgent.call_args.args[0].current("t1"),
             models.ModelChoice("opencode", "fake/model"),
         )
+
+    def test_improver_candidate_claude_cli_is_the_claude_cli_channel(self) -> None:
+        code, _out, _err = self._run(
+            self._args("--model-connector", _ref("claude_cli_improver_factory"))
+        )
+        self.assertEqual(code, 0)
+        args = cli.resolve_channel_model.call_args
+        self.assertEqual(args.args, ("claude_cli", "opus"))
+        self.assertEqual(args.kwargs["effort"], "low")
+
+    def test_connector_with_no_runner_meeting_the_fence_is_exit_2(self) -> None:
+        code, err = self._exit_code_and_err(
+            self._args("--model-connector", _ref("loose_session_factory"))
+        )
+        self.assertEqual(code, 2)
+        self.assertIn("commands", err)
+        self.run_intake.assert_not_called()
 
     def test_model_connector_close_error_keeps_the_run_error(self) -> None:
         self.connector.close = mock.MagicMock()

@@ -685,7 +685,7 @@ defines `run_session` must also define `fences`, or `capabilities` raises TypeEr
 | Capability | Does |
 |---|---|
 | `run_session(role, request) -> SessionResult` | Runs one session itself, on the runner and model of `request.choice` only; default None, so harness2 runs every session |
-| `fences() -> Mapping[str, FenceDeclaration]` | The fence it applies to each runner it executes, by runner name; default `{}` |
+| `fences() -> Mapping[str, FenceDeclaration]` | The fence it applies to each runner it executes, by the runner's name; default `{}` |
 | `record(role, task_id, choice, outcome) -> None` | Called once for each use of a candidate, with an `Outcome`. A skipped candidate is not a use, so `record` is not called for it. A `record` that raises is a warning on standard error, never a failed run; default None |
 | `close() -> None` | Releases connections and processes; `harness2-intake` calls it once at the end, also when the run fails; the default does nothing |
 
@@ -697,7 +697,7 @@ These dataclasses carry the values:
 | `SessionRequest` | `cwd`, `mission`, `system`, `wall` (seconds), `label` and `choice` (the `ModelChoice` harness2 picked: a session runs on `choice.runner` and `choice.model` only) |
 | `SessionResult` | `text`, `ok`, `cost_usd` (default `0.0`), `tokens` (a `Tokens` with `input` and `output`, each None when the backend does not report it), `wall_s` (default `0.0`), `error` (default `""`), `unavailable` (default False; true for a failure that should move on to the next candidate, such as a usage limit, an authentication failure, or a model or variant that does not exist) and `runner` (the runner that actually ran the session; empty means `choice.runner`, and a non-empty value that differs from it makes harness2 treat the result as a failure) |
 | `Outcome` | What `record` receives for one use: `ok`, `unavailable`, `cost_usd`, `tokens`, `wall_s`, `error`, and `run_id` (executor) or `label` (improver) |
-| `FenceDeclaration` | `tools` (the runner's tool names), `cwd_only` (no directory outside the session's working directory is added, so no `--add-dir`), `strict_mcp`, `no_prompts`, `restricted`, `permission_mode` and `dropped_env` |
+| `FenceDeclaration` | `capabilities` (the kinds of tool the session has: `read`, `write`, `search`, `commands`, `network`, `mcp`), `workdir_only`, `asks_human`, `harness_credentials`, and `runner` (optional, for the record) |
 
 A `SessionResult` that is `ok` with an empty `text` counts as a failure (`empty reply`).
 
@@ -741,7 +741,7 @@ label and the `choice`. The working directory is a fresh directory under
 root at start-up, and a connector that accepts only its own directories must allow
 it. harness2 still prepares and caches the working directory, retries, copies the
 context in and harvests the rewritten tree. It tries the candidates in order: a
-candidate whose runner has no satisfied fence is skipped and noted (`skipped_reason`
+candidate whose runner has no declaration that meets the condition is skipped and noted (`skipped_reason`
 `no fence`); an `unavailable` session moves on to the next candidate; any other
 failure counts as the attempt's failure. When `SessionResult.runner` is not empty and
 differs from `choice.runner`, the result is a failure (`connector ran <runner> instead
@@ -749,37 +749,43 @@ of <choice.runner>`), not an unavailable one.
 
 A connector without `run_session` keeps a channel of ours: harness2 runs the improver
 on the first improver candidate's runner and model through the existing `opencode` or
-`claude_cli` channel, chosen once at start-up, not per task. Runner names map to
-channel names through `models.RUNNER_CHANNELS` (`claude` to `claude_cli`, `opencode`
-to `opencode`); a runner outside that table is an argument error. When the connector
-offers no improver candidate, the environment's channel is used.
+`claude_cli` channel, chosen once at start-up, not per task. For this the candidate's
+`runner` is the channel's name, written as it is (`claude_cli` or `opencode`); any
+other name is an argument error. When the connector offers no improver candidate, the
+environment's channel is used.
 
 ### Fences
 
-A connector that runs sessions declares, for each runner it can execute, the fence it
-applies, with `fences()`. harness2 holds a requirement for each runner it is willing
-to hand a session to. Today only Claude Code has one:
+harness2 puts one condition on the improver sessions a connector runs. It names no
+runner and no provider: the connector sets up its side, and harness2 only checks what
+the connector declares. A connector that runs sessions declares the fence it applies
+with `fences()`, a mapping from the name of the runner it uses to a `FenceDeclaration`.
+The name only ties a candidate (`ModelChoice.runner`) to its declaration; it plays no
+part in the check.
 
-| Runner | Requirement |
+A `FenceDeclaration` says, in terms that do not depend on the runner:
+
+| Field | Meaning |
 |---|---|
-| `claude` | `tools` at most `Read`, `Edit`, `Write`, `Glob` and `Grep`; `cwd_only` (no directory outside the working directory is added, so no `--add-dir`); `strict_mcp`; `no_prompts`; `restricted`; `permission_mode` `acceptEdits`; and `dropped_env` including `ANTHROPIC_API_KEY`, `ANTHROPIC_AUTH_TOKEN`, `ANTHROPIC_BASE_URL`, `ANTHROPIC_BEDROCK_BASE_URL` and `CLAUDE_CODE_USE_BEDROCK` |
+| `capabilities` | The kinds of tool the session has, each one of `read` (read files), `write` (write or edit files), `search` (find files or text), `commands` (run commands), `network` (reach outside, such as fetching from the Web) and `mcp` (tools from MCP servers) |
+| `workdir_only` | The session cannot reach files outside the working directory it is given; no other directory is added |
+| `asks_human` | The session may stop to ask a person for confirmation |
+| `harness_credentials` | harness2's own API credentials (environment variables) reach the child process |
+| `runner` | Optional. The name of the runner the connector uses, for the record; it is not checked |
 
-A declaration satisfies a requirement when it is a `FenceDeclaration` with
-well-typed fields, its `tools` are a subset of the required tools, its `cwd_only`,
-`strict_mcp`, `no_prompts` and `restricted` equal the required values, its
-`permission_mode` equals the required one, and its `dropped_env` includes every
-required name (`models.satisfies`; `models.fence_problems` lists what is missing). A
-declaration of the wrong type is treated as not satisfying. A candidate for a runner
-with no requirement, or with a fence that does not satisfy the requirement, is never
-used for the improver; it is noted with `skipped_reason` `no fence` in the summary.
+The condition is `models.IMPROVER_FENCE`: `capabilities` is a subset of `read`,
+`write` and `search`, `workdir_only` is true, `asks_human` is false and
+`harness_credentials` is false. A declaration meets it when it is a `FenceDeclaration`
+with well-typed fields and every value is within the condition; a `capabilities` value
+outside the six names is a problem too (`models.satisfies`; `models.fence_problems`
+lists what is wrong). A declaration of the wrong type does not meet it. A candidate
+whose runner has no declaration that meets the condition is never used for the
+improver; it is noted with `skipped_reason` `no fence` in the summary.
 
-When a connector defines `run_session` but no declared runner satisfies the
-requirement, `harness2-intake` stops at start-up with exit code 2 and the reasons
-(`models.fence_report` names each runner and the item it misses). Adding a requirement
-for another runner is a change in `FENCE_REQUIREMENTS`, not in the contract, so a
-runner such as OpenCode or Codex can be accepted later without changing the
-connectors. The declaration is trusted: harness2 does not inspect the connector's
-processes.
+When a connector defines `run_session` but no declared runner meets the condition,
+`harness2-intake` stops at start-up with exit code 2 and the reasons
+(`models.fence_report` names each runner and what it misses). The declaration is
+trusted: harness2 does not inspect the connector's processes.
 
 ### Choosing and registering the connector
 
@@ -839,7 +845,7 @@ that runs them, and a few more, against the connector your test builds: `routes`
 returns a list of `ModelChoice` for both roles (an empty list is fine) with the
 executor's runner equal to the substrate; `fences()` (if any) is read through
 `models.fenced_runners`, and a connector that has both `run_session` and `fences()`
-fails that check when no runner harness2 accepts, with `models.fence_report` in the
+fails that check when no runner meets the condition, with `models.fence_report` in the
 message; `run_session`
 (if any) is called once, with a request from `make_session_request(tmp, choice)` for
 the first improver candidate on the first runner harness2 accepts, and passes

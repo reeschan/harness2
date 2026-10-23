@@ -25,7 +25,6 @@ from pathlib import Path
 from unittest import mock
 
 from harness2.core import models
-from harness2.core.proposer import _DROP_ENV, CLAUDE_CLI_PERMISSION_MODE, CLAUDE_CLI_TOOLS
 
 REPO = Path(__file__).resolve().parents[1]
 
@@ -42,7 +41,7 @@ class WithSession(Minimal):
 
 class WithFences(WithSession):
     def fences(self):
-        return {"claude": CLAUDE_FENCE}
+        return {"claude": GOOD_FENCE}
 
 
 class Full(WithFences):
@@ -63,13 +62,18 @@ class FakeEntryPoint:
 
 
 def declaration(**changes):
-    req = models.FENCE_REQUIREMENTS["claude"]
-    base = dataclasses.asdict(req)
+    base = {
+        "capabilities": frozenset({"read", "write", "search"}),
+        "workdir_only": True,
+        "asks_human": False,
+        "harness_credentials": False,
+        "runner": "claude",
+    }
     base.update(changes)
     return models.FenceDeclaration(**base)
 
 
-CLAUDE_FENCE = declaration()
+GOOD_FENCE = declaration()
 
 
 class ResolutionTests(unittest.TestCase):
@@ -159,7 +163,7 @@ class CapabilitiesTests(unittest.TestCase):
         caps = models.capabilities(conn)
         self.assertEqual(caps.run_session, conn.run_session)
         self.assertEqual(caps.record, conn.record)
-        self.assertEqual(caps.fences(), {"claude": CLAUDE_FENCE})
+        self.assertEqual(caps.fences(), {"claude": GOOD_FENCE})
 
     def test_run_session_without_fences_is_type_error(self):
         with self.assertRaises(TypeError):
@@ -167,7 +171,7 @@ class CapabilitiesTests(unittest.TestCase):
 
     def test_fences_not_callable_is_type_error(self):
         conn = WithSession()
-        conn.fences = {"claude": CLAUDE_FENCE}
+        conn.fences = {"claude": GOOD_FENCE}
         with self.assertRaises(TypeError):
             models.capabilities(conn)
 
@@ -182,113 +186,107 @@ class CapabilitiesTests(unittest.TestCase):
 
 
 class FenceTests(unittest.TestCase):
-    def test_claude_requirement_comes_from_proposer(self):
-        req = models.FENCE_REQUIREMENTS["claude"]
-        self.assertEqual(",".join(req.tools), CLAUDE_CLI_TOOLS)
-        self.assertEqual(req.dropped_env, tuple(_DROP_ENV))
-        self.assertTrue(req.cwd_only and req.strict_mcp and req.no_prompts and req.restricted)
-        self.assertEqual(req.permission_mode, CLAUDE_CLI_PERMISSION_MODE)
+    def test_improver_fence_is_the_one_condition(self):
+        limit = models.IMPROVER_FENCE
+        self.assertEqual(limit.capabilities, frozenset({"read", "write", "search"}))
+        self.assertTrue(limit.workdir_only)
+        self.assertFalse(limit.asks_human)
+        self.assertFalse(limit.harness_credentials)
+        self.assertEqual(
+            models.CAPABILITIES, ("read", "write", "search", "commands", "network", "mcp")
+        )
 
     def test_satisfies_exact_and_stricter(self):
-        req = models.FENCE_REQUIREMENTS["claude"]
-        self.assertTrue(models.satisfies(CLAUDE_FENCE, req))
-        self.assertTrue(models.satisfies(declaration(tools=("Read",)), req))
-        extra = declaration(dropped_env=req.dropped_env + ("MORE",))
-        self.assertTrue(models.satisfies(extra, req))
+        self.assertTrue(models.satisfies(GOOD_FENCE))
+        self.assertTrue(models.satisfies(declaration(capabilities=frozenset({"read"}))))
+        self.assertTrue(models.satisfies(declaration(capabilities=frozenset())))
+        self.assertTrue(models.satisfies(declaration(capabilities=("read", "write"))))
 
     def test_satisfies_false_cases(self):
-        req = models.FENCE_REQUIREMENTS["claude"]
         cases = {
-            "more tools": declaration(tools=req.tools + ("Bash",)),
-            "cwd_only false": declaration(cwd_only=False),
-            "strict_mcp false": declaration(strict_mcp=False),
-            "prompts allowed": declaration(no_prompts=False),
-            "not restricted": declaration(restricted=False),
-            "other permission mode": declaration(permission_mode="default"),
-            "env short": declaration(dropped_env=req.dropped_env[:-1]),
+            "commands": declaration(capabilities=frozenset({"read", "commands"})),
+            "network": declaration(capabilities=frozenset({"read", "network"})),
+            "mcp": declaration(capabilities=frozenset({"search", "mcp"})),
+            "workdir_only false": declaration(workdir_only=False),
+            "asks_human true": declaration(asks_human=True),
+            "harness_credentials true": declaration(harness_credentials=True),
         }
         for label, decl in cases.items():
             with self.subTest(label):
-                self.assertFalse(models.satisfies(decl, req))
+                self.assertFalse(models.satisfies(decl))
 
-    def test_fenced_runners_drops_unknown_and_unsatisfying(self):
-        class Fences(WithSession):
+    def test_runner_name_does_not_matter(self):
+        for runner in ("claude", "opencode", "anything", ""):
+            with self.subTest(runner):
+                self.assertTrue(models.satisfies(declaration(runner=runner)))
+                self.assertFalse(models.satisfies(declaration(runner=runner, asks_human=True)))
+
+        class Names(WithSession):
             def fences(self):
                 return {
-                    "claude": CLAUDE_FENCE,
-                    "other": CLAUDE_FENCE,
-                    "weak": declaration(cwd_only=False),
+                    "claude": GOOD_FENCE,
+                    "opencode": GOOD_FENCE,
+                    "anything": GOOD_FENCE,
+                    "weak": declaration(workdir_only=False),
                 }
 
-        self.assertEqual(models.fenced_runners(Fences()), {"claude": CLAUDE_FENCE})
-
-        class WeakClaude(WithSession):
-            def fences(self):
-                return {"claude": declaration(cwd_only=False)}
-
-        self.assertEqual(models.fenced_runners(WeakClaude()), {})
+        self.assertEqual(sorted(models.fenced_runners(Names())), ["anything", "claude", "opencode"])
 
     def test_fenced_runners_without_fences(self):
         self.assertEqual(models.fenced_runners(Minimal()), {})
 
     def test_fence_problems_each_item(self):
-        req = models.FENCE_REQUIREMENTS["claude"]
         cases = {
-            "tools": declaration(tools=req.tools + ("Bash",)),
-            "restricted": declaration(restricted=False),
-            "permission_mode": declaration(permission_mode="default"),
-            "permission_mode type": declaration(permission_mode=None),
-            "bool as 1": declaration(cwd_only=1),
-            "tools str": declaration(tools=""),
-            "tools content": declaration(tools=("Read", 3)),
-            "dropped_env None": declaration(dropped_env=None),
-            "dropped_env short": declaration(dropped_env=()),
-            "dict": dict(dataclasses.asdict(req)),
+            "commands": declaration(capabilities=frozenset({"commands"})),
+            "unknown capability": declaration(capabilities=frozenset({"read", "teleport"})),
+            "workdir_only": declaration(workdir_only=False),
+            "asks_human": declaration(asks_human=True),
+            "harness_credentials": declaration(harness_credentials=True),
+            "bool as 1": declaration(workdir_only=1),
+            "capabilities str": declaration(capabilities=3),
+            "capabilities content": declaration(capabilities=("read", 3)),
+            "capabilities None": declaration(capabilities=None),
+            "runner type": declaration(runner=None),
+            "dict": dataclasses.asdict(GOOD_FENCE),
             "None": None,
         }
-        self.assertEqual(models.fence_problems(CLAUDE_FENCE, req), [])
+        self.assertEqual(models.fence_problems(GOOD_FENCE), [])
         for label, decl in cases.items():
             with self.subTest(label):
-                self.assertTrue(models.fence_problems(decl, req))
-                self.assertFalse(models.satisfies(decl, req))
-        self.assertIn("restricted", models.fence_problems(cases["restricted"], req)[0])
-        self.assertIn("cwd_only", models.fence_problems(cases["bool as 1"], req)[0])
-        self.assertIn("tools", models.fence_problems(cases["tools str"], req)[0])
+                self.assertTrue(models.fence_problems(decl))
+                self.assertFalse(models.satisfies(decl))
+        self.assertIn("commands", models.fence_problems(cases["commands"])[0])
+        self.assertIn("teleport", models.fence_problems(cases["unknown capability"])[0])
+        self.assertIn("workdir_only", models.fence_problems(cases["bool as 1"])[0])
 
     def test_fenced_runners_tolerates_bad_fences(self):
         class NotMapping(WithSession):
             def fences(self):
-                return [("claude", CLAUDE_FENCE)]
+                return [("claude", GOOD_FENCE)]
 
         self.assertEqual(models.fenced_runners(NotMapping()), {})
         self.assertEqual(models.fence_report(NotMapping()), {})
 
         class BadValues(WithSession):
             def fences(self):
-                return {"claude": dataclasses.asdict(CLAUDE_FENCE), "other": None}
+                return {"claude": dataclasses.asdict(GOOD_FENCE), "other": None}
 
         self.assertEqual(models.fenced_runners(BadValues()), {})
 
     def test_fence_report(self):
         class Mixed(WithSession):
             def fences(self):
-                return {
-                    "claude": CLAUDE_FENCE,
-                    "other": CLAUDE_FENCE,
-                    "opencode": CLAUDE_FENCE,
-                }
+                return {"claude": GOOD_FENCE, "other": GOOD_FENCE}
 
-        report = models.fence_report(Mixed())
-        self.assertEqual(report["claude"], [])
-        self.assertEqual(report["other"], ["no fence requirement for other"])
+        self.assertEqual(models.fence_report(Mixed()), {"claude": [], "other": []})
 
         class Weak(WithSession):
             def fences(self):
-                return {"claude": declaration(cwd_only=False, restricted=False)}
+                return {"opencode": declaration(workdir_only=False, asks_human=True)}
 
-        problems = models.fence_report(Weak())["claude"]
+        problems = models.fence_report(Weak())["opencode"]
         self.assertEqual(len(problems), 2)
-        self.assertTrue(any("cwd_only" in p for p in problems))
+        self.assertTrue(any("workdir_only" in p for p in problems))
 
 
 class DataTests(unittest.TestCase):
@@ -377,8 +375,7 @@ class EnvConnectorTests(unittest.TestCase):
         out = run_child(
             {"HARNESS2_IMPROVER_CHANNEL": "claude_cli", "HARNESS2_IMPROVER_MODEL": "opus"}
         )
-        self.assertEqual(out["improver"], [["claude", "opus", ""]])
-        self.assertEqual(models.RUNNER_CHANNELS["claude"], "claude_cli")
+        self.assertEqual(out["improver"], [["claude_cli", "opus", ""]])
 
     def test_no_optional_capabilities(self):
         self.assertEqual(run_child({})["caps"], [True, True, {}])

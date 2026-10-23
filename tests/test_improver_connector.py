@@ -26,14 +26,7 @@ from unittest import mock
 from harness2.benchmarks.intake import _set_improver_task
 from harness2.cli import intake as intake_cli
 from harness2.core import models
-from harness2.core.proposer import (
-    _DROP_ENV,
-    CLAUDE_CLI_PERMISSION_MODE,
-    CLAUDE_CLI_TOOLS,
-    ModelSession,
-    Proposer,
-    ProposerError,
-)
+from harness2.core.proposer import ModelSession, Proposer, ProposerError
 from harness2.core.spec import ChannelSpec, resolve_channel_model
 
 CONNECTOR_SPEC = ChannelSpec("connector", "")
@@ -41,13 +34,11 @@ CONNECTOR_SPEC = ChannelSpec("connector", "")
 
 def claude_fence(**changes) -> models.FenceDeclaration:
     fields = {
-        "tools": tuple(CLAUDE_CLI_TOOLS.split(",")),
-        "cwd_only": True,
-        "strict_mcp": True,
-        "no_prompts": True,
-        "restricted": True,
-        "permission_mode": CLAUDE_CLI_PERMISSION_MODE,
-        "dropped_env": tuple(_DROP_ENV),
+        "capabilities": frozenset({"read", "write", "search"}),
+        "workdir_only": True,
+        "asks_human": False,
+        "harness_credentials": False,
+        "runner": "claude",
     }
     fields.update(changes)
     return models.FenceDeclaration(**fields)
@@ -165,7 +156,9 @@ class ImproverConnectorTest(unittest.TestCase):
     def test_unfenced_runner_is_skipped_and_noted(self):
         other = models.ModelChoice("opencode", "prov/x")
         conn = FakeConnector(
-            [other, A], [OK], fences={"claude": claude_fence(), "opencode": claude_fence()}
+            [other, A],
+            [OK],
+            fences={"claude": claude_fence(), "opencode": claude_fence(asks_human=True)},
         )
         prop = self.proposer(conn)
         reply = self.call(prop)
@@ -177,8 +170,31 @@ class ImproverConnectorTest(unittest.TestCase):
         self.assertEqual(rows[0]["n"], 0)
         self.assertEqual(len(conn.recorded), 1)
 
+    def test_any_runner_name_with_a_satisfying_declaration_gets_the_session(self):
+        for runner in ("claude", "opencode", "anything"):
+            with self.subTest(runner):
+                choice = models.ModelChoice(runner, "model-x")
+                conn = FakeConnector([choice], [OK], fences={runner: claude_fence(runner=runner)})
+                reply = self.call(self.proposer(conn), mission=f"do it with {runner}")
+                self.assertTrue(reply.ok)
+                self.assertEqual(reply.runner, runner)
+                self.assertEqual(len(conn.sessions), 1)
+
+    def test_any_runner_name_with_a_loose_declaration_is_not_used(self):
+        for runner in ("claude", "opencode", "anything"):
+            with self.subTest(runner):
+                choice = models.ModelChoice(runner, "model-x")
+                loose = claude_fence(runner=runner, capabilities=frozenset({"read", "commands"}))
+                conn = FakeConnector([choice], [OK], fences={runner: loose})
+                prop = self.proposer(conn)
+                with self.assertRaises(ProposerError):
+                    self.call(prop)
+                self.assertEqual(conn.sessions, [])
+                (row,) = prop.models.records_for("t1")
+                self.assertEqual(row["skipped_reason"], "no fence")
+
     def test_loose_declaration_is_not_called(self):
-        loose = claude_fence(tools=(*CLAUDE_CLI_TOOLS.split(","), "Bash"))
+        loose = claude_fence(capabilities=frozenset({"read", "commands"}))
         conn = FakeConnector([A], [OK], fences={"claude": loose})
         prop = self.proposer(conn)
         with self.assertRaises(ProposerError) as caught:
@@ -292,14 +308,14 @@ class ImproverConnectorTest(unittest.TestCase):
         )
 
     def test_cli_rejects_a_connector_with_no_fenced_runner(self):
-        short = claude_fence(dropped_env=())
+        short = claude_fence(harness_credentials=True)
         conn = FakeConnector([A], [], fences={"claude": short})
         args = argparse.Namespace(timeout=60)
         stderr = io.StringIO()
         with self.assertRaises(SystemExit) as caught, contextlib.redirect_stderr(stderr):
             intake_cli._improver_channel(argparse.ArgumentParser(), args, conn, "fake")
         self.assertEqual(caught.exception.code, 2)
-        self.assertIn("dropped_env", stderr.getvalue())
+        self.assertIn("harness_credentials", stderr.getvalue())
 
     def test_unavailable_cost_is_kept_when_the_next_candidate_raises(self):
         gone = models.SessionResult(text="", ok=False, unavailable=True, cost_usd=0.5)
@@ -328,8 +344,8 @@ class ImproverConnectorTest(unittest.TestCase):
         self.assertEqual(conn.recorded[0][3].error, "empty reply")
         self.assertFalse(conn.recorded[0][3].ok)
 
-    def test_cli_maps_the_claude_runner_to_the_claude_cli_channel(self):
-        conn = NoSessionConnector([models.ModelChoice("claude", "m")])
+    def test_cli_uses_the_channel_name_as_the_runner(self):
+        conn = NoSessionConnector([models.ModelChoice("claude_cli", "m")])
         args = argparse.Namespace(timeout=60)
         channel, session = intake_cli._improver_channel(
             argparse.ArgumentParser(), args, conn, "fake"
@@ -338,7 +354,7 @@ class ImproverConnectorTest(unittest.TestCase):
         self.assertEqual((channel.kind, channel.model), ("claude_cli", "m"))
 
     def test_cli_channel_rejects_an_unknown_runner(self):
-        conn = NoSessionConnector([models.ModelChoice("codex", "m")])
+        conn = NoSessionConnector([models.ModelChoice("claude", "m")])
         args = argparse.Namespace(timeout=60)
         with self.assertRaises(SystemExit) as caught, mock.patch("sys.stderr"):
             intake_cli._improver_channel(argparse.ArgumentParser(), args, conn, "fake")

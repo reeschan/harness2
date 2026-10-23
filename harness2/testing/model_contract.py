@@ -19,7 +19,7 @@ callable `routes(role, *, task_id, substrate)`, which returns the `ModelChoice` 
 a role (`executor` or `improver`), best first, plus four optional capabilities read through
 `models`: `run_session(role, request)`, `fences()`, `record(role, task_id, choice, outcome)`
 and `close()`. A connector that defines `run_session` must also define `fences`, because
-harness2 checks the fence of a runner before it hands a session over. The executor's runner is
+harness2 checks the declared fence (one runner-neutral condition) before it hands a session over. The executor's runner is
 the substrate harness2 fixed; the connector chooses only the model, the effort and the order of
 the candidates.
 
@@ -37,7 +37,7 @@ the candidates.
   against the connector your test builds: `check_model_connector`; `routes` for the executor
   (substrate `"opencode"`) and for the improver both pass `check_choices` (an empty list is
   fine); a `fences()` that is present is read through `models.fenced_runners`, and a connector
-  that has both `run_session` and `fences()` must leave at least one accepted runner there, or
+  that has both `run_session` and `fences()` must leave at least one runner there whose declaration meets the condition, or
   the check fails with `models.fence_report` in the message; `run_session` (if any) is called
   once, with a request from `make_session_request(tmp, choice)` (`choice` is the first improver
   candidate on the first fenced runner; the check is skipped when there is no accepted runner,
@@ -73,7 +73,7 @@ The mixin does not inherit from `unittest.TestCase`, so unittest does not collec
 own; list `unittest.TestCase` after it in your test class. Each test calls `make_connector()`
 with no arguments. A connector without `run_session` skips the session check, and so does a
 test that does not implement `make_session_request`; a connector with `run_session` but no
-runner whose fence harness2 accepts fails the fence check instead.
+runner whose declared fence meets the condition fails the fence check instead.
 """
 
 from __future__ import annotations
@@ -178,7 +178,7 @@ class ModelConnectorContractTests:
     Subclass it together with `unittest.TestCase` and implement `make_connector()`. Implement
     `make_session_request(tmp, choice)` too when the connector has `run_session`; the session
     check is skipped without it. A connector with `run_session` must declare a runner whose
-    fence harness2 accepts, or the fence check fails. Each test builds its own connector, and
+    fence meets the condition, or the fence check fails. Each test builds its own connector, and
     closes it afterwards when it has `close()`.
     """
 
@@ -235,8 +235,8 @@ class ModelConnectorContractTests:
             f"{runner}: {', '.join(problems) or 'accepted'}" for runner, problems in report.items()
         )
         raise AssertionError(
-            "the connector has run_session but declares no runner whose fence harness2 "
-            f"accepts ({detail or 'no fences declared'})"
+            "the connector has run_session but declares no runner whose fence meets "
+            f"the condition ({detail or 'no fences declared'})"
         )
 
     def test_model_contract_run_session(self) -> None:
@@ -247,7 +247,7 @@ class ModelConnectorContractTests:
         fenced = models.fenced_runners(conn)
         if not fenced:
             self.skipTest(  # type: ignore[attr-defined]
-                "the connector has run_session but no runner whose fence harness2 accepts"
+                "the connector has run_session but no runner whose fence meets the condition"
             )
         runner = next(iter(fenced))
         choice = next(
