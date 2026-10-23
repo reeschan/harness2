@@ -75,8 +75,10 @@ sequenceDiagram
    in the same run directory, on the next candidate. A second unavailable failure ends the
    rollout, and so does running out of candidates. Any other failure ends it at once.
 3. When the connector defines `record`, each executor use is handed to it as an `Outcome`.
-4. When the improver runs, the `Proposer` asks for the improver candidates:
-   `routes("improver", task_id=..., substrate="")`.
+4. For a connector with `run_session`, the `Proposer` asks for the improver candidates of
+   each task when the improver runs: `routes("improver", task_id=..., substrate="")`. For a
+   connector without `run_session`, `harness2-intake` asks only once, at start-up, with
+   `task_id=""`, and uses the first candidate's channel and model for every task.
 5. For a connector with `run_session`, the declarations from `fences()` are checked at
    start-up against `IMPROVER_FENCE`. A candidate whose runner has no declaration that meets
    it is skipped and noted with `skipped_reason` `no fence`.

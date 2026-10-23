@@ -56,7 +56,7 @@ intake: "harness2-intake" {
 port: "model connector port\nharness2.core.models" {
   class: zone
 
-  contract: "routes (required)\nrun_session · fences · record · close (optional)" {
+  contract: "routes (required)\nrun_session (optional)\nfences (required with run_session)\nrecord · close (optional)" {
     class: svc
   }
   default: "env (default)\nconfig.ROLES" {

@@ -59,8 +59,10 @@ sequenceDiagram
    ロールアウトが 1 回だけ再試行されます。2 回目の使用不能の失敗でロールアウトは終了
    し、候補を使い切った場合も終了します。それ以外の失敗はその時点で終了します。
 3. コネクターが `record` を定義しているとき、実行役の使用のたびに `Outcome` が渡されます。
-4. 改善役が動くとき、`Proposer` が改善役の候補を要求します:
-   `routes("improver", task_id=..., substrate="")`。
+4. `run_session` を持つコネクターでは、改善役が動くとき、`Proposer` がタスクごとに改善役の
+   候補を要求します: `routes("improver", task_id=..., substrate="")`。`run_session` を持たない
+   コネクターでは、`harness2-intake` が起動時に 1 回だけ `task_id=""` で要求し、先頭の候補の
+   チャネルとモデルをすべてのタスクで使います。
 5. `run_session` を持つコネクターでは、`fences()` が返す宣言が起動時に `IMPROVER_FENCE`
    と照らし合わせて検査されます。その条件を満たす宣言を持たないランナーの候補は飛ばされ、
    `skipped_reason` の `no fence` として記録されます。
