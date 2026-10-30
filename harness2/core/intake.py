@@ -365,6 +365,7 @@ class Capabilities:
     judge: Judge | None = None
     report: Callable[[str], str | None] | None = None
     close: Callable[[], None] = _noop
+    base_harness: Mapping[str, str] | None = None
 
 
 def _type_name(value: Any) -> str:
@@ -380,6 +381,9 @@ def capabilities(connector: Any) -> Capabilities:
       A Judge returns None or a dict with `n_passed`, `n_criteria` and `all_pass`.
     - `report(task_id)` (method): returns the text for a task or None; default None.
     - `close()` (method): default a function that does nothing.
+    - `base_harness()` (method): returns a mapping of always-on file name to text, or None;
+      default None. It is called here, once. The files replace those of the intake adapter's
+      starting harness (`IntakeAdapter(base_tree=...)` checks the names and the cap).
 
     An attribute that is present but None counts as missing. A value of the wrong type raises
     TypeError naming the capability and the type it had.
@@ -449,12 +453,36 @@ def capabilities(connector: Any) -> Capabilities:
             f"task connector capability 'close' must be a method or None, got {_type_name(close)}"
         )
 
+    base_method = getattr(connector, "base_harness", None)
+    base_harness: Mapping[str, str] | None = None
+    if base_method is not None:
+        if not callable(base_method):
+            raise TypeError(
+                "task connector capability 'base_harness' must be a method returning a mapping "
+                f"or None, got {_type_name(base_method)}"
+            )
+        got = base_method()
+        if got is not None:
+            if not isinstance(got, Mapping):
+                raise TypeError(
+                    "task connector capability 'base_harness()' must return a mapping of str to "
+                    f"str or None, got {_type_name(got)}"
+                )
+            for name, text in got.items():
+                if not isinstance(name, str) or not isinstance(text, str):
+                    raise TypeError(
+                        "task connector capability 'base_harness()' must map str to str, "
+                        f"got {_type_name(name)} to {_type_name(text)}"
+                    )
+            base_harness = dict(got)
+
     return Capabilities(
         workspace_policy=policy,
         scrub_env=scrub_env,
         judge=judge,
         report=report,
         close=close,
+        base_harness=base_harness,
     )
 
 
