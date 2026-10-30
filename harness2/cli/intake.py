@@ -395,6 +395,7 @@ def _run(
                 executor=executor,
                 model_connector="" if model_name == models.DEFAULT else model_name,
                 improver=improver,
+                base_tree=caps.base_harness,
             )
             target = functools.partial(
                 intake_report.summary_locations,

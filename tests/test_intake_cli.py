@@ -413,6 +413,13 @@ class IntakeCliTest(unittest.TestCase):
         adapter = self.run_intake.call_args.args[0]
         self.assertIs(adapter.judge, judge)
 
+    def test_base_harness_goes_to_the_intake_adapter(self) -> None:
+        self.connector.base_harness = lambda: {"systemprompt.md": "Follow worker.md.\n"}
+        self._run(self._args())
+        adapter = self.run_intake.call_args.args[0]
+        text = (adapter.base_harness() / "systemprompt.md").read_text()
+        self.assertEqual(text, "Follow worker.md.\n")
+
     def test_no_judge_means_no_scoring(self) -> None:
         self._run(self._args())
         self.assertIsNone(self.run_intake.call_args.args[0].judge)

@@ -282,6 +282,35 @@ class IntakeAdapterTest(unittest.TestCase):
         run_dir = adapter.execute("t1", None, "r1")
         self.assertTrue((run_dir / "workspace/output").is_dir())
 
+    def _base(self, base_tree):
+        return IntakeAdapter(
+            self.root,
+            FakeConnector([]),
+            FakeNormalizer({}),
+            launcher=FakeLauncher(),
+            channel=CHANNEL,
+            base_tree=base_tree,
+        )
+
+    def test_base_tree_replaces_the_always_on_files(self) -> None:
+        adapter = self._base({"systemprompt.md": "Follow worker.md.\n", "guardrails.md": "Rule.\n"})
+        base = adapter.base_harness()
+        self.assertEqual((base / "systemprompt.md").read_text(), "Follow worker.md.\n")
+        self.assertEqual((base / "guardrails.md").read_text(), "Rule.\n")
+
+    def test_without_base_tree_the_default_system_prompt_stays(self) -> None:
+        adapter = self._base(None)
+        text = (adapter.base_harness() / "systemprompt.md").read_text()
+        self.assertIn("output/", text)
+
+    def test_base_tree_rejects_other_files_and_the_cap(self) -> None:
+        with self.assertRaises(ValueError) as ctx:
+            self._base({"skills/x/SKILL.md": "no"})
+        self.assertIn("not always-on", str(ctx.exception))
+        with self.assertRaises(ValueError) as ctx:
+            self._base({"systemprompt.md": "x" * 30_000})
+        self.assertIn("cap", str(ctx.exception))
+
     def test_channel_is_required(self) -> None:
         with self.assertRaises(TypeError):
             IntakeAdapter(self.root, FakeConnector([]), FakeNormalizer({}), launcher=FakeLauncher())

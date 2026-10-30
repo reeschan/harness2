@@ -36,7 +36,7 @@ import os
 import shutil
 import weakref
 from pathlib import Path
-from typing import Any, Callable, Protocol, Sequence, runtime_checkable
+from typing import Any, Callable, Mapping, Protocol, Sequence, runtime_checkable
 
 from ..core import memory, schedule, tree
 from ..core.intake import TaskConnector, TaskSpec, task_spec_from_dict, task_spec_to_dict
@@ -133,6 +133,7 @@ class IntakeAdapter:
         executor: Any = None,
         model_connector: str = "",
         improver: Any = None,
+        base_tree: Mapping[str, str] | None = None,
     ):
         self.root = Path(root)
         self.connector = connector
@@ -171,6 +172,16 @@ class IntakeAdapter:
         surface = self.substrate.surface()
         base = {name: "" for name in surface.always_on}
         base["systemprompt.md"] = BASE_SYSTEMPROMPT
+        if base_tree:
+            # A task connector's starting harness: only always-on files, within the cap.
+            unknown = sorted(set(base_tree) - set(surface.always_on))
+            if unknown:
+                raise ValueError(
+                    f"base_tree names files that are not always-on on {surface.name}: "
+                    f"{', '.join(unknown)} (allowed: {', '.join(surface.always_on)})"
+                )
+            base.update(base_tree)
+            tree.validate(surface, base)
         tree.write_tree(surface, base, self.base_harness(), stubs=False)
 
     # -- storage ---------------------------------------------------------------------------

@@ -398,6 +398,7 @@ capability.
 | `judge()` | Method returning a Judge or None; called once | None (no judge) | The scorer used after selection |
 | `report(task_id)` | Method returning a string or None | None | The text printed for a task; without it, `<task_id>: <status>` |
 | `close()` | Method | Does nothing | Releases connections and processes; the CLI calls it once at the end, also when the run fails |
+| `base_harness()` | Method returning a mapping of always-on file name to text, or None; called once | None (the generic intake system prompt) | The starting harness of every task: the named always-on files (`systemprompt.md`, `guardrails.md`, `LongTermMEMORY.md` on OpenCode) replace the defaults. A name that is not always-on, or text over the always-on cap, is an error before any task runs. The improver edits these files like any other harness |
 
 ### The judge
 

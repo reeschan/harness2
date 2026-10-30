@@ -384,6 +384,30 @@ class CapabilitiesTest(unittest.TestCase):
         caps.close()
         self.assertEqual(conn.closed, 1)
 
+    def test_base_harness_is_read_once(self):
+        conn = FakeConnector()
+        calls = []
+        conn.base_harness = lambda: calls.append(1) or {"systemprompt.md": "Work like this.\n"}
+        caps = intake.capabilities(conn)
+        self.assertEqual(caps.base_harness, {"systemprompt.md": "Work like this.\n"})
+        self.assertEqual(calls, [1])
+        self.assertIsNone(intake.capabilities(FakeConnector()).base_harness)
+        conn.base_harness = lambda: None
+        self.assertIsNone(intake.capabilities(conn).base_harness)
+
+    def test_base_harness_of_the_wrong_type_raises(self):
+        for value, word in (
+            (lambda: ["systemprompt.md"], "list"),
+            (lambda: {"systemprompt.md": 1}, "int"),
+            ("text", "str"),
+        ):
+            conn = FakeConnector()
+            conn.base_harness = value
+            with self.subTest(word=word), self.assertRaises(TypeError) as ctx:
+                intake.capabilities(conn)
+            self.assertIn("base_harness", str(ctx.exception))
+            self.assertIn(word, str(ctx.exception))
+
     def test_judge_method_may_return_none(self):
         conn = FakeConnector()
         conn.judge = lambda: None
