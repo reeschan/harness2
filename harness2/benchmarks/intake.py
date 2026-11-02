@@ -213,11 +213,28 @@ class IntakeAdapter:
 
         A task that fails (normalization, a task_id that differs from the raw id, fetching
         its files, any other Exception) is reported with `connector.fail` and skipped.
-        A task whose spec.json already exists is skipped without normalizing it again.
+        A task whose spec.json already exists is skipped without normalizing it again. If
+        that task carries a `.handled` mark, an earlier run returned it to the connector and
+        the connector offers it again: each time it is offered, it is reported with
+        `connector.fail` (so a connector whose `poll` keeps returning tasks it already got
+        back sees one more `fail` per poll), the mark is left as it is, and it is not run. Without the mark, the task was stopped midway; it is
+        skipped silently, and `run_intake` resumes it.
         """
         stored: list[str] = []
         for raw in self.connector.poll():
             if self._has_spec(raw.id):
+                if _is_marked_handled(self, raw.id):
+                    # the mark's word is read from a regular file only; a link is never followed
+                    mark = self._task_dir(raw.id) / HANDLED_MARK
+                    word = "(not a regular file)"
+                    if not mark.is_symlink() and mark.is_file():
+                        word = mark.read_text(encoding="utf-8", errors="replace").strip()
+                    reason = (
+                        f"already returned by an earlier run (tasks/{raw.id}/{HANDLED_MARK} "
+                        f'says "{word}"); the connector offered it again, so it is failed '
+                        "here and not run"
+                    )
+                    self.connector.fail(raw.id, _clip_reason(reason))
                 continue
             try:
                 spec = normalize_task(self.normalizer, raw, domains=self.known_domains())
@@ -549,8 +566,9 @@ def run_intake(
     For every stored task this adapter has not yet taken up in this process and that has
     no `tasks/<task_id>/.handled` mark, run_task runs with the given arguments. The mark
     holds "delivered" or "failed" and is written only after `connector.deliver` or
-    `connector.fail` returned without an exception, so a restarted process does not hand
-    the same task to the connector twice. The chosen run of `modes[0]` is delivered with
+    `connector.fail` returned without an exception, so a restarted process does not run or
+    deliver the same task again. When the connector offers a marked task again, `ingest`
+    returns it with `connector.fail` each time it is offered. The chosen run of `modes[0]` is delivered with
     `adapter.connector.deliver(task_id, <its workspace/output/>, res.to_dict())` when that
     directory is a real directory (not a symbolic link) holding at least one regular file;
     otherwise the task goes to `adapter.connector.fail`. An Exception from run_task or from
