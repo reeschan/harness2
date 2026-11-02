@@ -30,6 +30,7 @@ from unittest.mock import patch
 from harness2.benchmarks import intake as intake_mod
 from harness2.benchmarks.intake import IntakeAdapter, run_intake
 from harness2.core import schedule
+from harness2.core.intake import RawTask
 from harness2.core.intake_local import LocalFileConnector
 from harness2.core.normalize import PassthroughNormalizer
 from harness2.core.proposer import Proposer, Reply
@@ -358,6 +359,73 @@ class IntakeEndToEndTest(unittest.TestCase):
         run_task.assert_not_called()
         self.assertEqual((launcher.calls, len(improver._calls)), (calls, proposals))
         self.assertFalse((self.inbox_root / "outbox" / "ledger-1").exists())
+
+    def test_handled_task_offered_again_is_failed_once_and_not_run(self) -> None:
+        connector = LocalFileConnector(self.inbox_root)
+        launcher = FakeLauncher()
+        improver = FakeImprover(CHANNEL)
+        first = run_intake(
+            self._adapter(launcher, connector=connector),
+            improver,
+            k=1,
+            runs_root=self.runs_root,
+            modes=("agg",),
+        )
+        self.assertEqual([r.task_id for r in first], ["ledger-1"])
+        mark = self.root / "tasks" / "ledger-1" / ".handled"
+        self.assertEqual(mark.read_text(encoding="utf-8"), "delivered")
+        calls, proposals = launcher.calls, len(improver._calls)
+
+        # the connector lost its state and offers ledger-1 again; a new adapter is a new process
+        with (
+            patch.object(connector, "poll", return_value=[RawTask(id="ledger-1")]),
+            patch.object(connector, "deliver") as deliver,
+            patch.object(connector, "fail") as fail,
+            patch.object(intake_mod.schedule, "run_task") as run_task,
+        ):
+            second = run_intake(
+                self._adapter(launcher, connector=connector),
+                improver,
+                k=1,
+                runs_root=self.runs_root,
+                modes=("agg",),
+            )
+        self.assertEqual(second, [])
+        run_task.assert_not_called()
+        deliver.assert_not_called()
+        fail.assert_called_once()
+        task_id, reason = fail.call_args.args
+        self.assertEqual(task_id, "ledger-1")
+        self.assertIn(".handled", reason)
+        self.assertIn("delivered", reason)
+        self.assertIn("tasks/ledger-1/", reason)
+        self.assertEqual(mark.read_text(encoding="utf-8"), "delivered")
+        self.assertEqual((launcher.calls, len(improver._calls)), (calls, proposals))
+
+    def test_stored_task_without_handled_mark_offered_again_is_not_failed(self) -> None:
+        connector = LocalFileConnector(self.inbox_root)
+        # a run that stopped after it stored ledger-1: spec.json is there, the mark is not
+        self._adapter(FakeLauncher(), connector=connector).ingest()
+        self.assertTrue((self.root / "tasks" / "ledger-1" / "spec.json").is_file())
+        self.assertFalse((self.root / "tasks" / "ledger-1" / ".handled").exists())
+        launcher = FakeLauncher()
+        with (
+            patch.object(connector, "poll", return_value=[RawTask(id="ledger-1")]),
+            patch.object(connector, "fail") as fail,
+        ):
+            results = run_intake(
+                self._adapter(launcher, connector=connector),
+                FakeImprover(CHANNEL),
+                k=1,
+                runs_root=self.runs_root,
+                modes=("agg",),
+            )
+        fail.assert_not_called()
+        self.assertEqual([r.task_id for r in results], ["ledger-1"])
+        self.assertEqual(
+            (self.root / "tasks" / "ledger-1" / ".handled").read_text(encoding="utf-8"),
+            "delivered",
+        )
 
     def test_no_mark_when_the_connector_raises(self) -> None:
         connector = LocalFileConnector(self.inbox_root)
