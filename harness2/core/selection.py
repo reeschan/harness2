@@ -25,7 +25,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Sequence, TypeVar
 
-from . import context
+from . import context, trace
 from . import prompts as P
 from .proposer import Proposer, ProposerError
 from .spec import BenchmarkAdapter, BenchPrompts, RunView, resolve_prompts
@@ -276,6 +276,33 @@ def run_selection(
     work_dir: Path,
     pool_kind: str = "mixed",
 ) -> Selection:
+    """Run the selector inside its SELECTION span and record the outcome."""
+    with trace.span(trace.Kind.SELECTION, mode=mode, pool=sorted(candidates)) as sp:
+        sel = _run_selection(
+            task_id,
+            k,
+            mode,
+            candidates,
+            adapter=adapter,
+            prop=prop,
+            work_dir=work_dir,
+            pool_kind=pool_kind,
+        )
+        sp.set(chosen_label=sel.chosen_label, ok=sel.ok, usd=sel.usd, error=sel.error)
+        return sel
+
+
+def _run_selection(
+    task_id: str,
+    k: int,
+    mode: str,
+    candidates: dict[str, RunView],
+    *,
+    adapter: BenchmarkAdapter,
+    prop: Proposer,
+    work_dir: Path,
+    pool_kind: str = "mixed",
+) -> Selection:
     """Pick one output. A selector failure falls back to a delivered base and never raises;
     an adapter bug does raise, because it is a bug and not a selection outcome.
 
@@ -366,6 +393,22 @@ def trivial_selection(
     adapter: BenchmarkAdapter,
     work_dir: Path,
 ) -> Selection:
+    """Deliver the single k=1 final inside its SELECTION span."""
+    with trace.span(trace.Kind.SELECTION, mode=mode, pool=sorted(candidates)) as sp:
+        sel = _trivial_selection(task_id, k, mode, candidates, adapter=adapter, work_dir=work_dir)
+        sp.set(chosen_label=sel.chosen_label, ok=sel.ok, usd=sel.usd, error=sel.error)
+        return sel
+
+
+def _trivial_selection(
+    task_id: str,
+    k: int,
+    mode: str,
+    candidates: dict[str, RunView],
+    *,
+    adapter: BenchmarkAdapter,
+    work_dir: Path,
+) -> Selection:
     """Deliver the single k=1 final without a selector session.
 
     The same non-answer drop rules apply, and the record is written with the standard
@@ -400,6 +443,51 @@ def trivial_selection(
 
 
 def reflect_adoption(
+    task_id: str,
+    sel: Selection,
+    candidates: dict[str, RunView],
+    *,
+    adapter: BenchmarkAdapter,
+    prop: Proposer,
+    work_dir: Path,
+    decisions: dict[str, str] | None = None,
+) -> dict:
+    """Run the adoption reflection inside its REFLECTION span.
+
+    The span reports only what the reflection itself spent and did: `usd` is the rise in
+    `sel.usd` during the call (the selection's own cost is already on its SELECTION span),
+    `ok` is whether an experience came back, and `error` says why it did not.
+    """
+    spend_before = sel.usd
+    with trace.span(trace.Kind.REFLECTION, mode=sel.mode) as sp:
+        experience = _reflect_adoption(
+            task_id,
+            sel,
+            candidates,
+            adapter=adapter,
+            prop=prop,
+            work_dir=work_dir,
+            decisions=decisions,
+        )
+        ok = bool(experience)
+        if not sel.ok:
+            error = "skipped: selection not ok" + (f": {sel.error}" if sel.error else "")
+        elif candidates.get(sel.chosen_label) is None:
+            error = "skipped: chosen candidate not in the pool"
+        elif not ok:
+            error = "reflection returned no experience"
+        else:
+            error = ""
+        sp.set(
+            chosen_label=sel.chosen_label,
+            ok=ok,
+            usd=sel.usd - spend_before,
+            error=error,
+        )
+        return experience
+
+
+def _reflect_adoption(
     task_id: str,
     sel: Selection,
     candidates: dict[str, RunView],

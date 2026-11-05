@@ -1,0 +1,425 @@
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     https://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""The trace of one task run: parent links, tree diffs, summary and failures."""
+
+import json
+import os
+import tempfile
+import unittest
+from pathlib import Path
+from unittest.mock import patch
+
+from harness2.core import schedule, selection, trace
+from harness2.core.proposer import ProposerError, Reply
+from harness2.core.spec import RunView
+from harness2.demo import DemoAdapter, DemoProposer
+from harness2.testing.trace_contract import RecordingSink
+
+TASK_ID = "ledger-1"
+
+EXPERIENCE_TEXT = (
+    "<experience>\ncue: a ledger holds credits and debits\n"
+    "lesson: sum both signs in scripts/summarize.py\n"
+    "evidence: the ledger total changed when the filter was dropped\n"
+    "confidence: high for this observed contrast\n</experience>"
+)
+
+
+class CostProposer:
+    """A proposer that bills the selector and the reflection separately."""
+
+    def __init__(self, *, select_usd=0.4, reflect_usd=0.1, reflect_fails=False):
+        self.select_usd = select_usd
+        self.reflect_usd = reflect_usd
+        self.reflect_fails = reflect_fails
+        self.spent = 0.0
+
+    def call(self, mission, context_dir, label, **kwargs):
+        cost = self.select_usd if label.startswith("select.") else self.reflect_usd
+        self.spent += cost
+        if label.startswith("select."):
+            return Reply(label=label, text="```choice\nA\n```", ok=True, cost_usd=cost)
+        if self.reflect_fails:
+            raise ProposerError(f"[{label}] no experience", cost_usd=cost)
+        return Reply(label=label, text=EXPERIENCE_TEXT, ok=True, cost_usd=cost)
+
+
+class BatchAdapter:
+    """An adapter whose batched executions return made-up run dirs."""
+
+    def __init__(self, dirs, *, fail_label=""):
+        self.dirs = dirs
+        self.fail_label = fail_label
+
+    def execute_many(self, task_id, harness_dir, run_ids):
+        return list(self.dirs)
+
+    def delivered(self, run_dir):
+        if self.fail_label and Path(run_dir).name == self.fail_label:
+            raise RuntimeError("delivered failed")
+        return True
+
+    def rollout_cost_usd(self, run_id, run_dir):
+        return 1.0
+
+
+class SingleAdapter:
+    """An adapter with no batched path, so every rollout runs on its own."""
+
+    def __init__(self, dirs):
+        self.dirs = dirs
+
+    def execute(self, task_id, harness_dir, run_id):
+        return self.dirs[0]
+
+    def delivered(self, run_dir):
+        return True
+
+    def rollout_cost_usd(self, run_id, run_dir):
+        return 1.0
+
+
+class BrokenSink:
+    """A sink that fails on every emit, to prove the run goes on."""
+
+    def emit(self, event):
+        raise RuntimeError("broken sink")
+
+    def close(self):
+        pass
+
+
+def broken_sink(root, **options):
+    """The factory form `factory(root=Path, **options)`."""
+    return BrokenSink()
+
+
+class TraceFlowTests(unittest.TestCase):
+    def setUp(self):
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        self.root = Path(temporary.name)
+        self.adapter = DemoAdapter(self.root)
+        self.proposer = DemoProposer(self.adapter.spec.channels["proposer"])
+
+    def run_one(self, k=1):
+        return schedule.run_task(
+            TASK_ID,
+            k,
+            adapter=self.adapter,
+            prop=self.proposer,
+            runs_root=self.adapter.spec.runs_root,
+        )
+
+    def task_dir(self, k=1):
+        return self.adapter.spec.runs_root / f"demo-oc-agg{k}" / TASK_ID
+
+    def events(self, k=1):
+        path = self.task_dir(k) / "trace.jsonl"
+        return [json.loads(line) for line in path.read_text().splitlines() if line.strip()]
+
+    def summary(self, k=1):
+        return json.loads((self.task_dir(k) / "summary.json").read_text())
+
+    def parents(self, events):
+        out = {}
+        for event in events:
+            out[event["span_id"]] = event["parent_id"]
+        return out
+
+    def root_of(self, span_id, parents):
+        seen = set()
+        while parents.get(span_id) is not None:
+            self.assertNotIn(span_id, seen, "a span cycle")
+            seen.add(span_id)
+            span_id = parents[span_id]
+        return span_id
+
+    def assert_spans_are_paired(self, events):
+        phases = {}
+        for event in events:
+            phase = event["attrs"].get("phase")
+            if phase is not None:
+                phases.setdefault(event["span_id"], set()).add(phase)
+        for span_id, got in phases.items():
+            self.assertEqual(got, {"start", "end"}, f"span {span_id} is unpaired: {got}")
+
+    def test_trace_file_links_every_span_and_records_the_summary(self):
+        result = self.run_one()
+        self.assertEqual(result.status, "ok")
+        path = self.task_dir() / "trace.jsonl"
+        self.assertTrue(path.is_file())
+        events = self.events()
+        self.assertTrue(events)
+
+        self.assertEqual(len({event["run_id"] for event in events}), 1)
+        self.assertFalse([e for e in events if e["kind"].startswith(trace.JUDGE_PREFIX)])
+        parents = self.parents(events)
+        task_starts = [
+            event
+            for event in events
+            if event["kind"] == trace.Kind.TASK and event["attrs"].get("phase") == "start"
+        ]
+        self.assertEqual(len(task_starts), 1)
+        task_id = task_starts[0]["span_id"]
+        self.assertIsNone(task_starts[0]["parent_id"])
+
+        roles = {
+            event["attrs"].get("role")
+            for event in events
+            if event["kind"] == trace.Kind.ROLLOUT and event["attrs"].get("phase") == "start"
+        }
+        self.assertEqual(roles, {"base", "candidate", "final"})
+        for kind in (
+            trace.Kind.ROLLOUT,
+            trace.Kind.STAGE,
+            trace.Kind.SELECTION,
+            trace.Kind.COST,
+        ):
+            kind_events = [event for event in events if event["kind"] == kind]
+            self.assertTrue(kind_events, f"no {kind} events")
+            for event in kind_events:
+                self.assertEqual(self.root_of(event["span_id"], parents), task_id)
+
+        stage_ids = {
+            event["span_id"]
+            for event in events
+            if event["kind"] == trace.Kind.STAGE and event["attrs"].get("phase") == "start"
+        }
+        diffs = [event for event in events if event["kind"] == trace.Kind.TREE_DIFF]
+        self.assertTrue(diffs)
+        for diff in diffs:
+            self.assertIn(diff["parent_id"], stage_ids)
+            for entry in diff["attrs"]["files"]:
+                self.assertEqual(set(entry), {"path", "sha256", "change"})
+                self.assertIn(entry["change"], {"added", "changed", "removed"})
+                self.assertEqual(len(entry["sha256"]), 64)
+
+        self.assert_spans_are_paired(events)
+        self.assertFalse(
+            [event for event in events if event["kind"].startswith(trace.JUDGE_PREFIX)]
+        )
+
+        summary = self.summary()
+        recorded = summary["trace"]
+        self.assertEqual(set(recorded), {"enabled", "sink", "run_id", "events", "warnings"})
+        self.assertTrue(recorded["enabled"])
+        self.assertEqual(recorded["sink"], "file")
+        self.assertEqual(recorded["warnings"], [])
+        same_run = [event for event in events if event["run_id"] == recorded["run_id"]]
+        self.assertEqual(recorded["events"], len(same_run))
+        self.assertEqual(set(event["run_id"] for event in same_run), {recorded["run_id"]})
+
+    def test_pooled_stages_and_rollouts_keep_the_task_as_parent(self):
+        self.run_one(k=2)
+        events = self.events(k=2)
+        parents = self.parents(events)
+        task_starts = [
+            event
+            for event in events
+            if event["kind"] == trace.Kind.TASK and event["attrs"].get("phase") == "start"
+        ]
+        task_id = task_starts[0]["span_id"]
+        stage_starts = [
+            event
+            for event in events
+            if event["kind"] == trace.Kind.STAGE and event["attrs"].get("phase") == "start"
+        ]
+        agg_stages = [event for event in stage_starts if event["attrs"].get("mode") == "agg"]
+        self.assertTrue(agg_stages)
+        for event in agg_stages:
+            self.assertEqual(event["parent_id"], task_id)
+        agg_rollouts = [
+            event
+            for event in events
+            if event["kind"] == trace.Kind.ROLLOUT
+            and event["attrs"].get("phase") == "start"
+            and event["attrs"].get("mode") == "agg"
+        ]
+        self.assertTrue(agg_rollouts)
+        for event in agg_rollouts:
+            self.assertEqual(event["parent_id"], task_id)
+        for event in events:
+            self.assertEqual(self.root_of(event["span_id"], parents), task_id)
+        self.assert_spans_are_paired(events)
+
+    def test_disabled_tracing_writes_no_file_and_says_so(self):
+        with patch.dict(os.environ, {trace.ENABLE_VAR: "0"}):
+            result = self.run_one()
+        self.assertEqual(result.status, "ok")
+        self.assertFalse((self.task_dir() / "trace.jsonl").exists())
+        self.assertEqual(self.summary()["trace"], {"enabled": False})
+        self.assertEqual(result.trace, {"enabled": False})
+
+    def test_a_failing_sink_does_not_stop_the_run_and_leaves_a_warning(self):
+        with patch.dict(os.environ, {trace.ENV_VAR: "tests.test_trace_flow:broken_sink"}):
+            result = self.run_one()
+        self.assertEqual(result.status, "ok")
+        recorded = self.summary()["trace"]
+        self.assertTrue(recorded["enabled"])
+        self.assertEqual(recorded["sink"], "tests.test_trace_flow:broken_sink")
+        self.assertEqual(recorded["events"], 0)
+        self.assertTrue(recorded["warnings"])
+        self.assertTrue(recorded["warnings"][0].startswith("emit failed: RuntimeError"))
+
+    def test_resume_appends_a_second_run_and_marks_the_task_resumed(self):
+        first = self.run_one()
+        first_run = first.trace["run_id"]
+        executions = self.adapter.execution_count
+        calls = len(self.proposer._calls)
+
+        second = self.run_one()
+        self.assertEqual(second.status, "skipped")
+        self.assertEqual(
+            (self.adapter.execution_count, len(self.proposer._calls)), (executions, calls)
+        )
+        events = self.events()
+        self.assertEqual(len({event["run_id"] for event in events}), 2)
+        new = [event for event in events if event["run_id"] != first_run]
+        self.assertEqual({event["run_id"] for event in new}, {second.trace["run_id"]})
+        task_end = [
+            event
+            for event in new
+            if event["kind"] == trace.Kind.TASK and event["attrs"].get("phase") == "end"
+        ]
+        self.assertEqual(len(task_end), 1)
+        self.assertTrue(task_end[0]["attrs"]["resumed"])
+
+        third = self.run_one()
+        self.assertEqual(third.status, "skipped")
+        self.assertEqual(
+            (self.adapter.execution_count, len(self.proposer._calls)), (executions, calls)
+        )
+        self.assertEqual(self.summary()["trace"]["run_id"], first_run)
+
+    def candidate(self, work, label="agg1"):
+        run_dir = work / "runs" / label
+        run_dir.mkdir(parents=True, exist_ok=True)
+        (run_dir / "trajectory.md").write_text(
+            "[ACTION] run scripts/summarize.py\n[OBSERVATION]\nTotal: 85.15\n", encoding="utf-8"
+        )
+        (run_dir / "answer.txt").write_text("Total: 85.15\n", encoding="utf-8")
+        return RunView(label=label, run_id=f"run-{label}", run_dir=run_dir, ok=True, delivered=True)
+
+    def candidates_for(self, work, label="agg1"):
+        harness = work / "harnesses" / label
+        harness.mkdir(parents=True, exist_ok=True)
+        (harness / "systemprompt.md").write_text("Reconcile the ledger.\n", encoding="utf-8")
+        return {label: self.candidate(work, label)}
+
+    def rollout_events(self, adapter, pending):
+        sink = RecordingSink()
+        tracer = trace.Tracer(sink)
+        self.addCleanup(tracer.close)
+        with trace.use(tracer):
+            schedule._roll_bases(TASK_ID, adapter, pending, self.root / "missing")
+        return [event for event in sink.events if event.kind == trace.Kind.ROLLOUT]
+
+    def test_reflection_traces_only_its_own_cost_and_failure(self):
+        for fails in (False, True):
+            with self.subTest(reflect_fails=fails):
+                work = self.root / f"cost-{fails}"
+                candidates = self.candidates_for(work)
+                proposer = CostProposer(reflect_fails=fails)
+                sink = RecordingSink()
+                tracer = trace.Tracer(sink)
+                self.addCleanup(tracer.close)
+                with trace.use(tracer):
+                    sel = selection.run_selection(
+                        TASK_ID,
+                        1,
+                        "agg",
+                        candidates,
+                        adapter=self.adapter,
+                        prop=proposer,
+                        work_dir=work,
+                    )
+                    experience = selection.reflect_adoption(
+                        TASK_ID,
+                        sel,
+                        candidates,
+                        adapter=self.adapter,
+                        prop=proposer,
+                        work_dir=work,
+                    )
+                ends = {
+                    event.kind: event.attrs
+                    for event in sink.events
+                    if event.attrs.get("phase") == "end"
+                }
+                selected = ends[trace.Kind.SELECTION]
+                reflected = ends[trace.Kind.REFLECTION]
+                self.assertEqual(selected["usd"], proposer.select_usd)
+                self.assertAlmostEqual(reflected["usd"], proposer.reflect_usd)
+                self.assertAlmostEqual(selected["usd"] + reflected["usd"], proposer.spent)
+                self.assertEqual(reflected["ok"], not fails)
+                self.assertEqual(bool(experience), not fails)
+                self.assertEqual(reflected["error"] == "", not fails)
+
+    def test_a_failed_batch_emits_one_rollout_per_run_id(self):
+        first = self.root / "batch-r1"
+        second = self.root / "batch-r2"
+        first.mkdir()
+        second.mkdir()
+        events = self.rollout_events(
+            BatchAdapter([first, second], fail_label="batch-r2"),
+            [("base1", "r1"), ("base2", "r2")],
+        )
+        starts = [event for event in events if event.attrs.get("phase") == "start"]
+        ends = [event for event in events if event.attrs.get("phase") == "end"]
+        self.assertEqual(sorted(event.attrs["run_id"] for event in starts), ["r1", "r2"])
+        self.assertEqual(
+            sorted(event.span_id for event in starts),
+            sorted(event.span_id for event in ends),
+        )
+
+    def test_both_rollout_paths_trace_the_same_attrs(self):
+        batch_first = self.root / "same-r1"
+        batch_second = self.root / "same-r2"
+        single = self.root / "single-r1"
+        for path in (batch_first, batch_second, single):
+            path.mkdir()
+        batch = self.rollout_events(
+            BatchAdapter([batch_first, batch_second]), [("base1", "r1"), ("base2", "r2")]
+        )
+        one = self.rollout_events(SingleAdapter([single]), [("base1", "r1")])
+        batch_start = next(event for event in batch if event.attrs.get("phase") == "start")
+        batch_end = next(event for event in batch if event.attrs.get("phase") == "end")
+        one_start = next(event for event in one if event.attrs.get("phase") == "start")
+        one_end = next(event for event in one if event.attrs.get("phase") == "end")
+        self.assertEqual(set(batch_start.attrs), set(one_start.attrs))
+        self.assertEqual(set(batch_end.attrs), set(one_end.attrs))
+        self.assertEqual(batch_start.attrs["mode"], "")
+        self.assertEqual(one_start.attrs["mode"], "")
+        self.assertEqual(
+            set(one_start.attrs) | set(one_end.attrs),
+            {
+                "role",
+                "mode",
+                "label",
+                "run_id",
+                "phase",
+                "status",
+                "dur_s",
+                "ok",
+                "delivered",
+                "usd",
+                "error",
+            },
+        )
+
+
+if __name__ == "__main__":
+    unittest.main()

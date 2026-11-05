@@ -40,7 +40,7 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Any, Iterable, Mapping, Protocol, Sequence, runtime_checkable
 
-from ..core import models, worktree
+from ..core import models, trace, worktree
 from ..substrate.base import Install
 from ..substrate.opencode import OpencodeSubstrate, compose_prompt
 
@@ -357,6 +357,11 @@ def usage(events_path: Path) -> tuple[float, models.Tokens]:
     )
 
 
+def _choice_attrs(choice: models.ModelChoice) -> dict[str, Any]:
+    """A candidate as it goes into a trace attr; `effort` is kept as it is (it may be None)."""
+    return {"runner": choice.runner, "model": choice.model, "effort": choice.effort}
+
+
 class ExecutorModels:
     """The executor candidates of a model connector, walked per task.
 
@@ -419,6 +424,12 @@ class ExecutorModels:
             self._other_runners[task_id] = len(skipped)
             for choice in skipped:
                 self._skip_row(task_id, choice)
+            trace.event(
+                trace.Kind.MODEL_ROUTE,
+                role="executor",
+                candidates=[_choice_attrs(choice) for choice in runnable],
+                skipped_other_runners=len(skipped),
+            )
         return self._choices[task_id]
 
     def current(self, task_id: str) -> models.ModelChoice:
@@ -443,6 +454,11 @@ class ExecutorModels:
         (a parallel rollout that failed on the same candidate would otherwise skip the
         candidate no one tried); it runs the candidate now current. The read and the move are
         under the lock.
+
+        A MODEL_SWITCH is emitted in exactly two of the branches: right after the position
+        moves (`from` the failed candidate, `to` the next one) and when the candidates are used
+        up (`to` None). No event is emitted when the connector offered nothing or when another
+        rollout already moved the position, because this rollout tries no other candidate.
         """
         with self._lock:
             choices = self._for_task(task_id)
@@ -452,8 +468,20 @@ class ExecutorModels:
             if choices[index] != failed:
                 return True
             if index + 1 >= len(choices):
+                trace.event(
+                    trace.Kind.MODEL_SWITCH,
+                    **{"from": _choice_attrs(failed), "to": None},
+                    role="executor",
+                    reason="",
+                )
                 return False
             self._index[task_id] = index + 1
+            trace.event(
+                trace.Kind.MODEL_SWITCH,
+                **{"from": _choice_attrs(failed), "to": _choice_attrs(choices[index + 1])},
+                role="executor",
+                reason="",
+            )
             return True
 
     def settle(
