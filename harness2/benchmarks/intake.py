@@ -45,6 +45,7 @@ from ..core.proposer import Proposer
 from ..core.spec import BenchPrompts, BenchSpec, ChannelSpec
 from ..substrate.base import Install
 from ..substrate.opencode import OpencodeSubstrate
+from . import intake_worktree
 
 DEFAULT_TIMEOUT = 3600
 REASON_MAX = 2_000
@@ -156,6 +157,11 @@ class IntakeAdapter:
         # rollout that never produced a run leaves no run directory to read, so the reason
         # the task connector receives comes from here (see `_deliverable_dir`).
         self.rollout_errors: dict[str, str] = {}
+        # The run ids this instance launched: `execute` adds one once it is past its
+        # `.complete` shortcut, whether the launch goes on to succeed or raise. Kept in
+        # memory only (a plain `set.add` from the rollouts' threads is enough), because a
+        # run left complete by an earlier process was not launched here.
+        self._launched: set[str] = set()
         # The improver's ModelSession (None unless a model connector runs the improver
         # sessions); its per-task rows go to `models.improver` of summary.json.
         self.improver = improver
@@ -358,6 +364,9 @@ class IntakeAdapter:
         run_dir = self.root / "executions" / run_id
         if (run_dir / ".complete").is_file():
             return run_dir
+        # This instance launches the run from here on (a raise still leaves the events of
+        # the attempt behind), so `rollout_cost_usd` reads its money from those events.
+        self._launched.add(str(run_id))
         if run_dir.exists():
             shutil.rmtree(run_dir)
         workspace = run_dir / "workspace"
@@ -406,6 +415,28 @@ class IntakeAdapter:
                 shutil.rmtree(install.staging_dir, ignore_errors=True)
         (run_dir / ".complete").write_text(run_id + "\n", encoding="utf-8")
         return run_dir
+
+    def rollout_cost_usd(self, run_id: str, run_dir: Path) -> float:
+        """The cost of one rollout this instance launched, from the executor record's files.
+
+        A run this instance did not launch (one whose `.complete` was reused from an earlier
+        process) costs nothing here: that process's record already counted the money, and
+        `ExecutorModels.records_for` has no row for it now, so reading its events again would
+        make the Ledger and the record part. For a launched run the cost sums
+        `events.jsonl` and every archived `events.<n>.jsonl`, as `records_for` does: each
+        attempt was settled from `events.jsonl` before a failed one was archived. A rollout
+        that raised left no run directory with the caller, so its events are read from
+        `executions/<run_id>` under this adapter's root instead. Missing files add nothing.
+        """
+        if str(run_id) not in self._launched:
+            return 0.0
+        path = Path(run_dir)
+        if not path.is_dir():
+            path = self.root / "executions" / run_id
+        total = intake_worktree.usage(path / intake_worktree.EVENTS_NAME)[0]
+        for events in sorted(path.glob("events.*.jsonl")):
+            total += intake_worktree.usage(events)[0]
+        return round(total, 6)
 
     def _output_files(self, run_dir: Path) -> list[tuple[str, Path]]:
         """Regular files under workspace/output/, never through a symbolic link."""

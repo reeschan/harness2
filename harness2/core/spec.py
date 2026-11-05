@@ -21,6 +21,7 @@ adapter). `ChannelSpec` describes the proposer/selector channel, which is indepe
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Protocol, runtime_checkable
@@ -207,7 +208,12 @@ class SubstrateLike(Protocol):
 
 @runtime_checkable
 class BenchmarkAdapter(Protocol):
-    """Implement these and the whole method works. Nothing here is method logic."""
+    """Implement these and the whole method works. Nothing here is method logic.
+
+    Optional, and not part of the protocol above: `rollout_cost_usd(run_id, run_dir) -> float`
+    reports what one rollout cost when the benchmark can know it. `spec.rollout_cost_usd`
+    reads it for the Ledger; an adapter without it reports 0.0.
+    """
 
     spec: BenchSpec
     substrate: SubstrateLike
@@ -258,6 +264,30 @@ class BenchmarkAdapter(Protocol):
         """
 
 
+def rollout_cost_usd(adapter: BenchmarkAdapter, run_id: str, run_dir: Path) -> float:
+    """What one rollout cost, when the adapter can say; 0.0 otherwise.
+
+    The optional adapter method `rollout_cost_usd(run_id, run_dir)` is the source. An
+    exception, a negative value, a non-number (bool included) or a non-finite number all
+    report 0.0, so a broken cost never stops a rollout or a run.
+    """
+    fn = getattr(adapter, "rollout_cost_usd", None)
+    if not callable(fn):
+        return 0.0
+    try:
+        value = fn(run_id, run_dir)
+    except Exception:
+        return 0.0
+    if (
+        isinstance(value, (int, float))
+        and not isinstance(value, bool)
+        and math.isfinite(value)
+        and value >= 0
+    ):
+        return float(value)
+    return 0.0
+
+
 def resolve_prompts(adapter: BenchmarkAdapter, task_id: str) -> BenchPrompts:
     """Return the task-specific prompt profile when the adapter supplies one."""
     fn = getattr(adapter, "prompts_for", None)
@@ -280,6 +310,7 @@ __all__ = [
     "ModelId",
     "resolve_prompts",
     "resolve_channel_model",
+    "rollout_cost_usd",
     "CHANNELS",
     "INSTALL_MODES",
 ]
