@@ -451,5 +451,98 @@ class TraceFlowTests(unittest.TestCase):
         )
 
 
+class ReflectionProposer:
+    """Answers the selector, then fails or answers the reflection on demand."""
+
+    def __init__(self, *, fail=None, text=EXPERIENCE_TEXT):
+        self.fail = fail
+        self.text = text
+
+    def call(self, mission, context_dir, label, **kwargs):
+        if label.startswith("select."):
+            return Reply(label=label, text="```choice\nA\n```", ok=True, cost_usd=0.0)
+        if self.fail is not None:
+            raise ProposerError(self.fail, cost_usd=0.1)
+        return Reply(label=label, text=self.text, ok=True, cost_usd=0.1)
+
+
+class ReflectionErrorTests(unittest.TestCase):
+    """The REFLECTION error says why the reflection gave no experience."""
+
+    def setUp(self):
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        self.root = Path(temporary.name)
+        self.adapter = DemoAdapter(self.root)
+
+    def candidates_for(self, work, label="agg1"):
+        run_dir = work / "runs" / label
+        run_dir.mkdir(parents=True, exist_ok=True)
+        (run_dir / "trajectory.md").write_text(
+            "[ACTION] run scripts/summarize.py\n[OBSERVATION]\nTotal: 85.15\n", encoding="utf-8"
+        )
+        (run_dir / "answer.txt").write_text("Total: 85.15\n", encoding="utf-8")
+        harness = work / "harnesses" / label
+        harness.mkdir(parents=True, exist_ok=True)
+        (harness / "systemprompt.md").write_text("Reconcile the ledger.\n", encoding="utf-8")
+        return {
+            label: RunView(
+                label=label, run_id=f"run-{label}", run_dir=run_dir, ok=True, delivered=True
+            )
+        }
+
+    def reflect(self, proposer, work):
+        candidates = self.candidates_for(work)
+        sink = RecordingSink()
+        tracer = trace.Tracer(sink)
+        self.addCleanup(tracer.close)
+        with trace.use(tracer):
+            sel = selection.run_selection(
+                TASK_ID,
+                1,
+                "agg",
+                candidates,
+                adapter=self.adapter,
+                prop=proposer,
+                work_dir=work,
+            )
+            experience = selection.reflect_adoption(
+                TASK_ID,
+                sel,
+                candidates,
+                adapter=self.adapter,
+                prop=proposer,
+                work_dir=work,
+            )
+        reflected = [
+            event
+            for event in sink.events
+            if event.kind == trace.Kind.REFLECTION and event.attrs.get("phase") == "end"
+        ]
+        self.assertEqual(len(reflected), 1)
+        return experience, reflected[0].attrs
+
+    def test_a_proposer_error_becomes_the_reflection_error(self):
+        experience, attrs = self.reflect(ReflectionProposer(fail="boom"), self.root / "failed")
+        self.assertEqual(experience, {})
+        self.assertFalse(attrs["ok"])
+        self.assertAlmostEqual(attrs["usd"], 0.1)
+        self.assertTrue(attrs["error"].startswith("ProposerError"), attrs["error"])
+        self.assertIn("boom", attrs["error"])
+
+    def test_a_reply_without_an_experience_explains_itself(self):
+        proposer = ReflectionProposer(text="I found nothing worth keeping.\n")
+        experience, attrs = self.reflect(proposer, self.root / "empty")
+        self.assertEqual(experience, {})
+        self.assertFalse(attrs["ok"])
+        self.assertEqual(attrs["error"], "no experience in the reply")
+
+    def test_a_successful_reflection_has_no_error(self):
+        experience, attrs = self.reflect(ReflectionProposer(), self.root / "ok")
+        self.assertTrue(experience)
+        self.assertTrue(attrs["ok"])
+        self.assertEqual(attrs["error"], "")
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -459,6 +459,7 @@ def reflect_adoption(
     `ok` is whether an experience came back, and `error` says why it did not.
     """
     spend_before = sel.usd
+    reasons: list[str] = []
     with trace.span(trace.Kind.REFLECTION, mode=sel.mode) as sp:
         experience = _reflect_adoption(
             task_id,
@@ -468,6 +469,7 @@ def reflect_adoption(
             prop=prop,
             work_dir=work_dir,
             decisions=decisions,
+            reasons=reasons,
         )
         ok = bool(experience)
         if not sel.ok:
@@ -475,7 +477,7 @@ def reflect_adoption(
         elif candidates.get(sel.chosen_label) is None:
             error = "skipped: chosen candidate not in the pool"
         elif not ok:
-            error = "reflection returned no experience"
+            error = reasons[-1] if reasons else "reflection returned no experience"
         else:
             error = ""
         sp.set(
@@ -496,6 +498,7 @@ def _reflect_adoption(
     prop: Proposer,
     work_dir: Path,
     decisions: dict[str, str] | None = None,
+    reasons: list[str] | None = None,
 ) -> dict:
     """Learn from harness edits, decisions, trajectories, and deliverables after adoption."""
     chosen = candidates.get(sel.chosen_label)
@@ -532,7 +535,14 @@ def _reflect_adoption(
     context.assert_no_leak_paths(root, adapter.spec.leak_globs)
     context.assert_no_grader_verdicts(root)
     experience = _distil(
-        task_id, sel, candidates, adapter=adapter, prop=prop, root=root, layout=evidence.layout
+        task_id,
+        sel,
+        candidates,
+        adapter=adapter,
+        prop=prop,
+        root=root,
+        layout=evidence.layout,
+        reasons=reasons,
     )
     sel.experience = experience
     _persist(sel, Path(work_dir) / "selection" / f"{sel.mode}{sel.k}", str(chosen.run_dir))
@@ -549,6 +559,7 @@ def _distil(
     root: Path,
     bp: BenchPrompts | None = None,
     layout: str = "",
+    reasons: list[str] | None = None,
 ) -> dict:
     """Extract a supported lesson from the complete task-local improvement record."""
     mission = "\n\n".join(
@@ -570,6 +581,8 @@ def _distil(
         reply = prop.call(mission, exp_root, f"experience.{sel.mode}{sel.k}")
     except ProposerError as exc:
         sel.usd += exc.cost_usd
+        if reasons is not None:
+            reasons.append(f"ProposerError: {exc}"[:300])
         return {}
     sel.usd += reply.cost_usd
     edits = _EDITS.search(reply.text)
@@ -577,6 +590,8 @@ def _distil(
         (root / "edits.md").write_text(edits.group(1).strip() + "\n", encoding="utf-8")
     m = _EXP.search(reply.text)
     if not m:
+        if reasons is not None:
+            reasons.append("no experience in the reply")
         return {}
     out: dict = {}
     for line in m.group(1).strip().splitlines():
@@ -586,6 +601,8 @@ def _distil(
             if key in ("cue", "lesson", "evidence", "confidence"):
                 out[key] = val.strip()
     if not all(out.get(key) for key in ("cue", "lesson", "evidence")):
+        if reasons is not None:
+            reasons.append("incomplete experience in the reply: missing cue, lesson or evidence")
         return {}
     if edits:
         out["edits"] = edits.group(1).strip()
