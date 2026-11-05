@@ -15,20 +15,27 @@
 """The default trace sink: one JSON object per line in `trace.jsonl`.
 
 `FileSink(root)` appends every event to `root / FILE_NAME`. Each `emit` opens the file in
-append mode, takes an exclusive `fcntl.flock`, writes one `json.dumps(event.to_dict())` line,
-flushes and closes, so events appended by another process (a parallel task) never interleave
-inside a line. `close` does nothing because nothing stays open.
+append mode, takes an exclusive `fcntl.flock`, writes one `json.dumps(..., sort_keys=True,
+ensure_ascii=True)` line, flushes and closes, so events appended by another process (a parallel
+task) never interleave inside a line. `ensure_ascii=True` escapes every character, so a value
+that is not valid UTF-8 on its own (a lone surrogate in a path, for example) is written as an
+escape and can be read back; the file itself stays ASCII. A write that was torn off without a
+final newline gets its newline repaired first, so the next event never joins the broken line.
+`close` does nothing because nothing stays open.
 
 `read(path)` reads a `trace.jsonl` back into events for the grading side and for the graph
-building that comes later; a line that is not a complete event is skipped. The module does not
-import `harness2.core.trace` at the top: `trace` imports this module at its own end to register
-`FileSink`, so importing `harness2.core.trace_file` first must not start a cycle. The type is
-imported only for type checkers, and `read` imports `TraceEvent` when it runs.
+building that comes later; a line that is not a complete event is skipped. It splits the text
+on `"\\n"` only, so the line-separator characters U+2028, U+2029 and U+0085 inside a value do not
+split an event. The module does not import `harness2.core.trace` at the top: `trace` imports this
+module at its own end to register `FileSink`, so importing `harness2.core.trace_file` first must
+not start a cycle. The type is imported only for type checkers, and `read` imports `TraceEvent`
+when it runs.
 """
 
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -46,15 +53,20 @@ class FileSink:
         self.path = self.root / FILE_NAME
 
     def emit(self, event: TraceEvent) -> None:
-        """Append `event` as one line, under an exclusive lock, and flush it to disk."""
+        """Append `event` as one ASCII JSON line under an exclusive lock, repairing a torn line."""
         import fcntl
 
         self.root.mkdir(parents=True, exist_ok=True)
-        line = json.dumps(event.to_dict(), sort_keys=True, ensure_ascii=False)
-        with open(self.path, "a", encoding="utf-8") as handle:
+        line = json.dumps(event.to_dict(), sort_keys=True, ensure_ascii=True) + "\n"
+        with open(self.path, "a+b") as handle:
             fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
             try:
-                handle.write(line + "\n")
+                handle.seek(0, os.SEEK_END)
+                if handle.tell() > 0:
+                    handle.seek(-1, os.SEEK_END)
+                    if handle.read(1) != b"\n":
+                        line = "\n" + line
+                handle.write(line.encode("ascii"))
                 handle.flush()
             finally:
                 fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
@@ -73,7 +85,7 @@ def read(path: Path | str) -> list[TraceEvent]:
 
     text = Path(path).read_text(encoding="utf-8", errors="replace") if Path(path).is_file() else ""
     events: list[TraceEvent] = []
-    for line in text.splitlines():
+    for line in text.split("\n"):
         if not line.strip():
             continue
         try:

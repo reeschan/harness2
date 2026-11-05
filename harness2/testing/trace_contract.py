@@ -17,17 +17,19 @@
 The trace sink contract is described in `harness2.core.trace`: a sink has `emit(event)` for one
 `TraceEvent` and `close()` for the end of the run. A sink must not drop or reorder the events
 the `Tracer` hands it, must accept emission from several threads, and must let `close` be called
-more than once. The `Tracer` does the cleaning, so a sink only ever sees events whose attrs are
+more than once. Every event must be readable no later than the moment `close` returns: a sink
+may buffer events in `emit` (and write them all in `close`), so the tests close the sink before
+they read. The `Tracer` does the cleaning, so a sink only ever sees events whose attrs are
 JSON-ready, with every string longer than `MAX_ATTR_CHARS` already replaced by its sha256. The
 bodies therefore never reach a sink.
 
 - `check_trace_sink(sink)` raises AssertionError when `sink` is not a `TraceSink`, or when
   `emit` or `close` is missing or not callable. The message names the missing or invalid members.
 - `TraceSinkContractTests` is a unittest mixin that runs these checks, and a few more, against
-  the sink your test builds: `check_trace_sink`; events emitted through a `Tracer` are read back
-  in order, with one start and one end event per span; `close` can be called twice; four threads
-  can emit at once and every event arrives with a unique span id; a 600-character attr reaches
-  the sink as `{"sha256": <hex>, "chars": 600}`.
+  the sink your test builds: `check_trace_sink`; the kind, phase and ordinal of every event are
+  read back in the order they were emitted, after `close`, with one start and one end event per
+  span; `close` can be called twice; four threads can emit at once and every event arrives with
+  a unique span id; a 600-character attr reaches the sink as `{"sha256": <hex>, "chars": 600}`.
 - `RecordingSink` keeps every event it receives in `events` (and counts `close` calls), so your
   own tests can inspect what a `Tracer` emitted without writing a file.
 
@@ -100,8 +102,10 @@ class TraceSinkContractTests:
     """A unittest mixin that checks a sink against the trace sink contract.
 
     Subclass it together with `unittest.TestCase` and implement `make_sink(root)`. Each test
-    passes a fresh, empty temporary directory as `root`. Override `read_events` when the sink
-    does not keep `events` and does not write `root / "trace.jsonl"`.
+    passes a fresh, empty temporary directory as `root`. The tests close the sink before they
+    read, so every event must be readable by the time `close` returns; a sink that delivers in
+    `close` is fine. Override `read_events` when the sink does not keep `events` and does not
+    write `root / "trace.jsonl"`.
     """
 
     def make_sink(self, root: Path) -> trace.TraceSink:
@@ -143,16 +147,25 @@ class TraceSinkContractTests:
         sink, root = self._sink()
         tracer = trace.Tracer(sink, run_id="contract")
         self.addCleanup(tracer.close)  # type: ignore[attr-defined]
-        tracer.event(trace.Kind.COST, seq=0)
-        with tracer.span(trace.Kind.TASK):
-            tracer.event(trace.Kind.MEMORY_RECALL, seq=1)
-        tracer.event(trace.Kind.ERROR, seq=2)
+        tracer.event(trace.Kind.COST, n=0)
+        with tracer.span(trace.Kind.TASK, n=1) as span:
+            tracer.event(trace.Kind.MEMORY_RECALL, n=2)
+            span.set(n=3)
+        tracer.event(trace.Kind.ERROR, n=4)
+        tracer.close()
         events = self.read_events(sink, root)
         if any(event.run_id != tracer.run_id for event in events):
             raise AssertionError("every event must carry the tracer's run_id")
-        seqs = [event.attrs.get("seq") for event in events if "seq" in event.attrs]
-        if seqs != [0, 1, 2]:
-            raise AssertionError(f"events must read back in emit order [0, 1, 2], got {seqs!r}")
+        expected = [
+            (trace.Kind.COST, None, 0),
+            (trace.Kind.TASK, "start", 1),
+            (trace.Kind.MEMORY_RECALL, None, 2),
+            (trace.Kind.TASK, "end", 3),
+            (trace.Kind.ERROR, None, 4),
+        ]
+        got = [(event.kind, event.attrs.get("phase"), event.attrs.get("n")) for event in events]
+        if got != expected:
+            raise AssertionError(f"events must read back in emit order {expected!r}, got {got!r}")
         task = [event for event in events if event.kind == trace.Kind.TASK]
         phases = [event.attrs.get("phase") for event in task]
         if phases != ["start", "end"]:
@@ -176,6 +189,7 @@ class TraceSinkContractTests:
 
         with ThreadPoolExecutor(max_workers=_THREADS) as pool:
             list(pool.map(work, range(_THREADS)))
+        tracer.close()
         events = self.read_events(sink, root)
         expected = _THREADS * _PER_THREAD
         if len(events) != expected:
@@ -192,6 +206,7 @@ class TraceSinkContractTests:
         self.addCleanup(tracer.close)  # type: ignore[attr-defined]
         body = "x" * 600
         tracer.event(trace.Kind.ERROR, where="contract", message=body)
+        tracer.close()
         events = self.read_events(sink, root)
         if not events:
             raise AssertionError("the emitted event did not reach the sink")

@@ -55,14 +55,14 @@ for i in range(count):
 """
 
 
-def make_event(tag, index):
+def make_event(tag, index, **attrs):
     return trace.TraceEvent(
         run_id=tag,
         span_id=f"{tag}-{index}",
         parent_id=None,
         kind=trace.Kind.COST,
         ts=_TS,
-        attrs={"i": index},
+        attrs={"i": index, **attrs},
     )
 
 
@@ -74,6 +74,27 @@ class FileSinkContractTest(TraceSinkContractTests, unittest.TestCase):
 class RecordingSinkContractTest(TraceSinkContractTests, unittest.TestCase):
     def make_sink(self, root):
         return RecordingSink(root)
+
+
+class FlushingSink:
+    """A sink that keeps every event in `emit` and delivers them only in `close`."""
+
+    def __init__(self, root=None):
+        self.root = root
+        self.events = []
+        self._pending = []
+
+    def emit(self, event):
+        self._pending.append(event)
+
+    def close(self):
+        self.events.extend(self._pending)
+        self._pending.clear()
+
+
+class FlushingSinkContractTest(TraceSinkContractTests, unittest.TestCase):
+    def make_sink(self, root):
+        return FlushingSink(root)
 
 
 class FileSinkCase(unittest.TestCase):
@@ -126,6 +147,33 @@ class FileSinkTests(FileSinkCase):
             )
         events = read(self.path())
         self.assertEqual([event.attrs.get("i") for event in events], [0, 1])
+
+    def test_read_keeps_line_separator_characters_inside_events(self):
+        sink = FileSink(self.root)
+        values = ["a\u2028b", "a\u2029b", "a\u0085b"]
+        for index, value in enumerate(values):
+            sink.emit(make_event("a", index, x=value))
+        events = read(self.path())
+        self.assertEqual([event.attrs["x"] for event in events], values)
+        self.assertEqual(len(self.path().read_text(encoding="ascii").split("\n")), 4)
+
+    def test_emit_escapes_a_lone_surrogate(self):
+        tracer = trace.Tracer(FileSink(self.root))
+        tracer.event(trace.Kind.TREE_DIFF, files=[{"path": "a\udcff"}])
+        tracer.close()
+        self.assertEqual(tracer.warnings, [])
+        self.path().read_bytes().decode("ascii")
+        events = read(self.path())
+        self.assertEqual(len(events), 1)
+        self.assertEqual(events[0].attrs["files"], [{"path": "a\udcff"}])
+
+    def test_emit_repairs_a_torn_last_line(self):
+        with open(self.path(), "w", encoding="utf-8") as handle:
+            handle.write('{"run_id": "r", "spa')
+        FileSink(self.root).emit(make_event("a", 0))
+        events = read(self.path())
+        self.assertEqual([event.attrs["i"] for event in events], [0])
+        self.assertEqual(len(self.path().read_text(encoding="ascii").split("\n")), 3)
 
     def test_concurrent_appends_from_processes_keep_whole_lines(self):
         writers = ("a", "b", "c")
@@ -185,6 +233,37 @@ class FileSinkTests(FileSinkCase):
             check=True,
         )
         self.assertEqual(result.stdout.strip(), "FileSink")
+
+
+class _ReorderingSink(RecordingSink):
+    """A sink that holds a TASK start back until the next non-TASK event."""
+
+    def __init__(self, root=None):
+        super().__init__(root)
+        self.held = None
+
+    def emit(self, event):
+        if event.kind == trace.Kind.TASK and event.attrs.get("phase") == "start":
+            self.held = event
+            return
+        self.events.append(event)
+        if self.held is not None:
+            self.events.append(self.held)
+            self.held = None
+
+
+class ReorderingSinkTests(unittest.TestCase):
+    def test_a_reordering_sink_fails_the_order_check(self):
+        class Contract(TraceSinkContractTests, unittest.TestCase):
+            def make_sink(self, root):
+                return _ReorderingSink(root)
+
+        case = Contract("test_trace_contract_events_are_read_in_order")
+        try:
+            with self.assertRaises(AssertionError):
+                case.test_trace_contract_events_are_read_in_order()
+        finally:
+            case.doCleanups()
 
 
 class CheckTraceSinkTests(unittest.TestCase):
