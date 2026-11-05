@@ -42,12 +42,16 @@ sequenceDiagram
 
 - **Where.** Each task run directory, the one that holds `summary.json`, gets a `trace.jsonl`.
   A resumed task appends to the same file with a new `run_id`; it never overwrites the file.
-- **Format.** One JSON object per line, UTF-8. The default sink appends each line under an
-  exclusive lock, so events written by another process (a parallel task) never interleave
-  inside a line.
+- **Format.** One JSON object per line. The default sink dumps each event with
+  `sort_keys=True, ensure_ascii=True`, so every non-ASCII character is escaped and the file
+  stays ASCII. It appends each line under an exclusive lock, so events written by another
+  process (a parallel task) never interleave inside a line; if the file's last line does not
+  end with a newline (a write torn off by a crash or a full disk), it writes that newline
+  first, so the next event never joins the broken line.
 - **Reading it.** `harness2.core.trace_file.read` returns the events in file order. A missing
   file reads as an empty list, and a line that is not a complete event (for example, one
-  another process is still writing) is skipped.
+  another process is still writing) is skipped. It splits the text on `\n` only, so a
+  line-separator character inside a value does not split an event.
 
 ```python
 from pathlib import Path
@@ -148,8 +152,10 @@ A trace is metadata, not a copy of the work:
   string longer than 512 characters (`trace.MAX_ATTR_CHARS`) is replaced by
   `{"sha256": <hex>, "chars": <length>}`, including inside nested dicts and lists. A value that
   is not JSON-ready becomes its `str()` (and then follows the same length rule), a non-finite
-  float becomes a string, and nesting deeper than 32 is stringified. Handing over a body by
-  mistake therefore still does not trace it.
+  float becomes a string, and nesting deeper than 32 is stringified. Replacing a long string
+  with its hash is a size-based safety net for big values, not a check for bodies: a string of
+  512 characters or fewer is kept as it is, so the caller must not pass a body. The length
+  rule applies to string values, not to mapping keys.
 - Grading stays out of the method's trace: no scores, verdicts or private criteria. Kinds
   starting with `judge.` (`trace.JUDGE_PREFIX`) are reserved for the grading side. The method
   side never emits one; grading code may append its own events (for example, `judge.score`) to
@@ -166,7 +172,9 @@ written, and `summary.json` records `{"enabled": false}`.
 
 A sink is any object with `emit(event)` for one `TraceEvent` and `close()` for the end of the
 run; that is the `TraceSink` protocol. A sink must hand every event on in the order it receives
-it, accept emission from several threads, and allow `close` to be called more than once.
+it, accept emission from several threads, and allow `close` to be called more than once. The
+contract tests read the events after `close`, so a sink that buffers must make every event
+readable by the time `close` returns.
 
 The name of the sink is `HARNESS2_TRACE_SINK` when set, else the default `file`; harness2 has no
 command-line flag for it. The name is looked up in this order:
@@ -225,7 +233,8 @@ def make_sink(root: Path, **options) -> MySink:
 ```
 
 The `file` sink is the only built-in one. It uses `root / "trace.jsonl"`, opens the file in
-append mode for each event, takes an exclusive lock, writes one line and flushes, so `close`
+append mode for each event, takes an exclusive lock, writes one
+`json.dumps(event.to_dict(), sort_keys=True, ensure_ascii=True)` line and flushes, so `close`
 has nothing to do.
 
 ## When a sink fails
@@ -253,9 +262,11 @@ At the end of the run, `summary.json` gains a `trace` object built by `Tracer.su
 | `events` | How many events reached the sink |
 | `warnings` | The sink and event failures, as above |
 
-With tracing off the whole object is `{"enabled": false}`. A task that resumes keeps the
-`trace` block written by the run that wrote the summary; the resumed run's events go into
-`trace.jsonl` with a new `run_id`, without rewriting that block.
+With tracing off the whole object is `{"enabled": false}`. A resumed task rewrites only the
+`trace` key of the existing `summary.json` with its own values and leaves every other key (for
+example `status`) as it was; the TASK span's end event carries `resumed: true`. While the modes
+run, each mid-run write keeps the old `trace`; the final write replaces it with this run's
+values. The resumed run's events go into `trace.jsonl` with a new `run_id`.
 
 ## Costs and the Ledger
 

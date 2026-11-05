@@ -63,12 +63,12 @@ class TraceEvent:
 | COST | `cost` | point | mode, usd, rollout_usd, session_usd, R, P (タスク終わりにモードごと) |
 | ERROR | `error` | point | where, message |
 
-- `judge.` で始まる種類は採点側のために予約する (`JUDGE_PREFIX = "judge."`)。手法側 (core・benchmarks・cli の run 系) は `judge.*` を出さない。harness2-judge が後で足すときは、`trace.read` で読んだ ROLLOUT の `attrs.run_id` から span を見つけ、その `span_id` を `parent_id` にした `judge.score` などを同じ `run_id` で追記する。この PR では judge 側の実装はしない (形と `read` だけ用意する)。
+- `judge.` で始まる種類は採点側のために予約する (`JUDGE_PREFIX = "judge."`)。手法側 (core・benchmarks・cli の run 系) は `judge.*` を出さない。harness2-judge が後で足すときは、`harness2.core.trace_file.read` で読んだ ROLLOUT の `attrs.run_id` から span を見つけ、その `span_id` を `parent_id` にした `judge.score` などを同じ `run_id` で追記する。この PR では judge 側の実装はしない (形と `read` だけ用意する)。
 
 ### 本文を入れない決まり
 
 - プロンプト・成果物・ハーネスの中身・改善役の返答は入れない。ファイルはパスと sha256 だけ。
-- `Tracer` が attrs を整える: JSON にできない値は `str()`、`MAX_ATTR_CHARS = 512` 文字を超える文字列は `{"sha256": <hex>, "chars": <長さ>}` に置き換える (入れ子の dict / list の中も)。これで誤って本文を渡しても本文は出ない。
+- `Tracer` が attrs を整える: JSON にできない値は `str()`、`MAX_ATTR_CHARS = 512` 文字を超える文字列は `{"sha256": <hex>, "chars": <長さ>}` に置き換える (入れ子の dict / list の中も)。これは大きさで弾く安全網で、本文かどうかを見分けるものではない。512 文字以下の文字列はそのまま残るので、本文は呼ぶ側が渡さない。長さの決まりは文字列の値に当たり、マッピングのキーには当たらない。
 - 採点のスコア・判定・private_criteria は手法側のトレースに入れない。
 
 ### TraceSink と登録
@@ -108,7 +108,7 @@ class Tracer:
 - `span` の中で例外が出たら、終了イベントを `status="error"`・`error="<型>: <メッセージ>"` (512 文字まで) で出して、例外はそのまま投げ直す。
 - スレッドプールに渡す関数は `bind(fn)` で包む (`contextvars.copy_context()` で今の Tracer と span を引き継ぐ)。recursion / schedule の `ThreadPoolExecutor` はこれを使う。
 - シンクの失敗: `emit` が例外を投げたら握りつぶし、`"emit failed: <型>: <メッセージ>"` を `warnings` に足す (同じ文は 1 回だけ、最大 20 件)。`close` の失敗も同じ。シンクを作れなかったとき (`connector_for` の例外) は `Tracer(None)` にして `"sink failed: ..."` を warnings に入れる。
-- `emit` は複数スレッドから呼ばれる。Tracer は `threading.Lock` で emit を直列にする。
+- `emit` は複数スレッドから呼ばれる。Tracer は `threading.RLock` で emit を直列にする。
 - `open_for(task_dir, *, env=None, name=None, options=None) -> Tracer`: 無効なら `Tracer(None)` (summary は `{"enabled": False}`)、有効ならシンクを作って Tracer を返す。
 - `summary()` の形: 有効なら `{"enabled": True, "sink": <名前>, "run_id": ..., "events": <出した数>, "warnings": [...]}`、無効なら `{"enabled": False}`。
 - `digest(data: str | bytes) -> str`: sha256 の hex。
@@ -116,16 +116,16 @@ class Tracer:
 ### file シンク
 
 - `harness2/core/trace_file.py` の `FileSink(root: Path)`。`trace.py` の末尾で `register(DEFAULT, FileSink)` (memory.py の `register(DEFAULT, FileConnector)` と同じ)。
-- 書き先は `root / "trace.jsonl"` (`FILE_NAME`)。`emit` ごとに追記モードで開き、`fcntl.flock(LOCK_EX)` を取り、`json.dumps(event.to_dict(), sort_keys=True, ensure_ascii=False)` の 1 行を書き、flush して閉じる。別プロセス (並列のタスク) からの追記でも行が混ざらない。
+- 書き先は `root / "trace.jsonl"` (`FILE_NAME`)。`emit` ごとに追記モードで開き、`fcntl.flock(LOCK_EX)` を取り、`json.dumps(event.to_dict(), sort_keys=True, ensure_ascii=True)` の 1 行を書き、flush して閉じる。`ensure_ascii=True` はどの文字もエスケープするので、ファイルは ASCII の JSON 行になり、単体で UTF-8 にならない値 (パスに紛れた孤立サロゲートなど) も読み戻せる。前の行が改行で終わっていなければ (クラッシュやディスクの満杯で書き切れなかった場合)、先に改行を書いてからイベントを書く。別プロセス (並列のタスク) からの追記でも行が混ざらない。
 - `close()` は何もしない (毎回開いて閉じるため)。
-- `read(path) -> list[TraceEvent]`: `trace.jsonl` を読む。壊れた行は飛ばす。judge 側と次の PR (実行のグラフ) が使う。
-- 再開 (resume) で同じタスクを回したときは、同じファイルに新しい `run_id` で追記する (上書きしない)。
+- `read(path) -> list[TraceEvent]`: `trace.jsonl` を読む。改行 (`\n`) だけで行を分けるので、値の中の U+2028・U+2029・U+0085 でイベントが分かれることはない。壊れた行は飛ばす。judge 側と次の PR (実行のグラフ) が使う。
+- 再開 (resume) で同じタスクを回したときは、同じファイルに新しい `run_id` で追記する (上書きしない)。再開した実行は、既にある summary.json の `trace` のキーだけを今回の値に書き換え、`status` などほかのキーは変えない (`schedule._write_trace`)。TASK の span は終了のイベントに `resumed=True` を持つ。
 
 ### 仕込み場所
 
 | 場所 | 出すもの |
 |---|---|
-| `core/schedule.py` `run_task` | `open_for(work)` で Tracer を作り `use()` で囲む。TASK の span (再開で summary から復元したときも `resumed=True` で 1 回出す)。ベースのロールアウト (`_roll_bases`) の ROLLOUT (role=`base`)。モードの例外と `res.errors` に足すエラーごとに ERROR。タスクの終わりにモードごとの COST (Ledger の値)。`TaskResult` に `trace: dict` を足し、`to_dict` と `_write_summary` で summary.json の `trace` に入れる (古い summary の `trace` は今回の値で置き換える)。最後に `close()` |
+| `core/schedule.py` `run_task` | `open_for(work)` で Tracer を作り `use()` で囲む。TASK の span (再開で summary から復元したときも `resumed=True` で 1 回出す)。ベースのロールアウト (`_roll_bases`) の ROLLOUT (role=`base`)。モードの例外と `res.errors` に足すエラーごとに ERROR。タスクの終わりにモードごとの COST (Ledger の値)。`TaskResult` に `trace: dict` を足し、`to_dict` と `_write_summary` で summary.json の `trace` に入れる。モードごとの途中の書き込みは古い `trace` を残し、最後の書き込みで今回の値に置き換える。再開した実行は `_write_trace` で `trace` のキーだけを今回の値に書き換え、ほかのキーはそのまま残す。最後に `close()` |
 | `core/recursion.py` | 改善段 1 つごとに STAGE の span (`_run_stage` 相当)。その段の採用したツリーとベースの差分を TREE_DIFF (`harness_tree.diff_summary` かツリーの比較から、パスと sha256 だけ)。候補・最終のロールアウト (`_roll`) の ROLLOUT (role=`candidate` / `final`)。プールに渡す関数は `bind` で包む |
 | `core/selection.py` | `run_selection` / `trivial_selection` の SELECTION、`reflect_adoption` の REFLECTION |
 | `core/memory.py` | モジュール関数 `recall` の MEMORY_RECALL (chars と sha256 のみ。本文は入れない)、`store` の MEMORY_STORE |
@@ -147,7 +147,7 @@ class Tracer:
 
 ### 契約テスト
 
-- `harness2/testing/trace_contract.py`: `check_trace_sink(sink)` (Protocol を満たす・emit と close が呼べる) と `TraceSinkContractTests` (unittest の mixin。`make_sink(root)` を実装させ、emit した順に読めること・close を 2 回呼べること・複数スレッドから emit できること・本文の長い文字列がハッシュになって渡ること、を確かめる)。偽シンク `RecordingSink` (イベントをリストに貯める) を置き、利用者が自分のテストで Tracer の出力を確かめられるようにする。
+- `harness2/testing/trace_contract.py`: `check_trace_sink(sink)` (Protocol を満たす・emit と close が呼べる) と `TraceSinkContractTests` (unittest の mixin。`make_sink(root)` を実装させ、emit した順に読めること・close を 2 回呼べること・複数スレッドから emit できること・本文の長い文字列がハッシュになって渡ること、を確かめる)。契約テストはイベントを `close` のあとに読むので、シンクは遅くとも `close` が返るまでにイベントを読めるようにする。偽シンク `RecordingSink` (イベントをリストに貯める) を置き、利用者が自分のテストで Tracer の出力を確かめられるようにする。
 - jev や特定のソースの名前は、コード・テスト・文書のどこにも入れない。
 
 ## Testing Decisions
