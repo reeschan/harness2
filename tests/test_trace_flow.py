@@ -17,11 +17,13 @@
 import json
 import os
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from harness2.core import schedule, selection, trace
+from harness2.core import recursion, schedule, selection, trace
+from harness2.core.ledger import Ledger
 from harness2.core.proposer import ProposerError, Reply
 from harness2.core.spec import RunView
 from harness2.demo import DemoAdapter, DemoProposer
@@ -62,6 +64,7 @@ class BatchAdapter:
     def __init__(self, dirs, *, fail_label=""):
         self.dirs = dirs
         self.fail_label = fail_label
+        self.cost_dirs = []
 
     def execute_many(self, task_id, harness_dir, run_ids):
         return list(self.dirs)
@@ -72,7 +75,57 @@ class BatchAdapter:
         return True
 
     def rollout_cost_usd(self, run_id, run_dir):
-        return 1.0
+        self.cost_dirs.append(Path(run_dir))
+        return 1.0 if Path(run_dir).exists() else 0.0
+
+
+class DirectoryCostAdapter:
+    """A one-at-a-time adapter that prices a rollout by whether its directory exists."""
+
+    def __init__(self, returned, *, delivered_raises=False):
+        self.returned = Path(returned)
+        self.delivered_raises = delivered_raises
+        self.cost_dirs = []
+
+    def execute(self, task_id, harness_dir, run_id):
+        return self.returned
+
+    def delivered(self, run_dir):
+        if self.delivered_raises:
+            raise RuntimeError("delivered failed")
+        return True
+
+    def rollout_cost_usd(self, run_id, run_dir):
+        self.cost_dirs.append(Path(run_dir))
+        return 1.0 if Path(run_dir).exists() else 0.0
+
+
+class EmittingDirectoryCostAdapter(DirectoryCostAdapter):
+    """Reports a model route while the rollout is still running."""
+
+    def execute(self, task_id, harness_dir, run_id):
+        trace.event(trace.Kind.MODEL_ROUTE, role="executor")
+        time.sleep(0.02)
+        return self.returned
+
+
+class CostDemoAdapter(DemoAdapter):
+    """DemoAdapter with a non-zero rollout price, so a kept Ledger shows in COST."""
+
+    def rollout_cost_usd(self, run_id, run_dir):
+        return 0.5
+
+
+class ExplodingSelector:
+    """Delegates every call but fails the selector with an unexpected error."""
+
+    def __init__(self, inner):
+        self.inner = inner
+
+    def call(self, mission, context_dir, label, **kwargs):
+        if label.startswith("select."):
+            raise RuntimeError("selector exploded")
+        return self.inner.call(mission, context_dir, label, **kwargs)
 
 
 class SingleAdapter:
@@ -414,6 +467,15 @@ class TraceFlowTests(unittest.TestCase):
             sorted(event.span_id for event in starts),
             sorted(event.span_id for event in ends),
         )
+        starts_by_id = {event.span_id: event.attrs for event in starts}
+        ends_by_id = {event.span_id: event.attrs for event in ends}
+        by_run_id = {
+            starts_by_id[span_id]["run_id"]: ends_by_id[span_id] for span_id in starts_by_id
+        }
+        self.assertTrue(by_run_id["r1"]["ok"])
+        self.assertEqual(by_run_id["r1"]["error"], "")
+        self.assertFalse(by_run_id["r2"]["ok"])
+        self.assertEqual(by_run_id["r2"]["error"], "RuntimeError: delivered failed")
 
     def test_both_rollout_paths_trace_the_same_attrs(self):
         batch_first = self.root / "same-r1"
@@ -449,6 +511,172 @@ class TraceFlowTests(unittest.TestCase):
                 "error",
             },
         )
+
+    def test_a_single_base_rollout_span_wraps_the_execution(self):
+        real = self.root / "wrapped"
+        real.mkdir()
+        sink = RecordingSink()
+        tracer = trace.Tracer(sink)
+        self.addCleanup(tracer.close)
+        with trace.use(tracer):
+            schedule._roll_bases(
+                TASK_ID,
+                EmittingDirectoryCostAdapter(real),
+                [("base1", "r1")],
+                self.root / "missing",
+            )
+        route = next(event for event in sink.events if event.kind == trace.Kind.MODEL_ROUTE)
+        start = next(
+            event
+            for event in sink.events
+            if event.kind == trace.Kind.ROLLOUT and event.attrs.get("phase") == "start"
+        )
+        end = next(
+            event
+            for event in sink.events
+            if event.kind == trace.Kind.ROLLOUT and event.attrs.get("phase") == "end"
+        )
+        self.assertEqual(route.parent_id, start.span_id)
+        self.assertGreater(end.attrs["dur_s"], 0.0)
+        self.assertTrue(end.attrs["ok"])
+        self.assertEqual(end.attrs["usd"], 1.0)
+
+    def test_a_single_base_on_a_missing_directory_is_not_ok(self):
+        missing = self.root / "not-there"
+        adapter = DirectoryCostAdapter(missing)
+        rolled = schedule._roll_bases(TASK_ID, adapter, [("base1", "r1")], self.root / "missing")
+        rv = rolled["base1"]
+        self.assertFalse(rv.ok)
+        self.assertFalse(rv.delivered)
+        self.assertEqual(rv.error, "adapter returned a missing run directory")
+        self.assertEqual(rv.cost_usd, 0.0)
+        self.assertEqual(adapter.cost_dirs, [missing])
+
+    def test_a_single_base_failure_is_priced_from_the_returned_directory(self):
+        real = self.root / "priced"
+        real.mkdir()
+        adapter = DirectoryCostAdapter(real, delivered_raises=True)
+        rolled = schedule._roll_bases(TASK_ID, adapter, [("base1", "r1")], self.root / "missing")
+        rv = rolled["base1"]
+        self.assertFalse(rv.ok)
+        self.assertFalse(rv.delivered)
+        self.assertEqual(rv.run_dir, self.root / "missing")
+        self.assertEqual(rv.error, "RuntimeError: delivered failed")
+        self.assertEqual(rv.cost_usd, 1.0)
+        self.assertEqual(adapter.cost_dirs, [real])
+
+    def test_a_recursion_rollout_failure_is_priced_from_the_returned_directory(self):
+        real = self.root / "priced-recursion"
+        real.mkdir()
+        adapter = DirectoryCostAdapter(real, delivered_raises=True)
+        ledger = Ledger("agg", TASK_ID, 1)
+        rv = recursion._roll(
+            adapter, ledger, TASK_ID, "c1", None, lambda label: f"rid-{label}", self.root
+        )
+        self.assertFalse(rv.ok)
+        self.assertEqual(rv.run_dir, self.root / "missing")
+        self.assertEqual(rv.error, "RuntimeError: delivered failed")
+        self.assertEqual(rv.cost_usd, 1.0)
+        self.assertEqual(ledger.rollout_usd, 1.0)
+        self.assertEqual(adapter.cost_dirs, [real])
+
+    def test_a_failed_batch_item_keeps_its_siblings_and_its_cost(self):
+        first = self.root / "item-r1"
+        second = self.root / "item-r2"
+        first.mkdir()
+        second.mkdir()
+        adapter = BatchAdapter([first, second], fail_label="item-r2")
+        rolled = schedule._roll_bases(
+            TASK_ID, adapter, [("base1", "r1"), ("base2", "r2")], self.root / "missing"
+        )
+        self.assertTrue(rolled["base1"].ok)
+        self.assertTrue(rolled["base1"].delivered)
+        self.assertEqual(rolled["base1"].cost_usd, 1.0)
+        self.assertFalse(rolled["base2"].ok)
+        self.assertFalse(rolled["base2"].delivered)
+        self.assertEqual(rolled["base2"].error, "RuntimeError: delivered failed")
+        self.assertEqual(rolled["base2"].run_dir, self.root / "missing")
+        self.assertEqual(rolled["base2"].cost_usd, 1.0)
+        self.assertEqual(adapter.cost_dirs, [first, second])
+
+    def test_a_mode_failure_keeps_its_ledger_and_still_emits_cost(self):
+        adapter = CostDemoAdapter(self.root)
+        proposer = DemoProposer(adapter.spec.channels["proposer"])
+        result = schedule.run_task(
+            TASK_ID,
+            2,
+            adapter=adapter,
+            prop=proposer,
+            runs_root=adapter.spec.runs_root,
+            modes=("agg",),
+            selector_prop=ExplodingSelector(proposer),
+        )
+        self.assertEqual(result.status, "partial")
+        record = result.modes["agg"]
+        self.assertFalse(record["ok"])
+        self.assertEqual(record["error"], "RuntimeError: selector exploded")
+        self.assertTrue(record["traceback"])
+        self.assertEqual(record["ledger"]["usd"], 4.0)
+        costs = [
+            event
+            for event in self.events(2)
+            if event["kind"] == trace.Kind.COST and event["attrs"]["mode"] == "agg"
+        ]
+        self.assertEqual(len(costs), 1)
+        self.assertEqual(costs[0]["attrs"]["usd"], record["ledger"]["usd"])
+        self.assertEqual(costs[0]["attrs"]["R"], record["ledger"]["R"])
+
+    def test_a_midrun_summary_keeps_the_previous_trace(self):
+        work = self.task_dir()
+        work.mkdir(parents=True, exist_ok=True)
+        summary_path = work / "summary.json"
+        old = {"enabled": True, "sink": "file", "run_id": "old", "events": 3, "warnings": []}
+        summary_path.write_text(json.dumps({"status": "running", "modes": {}, "trace": old}))
+        res = schedule.TaskResult(task_id=TASK_ID, domain="accounting", k=1)
+        schedule._write_summary(summary_path, res)
+        self.assertEqual(json.loads(summary_path.read_text())["trace"], old)
+
+        res.trace = {
+            "enabled": True,
+            "sink": "file",
+            "run_id": "new",
+            "events": 5,
+            "warnings": [],
+        }
+        schedule._write_summary(summary_path, res)
+        self.assertEqual(json.loads(summary_path.read_text())["trace"], res.trace)
+
+    def test_a_failed_reflection_still_reports_its_cost(self):
+        work = self.root / "reflection-failure"
+        candidates = self.candidates_for(work)
+        sel = selection.Selection(task_id=TASK_ID, mode="agg", k=1, ok=True, chosen_label="agg1")
+
+        def explode(task_id, selection_record, *args, **kwargs):
+            selection_record.usd += 0.25
+            raise RuntimeError("reflection exploded")
+
+        sink = RecordingSink()
+        tracer = trace.Tracer(sink)
+        self.addCleanup(tracer.close)
+        with trace.use(tracer):
+            with patch.object(selection, "_reflect_adoption", side_effect=explode):
+                with self.assertRaises(RuntimeError):
+                    selection.reflect_adoption(
+                        TASK_ID,
+                        sel,
+                        candidates,
+                        adapter=self.adapter,
+                        prop=object(),
+                        work_dir=work,
+                    )
+        reflected = [
+            event
+            for event in sink.events
+            if event.kind == trace.Kind.REFLECTION and event.attrs.get("phase") == "end"
+        ]
+        self.assertEqual(len(reflected), 1)
+        self.assertEqual(reflected[0].attrs["usd"], 0.25)
+        self.assertEqual(reflected[0].attrs["status"], "error")
 
 
 class ReflectionProposer:

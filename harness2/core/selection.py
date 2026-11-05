@@ -461,16 +461,20 @@ def reflect_adoption(
     spend_before = sel.usd
     reasons: list[str] = []
     with trace.span(trace.Kind.REFLECTION, mode=sel.mode) as sp:
-        experience = _reflect_adoption(
-            task_id,
-            sel,
-            candidates,
-            adapter=adapter,
-            prop=prop,
-            work_dir=work_dir,
-            decisions=decisions,
-            reasons=reasons,
-        )
+        try:
+            experience = _reflect_adoption(
+                task_id,
+                sel,
+                candidates,
+                adapter=adapter,
+                prop=prop,
+                work_dir=work_dir,
+                decisions=decisions,
+                reasons=reasons,
+            )
+        finally:
+            # Always report what the reflection spent, even when it raised.
+            sp.set(usd=sel.usd - spend_before)
         ok = bool(experience)
         if not sel.ok:
             error = "skipped: selection not ok" + (f": {sel.error}" if sel.error else "")
@@ -483,7 +487,6 @@ def reflect_adoption(
         sp.set(
             chosen_label=sel.chosen_label,
             ok=ok,
-            usd=sel.usd - spend_before,
             error=error,
         )
         return experience

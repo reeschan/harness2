@@ -352,6 +352,10 @@ def _write_summary(summary_path: Path, res: TaskResult) -> None:
                 prev_recall.update(merged.get("memory_recall") or {})
                 if prev_recall:
                     merged["memory_recall"] = prev_recall
+                # A mid-run write has no trace yet; keep the previous one until the final
+                # write (which carries this run's summary) replaces it.
+                if "trace" not in merged and "trace" in old:
+                    merged["trace"] = old["trace"]
                 # `models` and `model_connector` are never merged from the old summary:
                 # this write's executor record replaces them (and drops them when empty).
 
@@ -505,14 +509,23 @@ def _resume(
     return True
 
 
-def _dead(adapter: BenchmarkAdapter, label: str, rid: str, dead_dir: Path, error: str) -> RunView:
+def _dead(
+    adapter: BenchmarkAdapter,
+    label: str,
+    rid: str,
+    dead_dir: Path,
+    error: str,
+    *,
+    cost_dir: Path | None = None,
+) -> RunView:
+    """The failed view of a rollout, priced from `cost_dir` when the adapter returned one."""
     return RunView(
         label=label,
         run_id=rid,
         run_dir=dead_dir,
         ok=False,
         delivered=False,
-        cost_usd=rollout_cost_usd(adapter, rid, dead_dir),
+        cost_usd=rollout_cost_usd(adapter, rid, dead_dir if cost_dir is None else cost_dir),
         error=error,
     )
 
@@ -537,6 +550,13 @@ def _roll_bases(
         rolled: dict[str, RunView] = {}
         try:
             dirs = list(execute_many(task_id, None, [rid for _lbl, rid in pending]))
+        except Exception as exc:
+            # The batch call itself failed: no run directory exists for any item.
+            rolled = {
+                label: _dead(adapter, label, rid, dead_dir, f"{type(exc).__name__}: {exc}")
+                for label, rid in pending
+            }
+        else:
             for i, (label, rid) in enumerate(pending):
                 if i >= len(dirs):
                     rv = _dead(
@@ -548,22 +568,28 @@ def _roll_bases(
                     )
                 else:
                     rd = Path(dirs[i])
-                    exists = rd.exists()
-                    rv = RunView(
-                        label=label,
-                        run_id=rid,
-                        run_dir=rd,
-                        ok=exists,
-                        delivered=exists and adapter.delivered(rd),
-                        cost_usd=rollout_cost_usd(adapter, rid, rd),
-                        error="" if exists else "adapter returned a missing run directory",
-                    )
+                    try:
+                        exists = rd.exists()
+                        rv = RunView(
+                            label=label,
+                            run_id=rid,
+                            run_dir=rd,
+                            ok=exists,
+                            delivered=exists and adapter.delivered(rd),
+                            cost_usd=rollout_cost_usd(adapter, rid, rd),
+                            error="" if exists else "adapter returned a missing run directory",
+                        )
+                    except Exception as exc:
+                        # One item's `delivered` failed: only it dies, priced from its dir.
+                        rv = _dead(
+                            adapter,
+                            label,
+                            rid,
+                            dead_dir,
+                            f"{type(exc).__name__}: {exc}",
+                            cost_dir=rd,
+                        )
                 rolled[label] = rv
-        except Exception as exc:
-            rolled = {
-                label: _dead(adapter, label, rid, dead_dir, f"{type(exc).__name__}: {exc}")
-                for label, rid in pending
-            }
         # One ROLLOUT per run_id: decide every RunView first, then emit once, so a failure
         # partway through the batch cannot leave a second span for the same run.
         for rv in rolled.values():
@@ -572,19 +598,30 @@ def _roll_bases(
 
     def _one(label_rid: tuple[str, str]) -> RunView:
         label, rid = label_rid
-        try:
-            rd = adapter.execute(task_id, None, rid)
-            rv = RunView(
-                label=label,
-                run_id=rid,
-                run_dir=rd,
-                ok=True,
-                delivered=adapter.delivered(rd),
-                cost_usd=rollout_cost_usd(adapter, rid, rd),
-            )
-        except Exception as exc:
-            rv = _dead(adapter, label, rid, dead_dir, f"{type(exc).__name__}: {exc}")
-        _trace_rollout(rv, role="base")
+        rd: Path | None = None
+        with trace.span(trace.Kind.ROLLOUT, role="base", mode="", label=label, run_id=rid) as sp:
+            try:
+                rd = adapter.execute(task_id, None, rid)
+                exists = Path(rd).exists()
+                rv = RunView(
+                    label=label,
+                    run_id=rid,
+                    run_dir=rd,
+                    ok=exists,
+                    delivered=exists and adapter.delivered(rd),
+                    cost_usd=rollout_cost_usd(adapter, rid, rd),
+                    error="" if exists else "adapter returned a missing run directory",
+                )
+            except Exception as exc:
+                rv = _dead(
+                    adapter,
+                    label,
+                    rid,
+                    dead_dir,
+                    f"{type(exc).__name__}: {exc}",
+                    cost_dir=rd,
+                )
+            sp.set(ok=rv.ok, delivered=rv.delivered, usd=rv.cost_usd, error=rv.error)
         return rv
 
     if len(pending) == 1:
@@ -896,11 +933,18 @@ def run_task(
                             res=res,
                         )
                     except Exception as exc:
-                        res.modes[mode] = {
+                        failed = {
                             "ok": False,
                             "error": f"{type(exc).__name__}: {exc}",
                             "traceback": traceback.format_exc()[-1500:],
                         }
+                        previous = res.modes.get(mode)
+                        if isinstance(previous, dict):
+                            # Keep the ledger the mode recorded before it failed.
+                            previous.update(failed)
+                            res.modes[mode] = previous
+                        else:
+                            res.modes[mode] = failed
                         message = f"{mode}: {type(exc).__name__}: {exc}"
                         res.errors.append(message)
                         trace.event(trace.Kind.ERROR, where=f"mode:{mode}", message=message)

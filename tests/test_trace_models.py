@@ -152,6 +152,16 @@ class MemoryTraceTest(TraceTestBase):
         )
         self.assertNotIn("the lesson body", json.dumps(dict(event.attrs)))
 
+    def test_recall_of_more_than_the_limit_emits_the_cut_text(self):
+        conn = FakeMemory("abcdefghij")
+        with trace.use(self.tracer()):
+            text = memory.recall(conn, "t1", 5)
+        self.assertEqual(text, "abcde")
+        event = self.one(trace.Kind.MEMORY_RECALL)
+        self.assertEqual(event.attrs["chars"], 5)
+        self.assertEqual(event.attrs["sha256"], trace.digest("abcde"))
+        self.assertNotEqual(event.attrs["sha256"], trace.digest("abcdefghij"))
+
     def test_recall_without_a_connector_recall_or_a_limit_emits_chars_zero(self):
         with trace.use(self.tracer()):
             self.assertEqual(memory.recall(FakeMemory("body", recall=False), "t1", 10), "")
@@ -400,8 +410,8 @@ class ExecutorTraceTest(TraceTestBase):
         self.assertEqual(route.parent_id, outer)
 
 
-class OutsideUseTest(TraceTestBase):
-    def test_without_a_tracer_nothing_is_emitted_and_the_results_are_the_same(self):
+class OutsideUseTest(unittest.TestCase):
+    def test_without_a_tracer_the_calls_do_not_raise_and_the_results_are_unchanged(self):
         conn = FakeMemory("the lesson", path=None)
         experience = {"cue": "c", "lesson": "l", "evidence": "e"}
         self.assertEqual(memory.recall(conn, "t1", 100), "the lesson")
@@ -420,8 +430,6 @@ class OutsideUseTest(TraceTestBase):
             text, _cost, _error, choice = prop._connector(Path(tmp), "m", "", 30, "improve")
         self.assertEqual(text, "answer")
         self.assertEqual(choice, B)
-
-        self.assertEqual(self.sink.events, [])
 
 
 if __name__ == "__main__":

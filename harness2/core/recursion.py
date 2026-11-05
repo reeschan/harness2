@@ -344,6 +344,7 @@ def _roll(
         )
     run_id = run_id_of(label)
     with trace.span(trace.Kind.ROLLOUT, role=role, mode=mode, label=label, run_id=run_id) as sp:
+        rd: Path | None = None
         try:
             rd = adapter.execute(task_id, hdir, run_id)
             exists = Path(rd).exists()
@@ -364,7 +365,7 @@ def _roll(
                 run_dir=dead,
                 ok=False,
                 delivered=False,
-                cost_usd=rollout_cost_usd(adapter, run_id, dead),
+                cost_usd=rollout_cost_usd(adapter, run_id, dead if rd is None else rd),
                 error=f"{type(exc).__name__}: {exc}",
             )
         sp.set(ok=rv.ok, delivered=rv.delivered, usd=rv.cost_usd, error=rv.error)
