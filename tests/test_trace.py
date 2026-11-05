@@ -18,6 +18,7 @@ import hashlib
 import json
 import os
 import tempfile
+import threading
 import time
 import unittest
 from concurrent.futures import ThreadPoolExecutor
@@ -49,8 +50,10 @@ class RecordingSink:
 
 
 def make_sink(root, **options):
-    """A factory in the `factory(root=Path, **options)` shape."""
-    return RecordingSink(root)
+    """A factory in the `factory(root=Path, **options)` shape that keeps its options."""
+    sink = RecordingSink(root)
+    sink.options = options
+    return sink
 
 
 class Unprintable(Exception):
@@ -117,6 +120,35 @@ class TraceEventTests(unittest.TestCase):
     def test_from_dict_without_required_key_raises(self):
         with self.assertRaises(KeyError):
             trace.TraceEvent.from_dict({"span_id": "s"})
+
+    def test_from_dict_keeps_an_attrs_mapping_as_is(self):
+        attrs = {"a": 1}
+        event = trace.TraceEvent.from_dict(
+            {
+                "run_id": "r",
+                "span_id": "s",
+                "parent_id": None,
+                "kind": "k",
+                "ts": "ts",
+                "attrs": attrs,
+            }
+        )
+        self.assertIs(event.attrs, attrs)
+
+    def test_from_dict_with_non_mapping_attrs_raises_type_error(self):
+        for attrs in ([1, 2], "text", 3):
+            with self.subTest(attrs=attrs):
+                with self.assertRaises(TypeError):
+                    trace.TraceEvent.from_dict(
+                        {
+                            "run_id": "r",
+                            "span_id": "s",
+                            "parent_id": None,
+                            "kind": "k",
+                            "ts": "ts",
+                            "attrs": attrs,
+                        }
+                    )
 
     def test_kind_values(self):
         self.assertEqual(trace.Kind.TASK, "task")
@@ -234,6 +266,7 @@ class ConnectorTests(RegistryCase):
         sink = trace.connector_for(self.root, name="rec", env={}, options={"depth": 2})
         self.assertIsInstance(sink, trace.TraceSink)
         self.assertEqual(sink.root, self.root)
+        self.assertEqual(sink.options, {"depth": 2})
 
     def test_name_comes_from_env(self):
         trace.register("rec", make_sink)
@@ -251,6 +284,29 @@ class ConnectorTests(RegistryCase):
         with self.assertRaises(TypeError) as caught:
             trace.connector_for(self.root, name="bad", env={})
         self.assertIn("bad", str(caught.exception))
+
+    def test_result_whose_emit_or_close_is_not_callable_raises_type_error(self):
+        class BadEmit:
+            emit = 1
+
+            def close(self):
+                pass
+
+        class BadClose:
+            def emit(self, event):
+                pass
+
+            close = 1
+
+        for factory in (
+            lambda root, **options: BadEmit(),
+            lambda root, **options: BadClose(),
+        ):
+            with self.subTest(factory=factory):
+                trace.register("half", factory)
+                with self.assertRaises(TypeError) as caught:
+                    trace.connector_for(self.root, name="half", env={})
+                self.assertIn("which is not a TraceSink", str(caught.exception))
 
     def test_unknown_name_raises_value_error(self):
         with self.assertRaises(ValueError):
@@ -509,6 +565,29 @@ class FailureTests(unittest.TestCase):
         self.assertEqual(summary["warnings"], ["emit failed: RuntimeError: boom"])
         tracer.close()
         self.assertIn("close failed: RuntimeError: bye", tracer.warnings)
+
+    def test_sink_can_call_the_tracer_from_emit(self):
+        class ReentrantSink:
+            def __init__(self):
+                self.tracer = None
+                self.summaries = 0
+
+            def emit(self, event):
+                if self.tracer is not None:
+                    self.summaries += 1
+                    self.tracer.summary()
+
+            def close(self):
+                pass
+
+        sink = ReentrantSink()
+        tracer = trace.Tracer(sink, clock=lambda: FIXED)
+        sink.tracer = tracer
+        worker = threading.Thread(target=tracer.event, args=(trace.Kind.ERROR,), daemon=True)
+        worker.start()
+        worker.join(3)
+        self.assertFalse(worker.is_alive())
+        self.assertEqual(sink.summaries, 1)
 
     def test_many_different_failures_stop_at_twenty(self):
         class NoisySink:

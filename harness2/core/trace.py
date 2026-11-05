@@ -19,10 +19,13 @@ parent span, a kind, a UTC timestamp and JSON-ready attributes. A span is two ev
 a `span_id`, one with `phase="start"` and one with `phase="end"`; a one-off occurrence is a
 point event without a `phase`.
 
-The rules keep the bodies out of the trace: prompts, artifacts and harness contents are never
-stored. A file is a path and a sha256, and the `Tracer` replaces any string longer than
-`MAX_ATTR_CHARS` with `{"sha256": <hex>, "chars": <length>}`, including inside nested dicts
-and lists, so handing over a body by mistake still does not trace it.
+The rules keep the bodies out of the trace: prompts, artifacts and harness contents must not
+be stored, and callers are responsible for not passing them. A file is a path and a sha256.
+The `Tracer` replaces any string value longer than `MAX_ATTR_CHARS` with
+`{"sha256": <hex>, "chars": <length>}`, including inside nested dicts and lists. The limit
+applies to string values, not to mapping keys. It is a size-based safety net, not a check for
+bodies: a body of `MAX_ATTR_CHARS` characters or fewer is kept, so the caller must not pass
+one.
 
 A sink is anything with `emit(event)` and `close()`. Sinks are found by name, like the memory
 connectors and the model runners: `connector_name` picks the name (an explicit name, then the
@@ -127,14 +130,19 @@ class TraceEvent:
 
     @classmethod
     def from_dict(cls, d: Mapping) -> TraceEvent:
-        """The event in `d`; missing required keys raise and missing `attrs` is `{}`."""
+        """The event in `d`; a missing `attrs` is `{}` and a non-mapping one raises TypeError."""
+        attrs = d.get("attrs")
+        if attrs is None:
+            attrs = {}
+        elif not isinstance(attrs, Mapping):
+            raise TypeError(f"trace event attrs must be a mapping, not {type(attrs).__name__}")
         return cls(
             run_id=d["run_id"],
             span_id=d["span_id"],
             parent_id=d.get("parent_id"),
             kind=d["kind"],
             ts=d["ts"],
-            attrs=d.get("attrs") or {},
+            attrs=attrs,
         )
 
 
@@ -272,7 +280,7 @@ def connector_for(
             f"trace sink {name!r} options must not set {reserved}; harness2 supplies root itself"
         )
     sink = factory(root=Path(root), **extra)
-    if not isinstance(sink, TraceSink):
+    if not isinstance(sink, TraceSink) or not (callable(sink.emit) and callable(sink.close)):
         raise TypeError(
             f"trace sink {name!r} factory returned {type(sink).__name__}, which is not a TraceSink"
         )
@@ -398,7 +406,7 @@ class Tracer:
         self._sink_name = sink_name
         self._clock = clock or _utcnow
         self.warnings: list[str] = list(warnings)
-        self._lock = threading.Lock()
+        self._lock = threading.RLock()
         self._events = 0
         self._closed = False
 
