@@ -378,6 +378,37 @@ def _write_summary(summary_path: Path, res: TaskResult) -> None:
             fcntl.flock(lf, fcntl.LOCK_UN)
 
 
+def _write_trace(summary_path: Path, trace: dict) -> None:
+    """Replace only the `trace` key of an existing summary, under the summary's flock.
+
+    A resumed run leaves `summary.json` alone (rewriting it would store `status="skipped"`),
+    but its `trace` still describes the earlier run. This rewrites just that key, the same way
+    `_write_summary` does, and does nothing when there is no readable summary to update.
+    """
+    import fcntl
+
+    if not summary_path.is_file():
+        return
+    lock = summary_path.with_suffix(".lock")
+    with open(lock, "w") as lf:
+        fcntl.flock(lf, fcntl.LOCK_EX)
+        try:
+            if not summary_path.is_file():
+                return
+            try:
+                old = json.loads(summary_path.read_text())
+            except (OSError, ValueError):
+                return
+            if not isinstance(old, dict):
+                return
+            old["trace"] = trace
+            tmp = summary_path.with_suffix(".json.tmp")
+            tmp.write_text(json.dumps(old, indent=2, default=str))
+            os.replace(tmp, summary_path)
+        finally:
+            fcntl.flock(lf, fcntl.LOCK_UN)
+
+
 def _resolve_libraries(
     library: memory.MemoryConnector | None,
     libraries: dict[str, memory.MemoryConnector] | None,
@@ -788,8 +819,8 @@ def run_task(
                 k=k,
                 seed=seed,
                 modes=list(modes),
-                resumed=False,
             ) as task_span:
+                task_span.set(resumed=False)
                 if summary_path.is_file() and _resume(
                     summary_path, task_id, k, adapter, runs_root, modes, seed, tag, mode_libs, res
                 ):
@@ -885,7 +916,9 @@ def run_task(
     finally:
         tracer.close()
         res.trace = tracer.summary()
-        if finished and not resumed:
+        if resumed:
+            _write_trace(summary_path, res.trace)
+        elif finished:
             _write_summary(summary_path, res)
 
 

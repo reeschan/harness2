@@ -277,6 +277,7 @@ class TraceFlowTests(unittest.TestCase):
     def test_resume_appends_a_second_run_and_marks_the_task_resumed(self):
         first = self.run_one()
         first_run = first.trace["run_id"]
+        first_summary = self.summary()
         executions = self.adapter.execution_count
         calls = len(self.proposer._calls)
 
@@ -297,12 +298,41 @@ class TraceFlowTests(unittest.TestCase):
         self.assertEqual(len(task_end), 1)
         self.assertTrue(task_end[0]["attrs"]["resumed"])
 
+        task_starts = [
+            event
+            for event in events
+            if event["kind"] == trace.Kind.TASK and event["attrs"].get("phase") == "start"
+        ]
+        self.assertEqual(len(task_starts), 2)
+        for event in task_starts:
+            self.assertNotIn("resumed", event["attrs"])
+        task_ends = {
+            event["run_id"]: event["attrs"]
+            for event in events
+            if event["kind"] == trace.Kind.TASK and event["attrs"].get("phase") == "end"
+        }
+        self.assertFalse(task_ends[first_run]["resumed"])
+        self.assertTrue(task_ends[second.trace["run_id"]]["resumed"])
+
+        summary = self.summary()
+        self.assertEqual(summary["trace"]["run_id"], second.trace["run_id"])
+        self.assertEqual(summary["status"], "ok")
+        for key in ("status", "modes", "selections", "errors"):
+            self.assertEqual(summary[key], first_summary[key], f"resume changed {key}")
+
         third = self.run_one()
         self.assertEqual(third.status, "skipped")
         self.assertEqual(
             (self.adapter.execution_count, len(self.proposer._calls)), (executions, calls)
         )
-        self.assertEqual(self.summary()["trace"]["run_id"], first_run)
+        self.assertEqual(self.summary()["trace"]["run_id"], third.trace["run_id"])
+
+    def test_write_trace_leaves_a_missing_summary_alone(self):
+        work = self.task_dir()
+        work.mkdir(parents=True, exist_ok=True)
+        summary_path = work / "summary.json"
+        schedule._write_trace(summary_path, {"enabled": True, "run_id": "run"})
+        self.assertFalse(summary_path.exists())
 
     def candidate(self, work, label="agg1"):
         run_dir = work / "runs" / label
