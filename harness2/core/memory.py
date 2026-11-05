@@ -43,7 +43,7 @@ import os
 from pathlib import Path
 from typing import Any, Callable, Mapping, Protocol, Sequence, runtime_checkable
 
-from . import context, library
+from . import context, library, trace
 from . import recall as recall_block
 from . import tree as harness_tree
 from .library import Library
@@ -292,13 +292,34 @@ def store(
     An incomplete experience stores nothing and returns None. Otherwise every recall block is
     stripped from the tree, the stripped tree and the experience text are checked for grader
     verdicts, and `conn.add` is called with the stripped tree; its result is returned.
+
+    A MEMORY_STORE event records whether `conn.add` was called (`stored`) and what it returned
+    (`path`), so a connector that stores and returns None is still `stored=True`. Nothing is
+    emitted when the grader-verdict check raises: the exception is the caller's.
     """
     if not library.has_experience(experience):
+        trace.event(
+            trace.Kind.MEMORY_STORE,
+            connector=type(conn).__name__,
+            task_id=task_id,
+            label=label,
+            stored=False,
+            path=None,
+        )
         return None
     harness = recall_block.strip(harness)
     context.assert_tree_has_no_grader_verdicts(harness)
     context.assert_tree_has_no_grader_verdicts({"EXPERIENCE.md": str(experience) + why})
-    return conn.add(task_id, harness, why=why, label=label, run_id=run_id, experience=experience)
+    path = conn.add(task_id, harness, why=why, label=label, run_id=run_id, experience=experience)
+    trace.event(
+        trace.Kind.MEMORY_STORE,
+        connector=type(conn).__name__,
+        task_id=task_id,
+        label=label,
+        stored=True,
+        path=str(path) if path is not None else None,
+    )
+    return path
 
 
 def recall(conn: MemoryConnector, task_id: str, limit_chars: int, *, query: str = "") -> str:
@@ -309,25 +330,37 @@ def recall(conn: MemoryConnector, task_id: str, limit_chars: int, *, query: str 
     the connector's `recall` can take it as a keyword (a `query` parameter or `**kwargs`), so a
     connector with the two-argument form keeps working. A signature that cannot be read is
     treated as not taking a `query`.
+
+    A MEMORY_RECALL event carries the connector, the task, the length and the sha256 of the
+    returned text, and never the text itself; a connector without a recall, or a limit of zero
+    or less, emits it with chars=0.
     """
     fn = getattr(conn, "recall", None)
-    if not callable(fn) or limit_chars <= 0:
-        return ""
-    try:
-        params = inspect.signature(fn).parameters.values()
-    except (TypeError, ValueError):
-        params = ()
-    takes_query = any(p.kind is p.VAR_KEYWORD for p in params)
-    if not takes_query:
-        takes_query = any(
-            p.name == "query" and p.kind in (p.POSITIONAL_OR_KEYWORD, p.KEYWORD_ONLY)
-            for p in params
-        )
-    if takes_query:
-        text = fn(task_id, limit_chars, query=query)
-    else:
-        text = fn(task_id, limit_chars)
-    return (text or "")[:limit_chars]
+    text = ""
+    if callable(fn) and limit_chars > 0:
+        try:
+            params = inspect.signature(fn).parameters.values()
+        except (TypeError, ValueError):
+            params = ()
+        takes_query = any(p.kind is p.VAR_KEYWORD for p in params)
+        if not takes_query:
+            takes_query = any(
+                p.name == "query" and p.kind in (p.POSITIONAL_OR_KEYWORD, p.KEYWORD_ONLY)
+                for p in params
+            )
+        if takes_query:
+            text = fn(task_id, limit_chars, query=query)
+        else:
+            text = fn(task_id, limit_chars)
+        text = (text or "")[:limit_chars]
+    trace.event(
+        trace.Kind.MEMORY_RECALL,
+        connector=type(conn).__name__,
+        task_id=task_id,
+        chars=len(text),
+        sha256=trace.digest(text),
+    )
+    return text
 
 
 register(DEFAULT, FileConnector)

@@ -16,4 +16,5 @@
 
 `harness2.testing.connector_contract` checks that a task connector meets the public task
 connector contract. `harness2.testing.memory_contract` does the same for memory connectors.
+`harness2.testing.trace_contract` does it for trace sinks and includes a recording fake sink.
 """

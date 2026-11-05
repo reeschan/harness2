@@ -104,6 +104,10 @@ core: "harness2.core  ·  the method (benchmark-independent)" {
       height: 170
     }
     selection: "selection\nblind pick of a final\n+ reflection" {class: box}
+    trace: "TraceSink  ·  file (default)\ntrace.jsonl per task\nspans linked by parent_id\npaths + hashes, no bodies\nHARNESS2_TRACE=0 turns it off" {
+      class: box
+      width: 290
+    }
     routes: "ModelConnector  ·  env (default)\nrole → model candidates\nexecutor: model + fallback\nimprover: session (fenced)\njudge: config.ROLES" {
       class: box
       width: 290
@@ -117,6 +121,10 @@ core: "harness2.core  ·  the method (benchmark-independent)" {
     grid-gap: 40
     file: "FileConnector (default)\nfiles under the library root" {class: box}
     plug: "pluggable connector\nentry point · module:Attr" {
+      class: box
+      style.stroke-dash: 4
+    }
+    traceplug: "external trace sink\nentry point · module:Attr" {
       class: box
       style.stroke-dash: 4
     }
@@ -263,6 +271,8 @@ core.outputs.library -> core.task: "guides the next task\n(harnessing-level recu
 core.outputs.library -> core.impls.file: "default" {style.stroke-dash: 4}
 core.outputs.library -> core.impls.plug: "HARNESS2_MEMORY_CONNECTOR\nname, entry point or module:Attr" {style.stroke-dash: 4}
 core.outputs.routes -> core.impls.modelplug: "HARNESS2_MODEL_CONNECTOR\nname, entry point or module:Attr" {style.stroke-dash: 4}
+core.task -> core.outputs.trace: "events" {style.stroke-dash: 4}
+core.outputs.trace -> core.impls.traceplug: "HARNESS2_TRACE_SINK\nname, entry point or module:Attr" {style.stroke-dash: 4}
 
 core -> exec: "rollouts ·\nimprover calls" {style.stroke-width: 3}
 exec.bench -> exec.substrate: "launch rollout"

@@ -27,11 +27,11 @@ from pathlib import Path
 from typing import Callable, Sequence
 
 from .. import config
-from . import context, prompts
+from . import context, prompts, trace
 from . import tree as harness_tree
 from .ledger import Ledger
 from .proposer import Proposer, ProposerError
-from .spec import BenchmarkAdapter, RunView, resolve_prompts
+from .spec import BenchmarkAdapter, RunView, resolve_prompts, rollout_cost_usd
 
 STAGE_ATTEMPTS = 2
 TRANSPORT_ATTEMPTS = config.TRANSPORT_ATTEMPTS
@@ -132,7 +132,73 @@ def _accept_tree(
     return kept, ""
 
 
+def _trace_tree_diff(
+    surface, before: harness_tree.Tree, after: harness_tree.Tree, label: str
+) -> None:
+    """Emit the stage's tree diff as paths and digests only; the contents stay out."""
+    changed = harness_tree.diff_summary(surface, before, after)
+    files = [
+        {"path": path, "sha256": trace.digest(after[path]), "change": "added"}
+        for path in changed["added"]
+    ]
+    files += [
+        {"path": path, "sha256": trace.digest(before[path]), "change": "removed"}
+        for path in changed["removed"]
+    ]
+    files += [
+        {"path": path, "sha256": trace.digest(after[path]), "change": "changed"}
+        for path in changed["modified"]
+    ]
+    trace.event(trace.Kind.TREE_DIFF, label=label, files=files)
+
+
 def _run_stage(
+    *,
+    label: str,
+    dim: str,
+    job: str,
+    fallback: harness_tree.Tree,
+    adapter: BenchmarkAdapter,
+    prop: Proposer,
+    ctx_dir: Path,
+    task_id: str,
+    rollouts: Sequence[RunView],
+    harness_dir: Path | None,
+    library_dir: Path | None,
+    pool: Sequence[tuple[str, Path, RunView | None]] = (),
+    decisions: dict[str, str] | None = None,
+    mode: str = "",
+) -> Stage:
+    """Run one improvement stage inside its STAGE span, tracing the tree it adopted."""
+    with trace.span(trace.Kind.STAGE, label=label, dim=dim, mode=mode) as sp:
+        stage = _run_stage_body(
+            label=label,
+            dim=dim,
+            job=job,
+            fallback=fallback,
+            adapter=adapter,
+            prop=prop,
+            ctx_dir=ctx_dir,
+            task_id=task_id,
+            rollouts=rollouts,
+            harness_dir=harness_dir,
+            library_dir=library_dir,
+            pool=pool,
+            decisions=decisions,
+        )
+        sp.set(
+            kept_base=stage.kept_base,
+            fell_back=stage.fell_back,
+            attempts=stage.attempts,
+            cached=stage.cached,
+            usd=stage.usd,
+            error=stage.error,
+        )
+        _trace_tree_diff(adapter.substrate.surface(), fallback, stage.tree, label)
+        return stage
+
+
+def _run_stage_body(
     *,
     label: str,
     dim: str,
@@ -267,6 +333,8 @@ def _roll(
     work_dir: Path,
     *,
     record: bool = True,
+    role: str = "final",
+    mode: str = "",
 ) -> RunView:
     """Materialise a harness and roll it once. A dead rollout is recorded, never raised."""
     hdir = None
@@ -275,28 +343,34 @@ def _roll(
             adapter.substrate.surface(), tree, work_dir / "harnesses" / label
         )
     run_id = run_id_of(label)
-    try:
-        rd = adapter.execute(task_id, hdir, run_id)
-        exists = Path(rd).exists()
-        rv = RunView(
-            label=label,
-            run_id=run_id,
-            run_dir=rd,
-            ok=exists,
-            delivered=exists and adapter.delivered(rd),
-            error="" if exists else "adapter returned a missing run directory",
-        )
-    except Exception as exc:
-        rv = RunView(
-            label=label,
-            run_id=run_id,
-            run_dir=work_dir / "missing",
-            ok=False,
-            delivered=False,
-            error=f"{type(exc).__name__}: {exc}",
-        )
+    with trace.span(trace.Kind.ROLLOUT, role=role, mode=mode, label=label, run_id=run_id) as sp:
+        rd: Path | None = None
+        try:
+            rd = adapter.execute(task_id, hdir, run_id)
+            exists = Path(rd).exists()
+            rv = RunView(
+                label=label,
+                run_id=run_id,
+                run_dir=rd,
+                ok=exists,
+                delivered=exists and adapter.delivered(rd),
+                cost_usd=rollout_cost_usd(adapter, run_id, rd),
+                error="" if exists else "adapter returned a missing run directory",
+            )
+        except Exception as exc:
+            dead = work_dir / "missing"
+            rv = RunView(
+                label=label,
+                run_id=run_id,
+                run_dir=dead,
+                ok=False,
+                delivered=False,
+                cost_usd=rollout_cost_usd(adapter, run_id, dead if rd is None else rd),
+                error=f"{type(exc).__name__}: {exc}",
+            )
+        sp.set(ok=rv.ok, delivered=rv.delivered, usd=rv.cost_usd, error=rv.error)
     if record:
-        ledger.rollout(label)
+        ledger.rollout(label, rv.cost_usd)
     return rv
 
 
@@ -309,6 +383,8 @@ def _roll_many(
     work_dir: Path,
     *,
     width: int,
+    role: str = "candidate",
+    mode: str = "",
 ) -> dict[str, RunView]:
     """Roll independent harnesses concurrently, then record them in the caller's order.
 
@@ -322,20 +398,40 @@ def _roll_many(
     if n == 1:
         for label, tree in items:
             out[label] = _roll(
-                adapter, ledger, task_id, label, tree, run_id_of, work_dir, record=True
+                adapter,
+                ledger,
+                task_id,
+                label,
+                tree,
+                run_id_of,
+                work_dir,
+                record=True,
+                role=role,
+                mode=mode,
             )
         return out
     with ThreadPoolExecutor(max_workers=n) as pool:
         got = list(
             pool.map(
-                lambda it: _roll(
-                    adapter, ledger, task_id, it[0], it[1], run_id_of, work_dir, record=False
+                trace.bind(
+                    lambda it: _roll(
+                        adapter,
+                        ledger,
+                        task_id,
+                        it[0],
+                        it[1],
+                        run_id_of,
+                        work_dir,
+                        record=False,
+                        role=role,
+                        mode=mode,
+                    )
                 ),
                 items,
             )
         )
     for (label, _tree), rv in zip(items, got):
-        ledger.rollout(label)
+        ledger.rollout(label, rv.cost_usd)
         out[label] = rv
     return out
 
@@ -358,7 +454,7 @@ def run_parallel(
     surface = adapter.substrate.surface()
     ledger = Ledger(mode="agg", task_id=task_id, k=k)
     for r in base:
-        ledger.rollout(r.label)
+        ledger.rollout(r.label, r.cost_usd)
     result = ModeResult(mode="agg", task_id=task_id, k=k, ledger=ledger)
     result.rollouts.update({r.label: r for r in base})
     ctx_dir = work_dir / "context"
@@ -369,18 +465,21 @@ def run_parallel(
     with ThreadPoolExecutor(max_workers=min(len(specs), propose_workers)) as pool_x:
         stages = list(
             pool_x.map(
-                lambda s: _run_stage(
-                    label=s[0],
-                    dim=s[1],
-                    job=prompts.propose(benchmark_prompts, s[1], surface, k=k, index=s[2]),
-                    fallback=base_tree,
-                    adapter=adapter,
-                    prop=prop,
-                    ctx_dir=ctx_dir,
-                    task_id=task_id,
-                    rollouts=base,
-                    harness_dir=base_dir,
-                    library_dir=library_dir,
+                trace.bind(
+                    lambda s: _run_stage(
+                        label=s[0],
+                        dim=s[1],
+                        job=prompts.propose(benchmark_prompts, s[1], surface, k=k, index=s[2]),
+                        fallback=base_tree,
+                        adapter=adapter,
+                        prop=prop,
+                        ctx_dir=ctx_dir,
+                        task_id=task_id,
+                        rollouts=base,
+                        harness_dir=base_dir,
+                        library_dir=library_dir,
+                        mode="agg",
+                    )
                 ),
                 specs,
             )
@@ -398,6 +497,8 @@ def run_parallel(
             run_id_of,
             work_dir,
             width=rollout_workers,
+            role="candidate",
+            mode="agg",
         )
     )
 
@@ -409,20 +510,23 @@ def run_parallel(
     with ThreadPoolExecutor(max_workers=min(len(agg_specs), propose_workers)) as pool_x:
         aggs = list(
             pool_x.map(
-                lambda lbl: _run_stage(
-                    label=lbl,
-                    dim="AGG",
-                    job=prompts.aggregate(benchmark_prompts, surface, k=k, index=int(lbl[3:])),
-                    fallback=base_tree,
-                    adapter=adapter,
-                    prop=prop,
-                    ctx_dir=ctx_dir,
-                    task_id=task_id,
-                    rollouts=base,
-                    harness_dir=base_dir,
-                    library_dir=library_dir,
-                    pool=pool_ev,
-                    decisions={stage.label: stage.notes or stage.error for stage in stages},
+                trace.bind(
+                    lambda lbl: _run_stage(
+                        label=lbl,
+                        dim="AGG",
+                        job=prompts.aggregate(benchmark_prompts, surface, k=k, index=int(lbl[3:])),
+                        fallback=base_tree,
+                        adapter=adapter,
+                        prop=prop,
+                        ctx_dir=ctx_dir,
+                        task_id=task_id,
+                        rollouts=base,
+                        harness_dir=base_dir,
+                        library_dir=library_dir,
+                        pool=pool_ev,
+                        decisions={stage.label: stage.notes or stage.error for stage in stages},
+                        mode="agg",
+                    )
                 ),
                 agg_specs,
             )
@@ -441,6 +545,8 @@ def run_parallel(
             run_id_of,
             work_dir,
             width=rollout_workers,
+            role="final",
+            mode="agg",
         )
     )
 
@@ -467,7 +573,7 @@ def run_sequential(
     surface = adapter.substrate.surface()
     ledger = Ledger(mode="seq", task_id=task_id, k=k)
     for r in base:
-        ledger.rollout(r.label)
+        ledger.rollout(r.label, r.cost_usd)
     result = ModeResult(mode="seq", task_id=task_id, k=k, ledger=ledger)
     result.rollouts.update({r.label: r for r in base})
     ctx_dir = work_dir / "context"
@@ -484,29 +590,32 @@ def run_sequential(
         with ThreadPoolExecutor(max_workers=min(2, propose_workers)) as pool_x:
             stages = list(
                 pool_x.map(
-                    lambda s: _run_stage(
-                        label=s[0],
-                        dim=s[1],
-                        job=prompts.propose(
-                            benchmark_prompts,
-                            s[1],
-                            surface,
-                            k=k,
-                            index=t,
-                            round_t=(t if k > 1 else None),
-                        ),
-                        fallback=current_harness,
-                        adapter=adapter,
-                        prop=prop,
-                        ctx_dir=ctx_dir,
-                        task_id=task_id,
-                        rollouts=base,
-                        harness_dir=current_dir,
-                        library_dir=library_dir,
-                        pool=list(history),
-                        decisions={
-                            stage.label: stage.notes or stage.error for stage in result.stages
-                        },
+                    trace.bind(
+                        lambda s: _run_stage(
+                            label=s[0],
+                            dim=s[1],
+                            job=prompts.propose(
+                                benchmark_prompts,
+                                s[1],
+                                surface,
+                                k=k,
+                                index=t,
+                                round_t=(t if k > 1 else None),
+                            ),
+                            fallback=current_harness,
+                            adapter=adapter,
+                            prop=prop,
+                            ctx_dir=ctx_dir,
+                            task_id=task_id,
+                            rollouts=base,
+                            harness_dir=current_dir,
+                            library_dir=library_dir,
+                            pool=list(history),
+                            decisions={
+                                stage.label: stage.notes or stage.error for stage in result.stages
+                            },
+                            mode="seq",
+                        )
                     ),
                     specs,
                 )
@@ -524,6 +633,8 @@ def run_sequential(
                 run_id_of,
                 work_dir,
                 width=rollout_workers,
+                role="candidate",
+                mode="seq",
             )
         )
 
@@ -552,11 +663,22 @@ def run_sequential(
             library_dir=library_dir,
             pool=round_pool,
             decisions={stage.label: stage.notes or stage.error for stage in result.stages},
+            mode="seq",
         )
         _record_sessions(ledger, [comp])
         result.stages.append(comp)
         result.trees[ck] = comp.tree
-        result.rollouts[ck] = _roll(adapter, ledger, task_id, ck, comp.tree, run_id_of, work_dir)
+        result.rollouts[ck] = _roll(
+            adapter,
+            ledger,
+            task_id,
+            ck,
+            comp.tree,
+            run_id_of,
+            work_dir,
+            role="final",
+            mode="seq",
+        )
 
         history = round_pool + [(ck, work_dir / "harnesses" / ck, result.rollouts[ck])]
         current_harness = comp.tree

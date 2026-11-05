@@ -36,6 +36,7 @@ from pathlib import Path
 from typing import Any
 
 from .. import config
+from . import trace
 from .spec import ChannelSpec
 
 SYSTEM_ARG_MAX = 120_000
@@ -44,6 +45,11 @@ SYSTEM_ARG_MAX = 120_000
 CLAUDE_CLI_TOOLS = "Read,Edit,Write,Glob,Grep"
 # The permission mode of a claude_cli session: edits are accepted without asking.
 CLAUDE_CLI_PERMISSION_MODE = "acceptEdits"
+
+
+def _choice_attrs(choice: Any) -> dict[str, Any]:
+    """A candidate as it goes into a trace attr; `effort` is kept as it is (it may be None)."""
+    return {"runner": choice.runner, "model": choice.model, "effort": choice.effort}
 
 
 MAX_CONCURRENCY = int(config.PROPOSER_CONCURRENCY)
@@ -368,6 +374,10 @@ class Proposer:
         The connector's improver candidates are tried in order. One whose runner has no
         satisfied fence is skipped (and noted); `unavailable` moves on to the next; any other
         failure is this attempt's failure.
+
+        One MODEL_ROUTE records the candidates of this call, one MODEL_FENCE records each
+        skipped candidate without a fence, and one MODEL_SWITCH records each `unavailable`
+        move to the candidate that is actually tried next (None when none is left).
         """
         from . import models
 
@@ -375,9 +385,23 @@ class Proposer:
         assert session is not None
         cost = 0.0
         last = ""
-        for choice in session.candidates():
+        candidates = session.candidates()
+        trace.event(
+            trace.Kind.MODEL_ROUTE,
+            role="improver",
+            candidates=[_choice_attrs(choice) for choice in candidates],
+        )
+        for index, choice in enumerate(candidates):
             if choice.runner not in session.fenced:
                 session.skip(choice, "no fence")
+                trace.event(
+                    trace.Kind.MODEL_FENCE,
+                    role="improver",
+                    fenced=False,
+                    runners=[choice.runner],
+                    problems=["no fence"],
+                    model=choice.model,
+                )
                 continue
             request = models.SessionRequest(
                 cwd=cwd, mission=mission, system=system, wall=wall, label=label, choice=choice
@@ -412,6 +436,19 @@ class Proposer:
                 return res.text, cost, error, choice
             if unavailable:
                 last = error or "unavailable"
+                following = next(
+                    (later for later in candidates[index + 1 :] if later.runner in session.fenced),
+                    None,
+                )
+                trace.event(
+                    trace.Kind.MODEL_SWITCH,
+                    **{
+                        "from": _choice_attrs(choice),
+                        "to": _choice_attrs(following) if following is not None else None,
+                    },
+                    role="improver",
+                    reason=(error or "")[:200],
+                )
                 continue
             return "", cost, error or "session failed", choice
         detail = f": {last}" if last else ""

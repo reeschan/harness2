@@ -34,11 +34,11 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
-from . import library, memory, recursion, runmark, selection
+from . import library, memory, recursion, runmark, selection, trace
 from . import recall as recall_block
 from . import tree as harness_tree
 from .proposer import Proposer
-from .spec import BenchmarkAdapter, RunView
+from .spec import BenchmarkAdapter, RunView, rollout_cost_usd
 
 MODES = ("agg", "seq")
 MODE_NAMES = {"agg": "parallel", "seq": "sequential"}
@@ -249,6 +249,7 @@ class TaskResult:
     memory_recall: dict = field(default_factory=dict)
     models: dict = field(default_factory=dict)
     model_connector: str = ""
+    trace: dict = field(default_factory=dict)
 
     def to_dict(self) -> dict:
         out = {
@@ -271,6 +272,8 @@ class TaskResult:
             out["models"] = self.models
         if self.model_connector:
             out["model_connector"] = self.model_connector
+        if self.trace:
+            out["trace"] = self.trace
         return out
 
 
@@ -349,6 +352,10 @@ def _write_summary(summary_path: Path, res: TaskResult) -> None:
                 prev_recall.update(merged.get("memory_recall") or {})
                 if prev_recall:
                     merged["memory_recall"] = prev_recall
+                # A mid-run write has no trace yet; keep the previous one until the final
+                # write (which carries this run's summary) replaces it.
+                if "trace" not in merged and "trace" in old:
+                    merged["trace"] = old["trace"]
                 # `models` and `model_connector` are never merged from the old summary:
                 # this write's executor record replaces them (and drops them when empty).
 
@@ -370,6 +377,37 @@ def _write_summary(summary_path: Path, res: TaskResult) -> None:
                     merged["status"] = _merged_status(merged)
             tmp = summary_path.with_suffix(".json.tmp")
             tmp.write_text(json.dumps(merged, indent=2, default=str))
+            os.replace(tmp, summary_path)
+        finally:
+            fcntl.flock(lf, fcntl.LOCK_UN)
+
+
+def _write_trace(summary_path: Path, trace: dict) -> None:
+    """Replace only the `trace` key of an existing summary, under the summary's flock.
+
+    A resumed run leaves `summary.json` alone (rewriting it would store `status="skipped"`),
+    but its `trace` still describes the earlier run. This rewrites just that key, the same way
+    `_write_summary` does, and does nothing when there is no readable summary to update.
+    """
+    import fcntl
+
+    if not summary_path.is_file():
+        return
+    lock = summary_path.with_suffix(".lock")
+    with open(lock, "w") as lf:
+        fcntl.flock(lf, fcntl.LOCK_EX)
+        try:
+            if not summary_path.is_file():
+                return
+            try:
+                old = json.loads(summary_path.read_text())
+            except (OSError, ValueError):
+                return
+            if not isinstance(old, dict):
+                return
+            old["trace"] = trace
+            tmp = summary_path.with_suffix(".json.tmp")
+            tmp.write_text(json.dumps(old, indent=2, default=str))
             os.replace(tmp, summary_path)
         finally:
             fcntl.flock(lf, fcntl.LOCK_UN)
@@ -471,10 +509,33 @@ def _resume(
     return True
 
 
-def _dead(label: str, rid: str, dead_dir: Path, error: str) -> RunView:
+def _dead(
+    adapter: BenchmarkAdapter,
+    label: str,
+    rid: str,
+    dead_dir: Path,
+    error: str,
+    *,
+    cost_dir: Path | None = None,
+) -> RunView:
+    """The failed view of a rollout, priced from `cost_dir` when the adapter returned one."""
     return RunView(
-        label=label, run_id=rid, run_dir=dead_dir, ok=False, delivered=False, error=error
+        label=label,
+        run_id=rid,
+        run_dir=dead_dir,
+        ok=False,
+        delivered=False,
+        cost_usd=rollout_cost_usd(adapter, rid, dead_dir if cost_dir is None else cost_dir),
+        error=error,
     )
+
+
+def _trace_rollout(rv: RunView, *, role: str, mode: str = "") -> None:
+    """Emit the ROLLOUT span of an already-finished reference execution."""
+    with trace.span(
+        trace.Kind.ROLLOUT, role=role, mode=mode, label=rv.label, run_id=rv.run_id
+    ) as sp:
+        sp.set(ok=rv.ok, delivered=rv.delivered, usd=rv.cost_usd, error=rv.error)
 
 
 def _roll_bases(
@@ -486,45 +547,89 @@ def _roll_bases(
     rolled: dict[str, RunView] = {}
     execute_many = getattr(adapter, "execute_many", None)
     if len(pending) > 1 and callable(execute_many):
+        rolled: dict[str, RunView] = {}
         try:
             dirs = list(execute_many(task_id, None, [rid for _lbl, rid in pending]))
+        except Exception as exc:
+            # The batch call itself failed: no run directory exists for any item.
+            rolled = {
+                label: _dead(adapter, label, rid, dead_dir, f"{type(exc).__name__}: {exc}")
+                for label, rid in pending
+            }
+        else:
             for i, (label, rid) in enumerate(pending):
                 if i >= len(dirs):
-                    rolled[label] = _dead(
-                        label, rid, dead_dir, "batch adapter returned too few run directories"
+                    rv = _dead(
+                        adapter,
+                        label,
+                        rid,
+                        dead_dir,
+                        "batch adapter returned too few run directories",
                     )
-                    continue
-                rd = Path(dirs[i])
-                exists = rd.exists()
-                rolled[label] = RunView(
+                else:
+                    rd = Path(dirs[i])
+                    try:
+                        exists = rd.exists()
+                        rv = RunView(
+                            label=label,
+                            run_id=rid,
+                            run_dir=rd,
+                            ok=exists,
+                            delivered=exists and adapter.delivered(rd),
+                            cost_usd=rollout_cost_usd(adapter, rid, rd),
+                            error="" if exists else "adapter returned a missing run directory",
+                        )
+                    except Exception as exc:
+                        # One item's `delivered` failed: only it dies, priced from its dir.
+                        rv = _dead(
+                            adapter,
+                            label,
+                            rid,
+                            dead_dir,
+                            f"{type(exc).__name__}: {exc}",
+                            cost_dir=rd,
+                        )
+                rolled[label] = rv
+        # One ROLLOUT per run_id: decide every RunView first, then emit once, so a failure
+        # partway through the batch cannot leave a second span for the same run.
+        for rv in rolled.values():
+            _trace_rollout(rv, role="base")
+        return rolled
+
+    def _one(label_rid: tuple[str, str]) -> RunView:
+        label, rid = label_rid
+        rd: Path | None = None
+        with trace.span(trace.Kind.ROLLOUT, role="base", mode="", label=label, run_id=rid) as sp:
+            try:
+                rd = adapter.execute(task_id, None, rid)
+                exists = Path(rd).exists()
+                rv = RunView(
                     label=label,
                     run_id=rid,
                     run_dir=rd,
                     ok=exists,
                     delivered=exists and adapter.delivered(rd),
+                    cost_usd=rollout_cost_usd(adapter, rid, rd),
                     error="" if exists else "adapter returned a missing run directory",
                 )
-        except Exception as exc:
-            for label, rid in pending:
-                rolled[label] = _dead(label, rid, dead_dir, f"{type(exc).__name__}: {exc}")
-        return rolled
-
-    def _one(label_rid: tuple[str, str]) -> RunView:
-        label, rid = label_rid
-        try:
-            rd = adapter.execute(task_id, None, rid)
-            return RunView(
-                label=label, run_id=rid, run_dir=rd, ok=True, delivered=adapter.delivered(rd)
-            )
-        except Exception as exc:
-            return _dead(label, rid, dead_dir, f"{type(exc).__name__}: {exc}")
+            except Exception as exc:
+                rv = _dead(
+                    adapter,
+                    label,
+                    rid,
+                    dead_dir,
+                    f"{type(exc).__name__}: {exc}",
+                    cost_dir=rd,
+                )
+            sp.set(ok=rv.ok, delivered=rv.delivered, usd=rv.cost_usd, error=rv.error)
+        return rv
 
     if len(pending) == 1:
         rv = _one(pending[0])
         return {rv.label: rv}
     width = min(len(pending), ROLLOUT_PARALLEL)
     with ThreadPoolExecutor(max_workers=max(1, width)) as pool_r:
-        return {rv.label: rv for rv in pool_r.map(_one, pending)}
+        return {rv.label: rv for rv in pool_r.map(trace.bind(_one), pending)}
 
 
 def _sha256(text: str) -> str:
@@ -645,10 +750,14 @@ def _run_one_mode(
         d["harness_fingerprint"] = runmark.fingerprint(work_dir / "harnesses" / sel.chosen_label)
     res.selections[mode] = d
     if not sel.ok:
-        res.errors.append(f"{mode}: selection failed: {sel.error}")
+        message = f"{mode}: selection failed: {sel.error}"
+        res.errors.append(message)
+        trace.event(trace.Kind.ERROR, where=f"selection:{mode}", message=message)
     chosen = candidates.get(sel.chosen_label)
     if sel.ok and chosen is not None and not chosen.delivered:
-        res.errors.append(f"{mode}: selected run {chosen.run_id} produced no deliverable")
+        message = f"{mode}: selected run {chosen.run_id} produced no deliverable"
+        res.errors.append(message)
+        trace.event(trace.Kind.ERROR, where=f"selection:{mode}", message=message)
     if mode_lib is not None and sel.ok:
         memory.store(
             mode_lib,
@@ -659,6 +768,22 @@ def _run_one_mode(
             run_id=sel.chosen_run_id,
             experience=sel.experience,
         )
+
+
+def _trace_cost(mode: str, res: TaskResult) -> None:
+    """Emit the mode's Ledger totals; a mode that failed before a ledger exists emits none."""
+    ledger = (res.modes.get(mode) or {}).get("ledger") or {}
+    if not ledger:
+        return
+    trace.event(
+        trace.Kind.COST,
+        mode=mode,
+        usd=ledger.get("usd"),
+        rollout_usd=ledger.get("rollout_usd"),
+        session_usd=ledger.get("session_usd"),
+        R=ledger.get("R"),
+        P=ledger.get("P"),
+    )
 
 
 def run_task(
@@ -719,88 +844,126 @@ def run_task(
     work.mkdir(parents=True, exist_ok=True)
     summary_path = work / "summary.json"
 
-    if summary_path.is_file() and _resume(
-        summary_path, task_id, k, adapter, runs_root, modes, seed, tag, mode_libs, res
-    ):
-        return res
+    tracer = trace.open_for(work)
+    resumed = False
+    finished = False
+    try:
+        with trace.use(tracer):
+            with trace.span(
+                trace.Kind.TASK,
+                task_id=task_id,
+                domain=domain,
+                k=k,
+                seed=seed,
+                modes=list(modes),
+            ) as task_span:
+                task_span.set(resumed=False)
+                if summary_path.is_file() and _resume(
+                    summary_path, task_id, k, adapter, runs_root, modes, seed, tag, mode_libs, res
+                ):
+                    resumed = True
+                    task_span.set(resumed=True)
+                    return res
 
-    surface = adapter.substrate.surface()
-    base_tree = harness_tree.read_tree(surface, adapter.base_harness())
-    recorded_recall = {}
-    if memory_recall and summary_path.is_file():
-        recorded_recall = dict(_load_old(summary_path).get("memory_recall") or {})
+                surface = adapter.substrate.surface()
+                base_tree = harness_tree.read_tree(surface, adapter.base_harness())
+                recorded_recall = {}
+                if memory_recall and summary_path.is_file():
+                    recorded_recall = dict(_load_old(summary_path).get("memory_recall") or {})
 
-    labels = [f"base{i}" for i in range(1, k + 1)]
-    run_ids = [base_ns.run_id(task_id, label) for label in labels]
+                labels = [f"base{i}" for i in range(1, k + 1)]
+                run_ids = [base_ns.run_id(task_id, label) for label in labels]
 
-    dead_dir = work / "missing"
+                dead_dir = work / "missing"
 
-    pending = list(zip(labels, run_ids))
-    rolled = _roll_bases(task_id, adapter, pending, dead_dir)
-    base: list[RunView] = [rolled[label] for label in labels]
+                pending = list(zip(labels, run_ids))
+                rolled = _roll_bases(task_id, adapter, pending, dead_dir)
+                base: list[RunView] = [rolled[label] for label in labels]
 
-    res.base = [{"label": b.label, "run_id": b.run_id, "run_dir": str(b.run_dir)} for b in base]
-    res.models, res.model_connector = _adapter_models(adapter, task_id)
-    if not any(b.ok for b in base):
-        res.status = "base-failed"
-        res.errors.append("no base rollout produced anything")
-        _write_summary(summary_path, res)
-        return res
+                res.base = [
+                    {"label": b.label, "run_id": b.run_id, "run_dir": str(b.run_dir)} for b in base
+                ]
+                res.models, res.model_connector = _adapter_models(adapter, task_id)
+                if not any(b.ok for b in base):
+                    res.status = "base-failed"
+                    message = "no base rollout produced anything"
+                    res.errors.append(message)
+                    trace.event(trace.Kind.ERROR, where="base", message=message)
+                    _write_summary(summary_path, res)
+                    finished = True
+                    return res
 
-    prompt: str | None = None
-    for mode in modes:
-        n = Namespace(bench, sub, mode, k, seed, tag)
-        try:
-            mode_lib = mode_libs.get(mode)
-            mode_tree = base_tree
-            if memory_recall and mode_lib is not None:
-                recorded = recorded_recall.get(mode)
-                if prompt is None and not recorded:
+                prompt: str | None = None
+                for mode in modes:
+                    n = Namespace(bench, sub, mode, k, seed, tag)
                     try:
-                        prompt = adapter.task_prompt(task_id)
-                    except Exception:
-                        prompt = ""
-                mode_tree = _recall_tree(
-                    mode,
-                    task_id,
-                    surface=surface,
-                    base_tree=base_tree,
-                    mode_lib=mode_lib,
-                    query=prompt or "",
-                    recorded=recorded,
-                    res=res,
-                )
-            _run_one_mode(
-                mode,
-                task_id,
-                k,
-                base,
-                adapter=adapter,
-                prop=prop,
-                selector=selector,
-                n=n,
-                runs_root=runs_root,
-                mode_lib=mode_lib,
-                base_tree=mode_tree,
-                surface=surface,
-                pool_policy=pool_policy,
-                res=res,
-            )
-        except Exception as exc:
-            res.modes[mode] = {
-                "ok": False,
-                "error": f"{type(exc).__name__}: {exc}",
-                "traceback": traceback.format_exc()[-1500:],
-            }
-            res.errors.append(f"{mode}: {type(exc).__name__}: {exc}")
-        res.status = "partial"
-        res.models, res.model_connector = _adapter_models(adapter, task_id)
-        _write_summary(summary_path, res)
+                        mode_lib = mode_libs.get(mode)
+                        mode_tree = base_tree
+                        if memory_recall and mode_lib is not None:
+                            recorded = recorded_recall.get(mode)
+                            if prompt is None and not recorded:
+                                try:
+                                    prompt = adapter.task_prompt(task_id)
+                                except Exception:
+                                    prompt = ""
+                            mode_tree = _recall_tree(
+                                mode,
+                                task_id,
+                                surface=surface,
+                                base_tree=base_tree,
+                                mode_lib=mode_lib,
+                                query=prompt or "",
+                                recorded=recorded,
+                                res=res,
+                            )
+                        _run_one_mode(
+                            mode,
+                            task_id,
+                            k,
+                            base,
+                            adapter=adapter,
+                            prop=prop,
+                            selector=selector,
+                            n=n,
+                            runs_root=runs_root,
+                            mode_lib=mode_lib,
+                            base_tree=mode_tree,
+                            surface=surface,
+                            pool_policy=pool_policy,
+                            res=res,
+                        )
+                    except Exception as exc:
+                        failed = {
+                            "ok": False,
+                            "error": f"{type(exc).__name__}: {exc}",
+                            "traceback": traceback.format_exc()[-1500:],
+                        }
+                        previous = res.modes.get(mode)
+                        if isinstance(previous, dict):
+                            # Keep the ledger the mode recorded before it failed.
+                            previous.update(failed)
+                            res.modes[mode] = previous
+                        else:
+                            res.modes[mode] = failed
+                        message = f"{mode}: {type(exc).__name__}: {exc}"
+                        res.errors.append(message)
+                        trace.event(trace.Kind.ERROR, where=f"mode:{mode}", message=message)
+                    _trace_cost(mode, res)
+                    res.status = "partial"
+                    res.models, res.model_connector = _adapter_models(adapter, task_id)
+                    _write_summary(summary_path, res)
 
-    res.status = _merged_status(res.to_dict())
-    res.models, res.model_connector = _adapter_models(adapter, task_id)
-    _write_summary(summary_path, res)
-    return res
+                res.status = _merged_status(res.to_dict())
+                res.models, res.model_connector = _adapter_models(adapter, task_id)
+                finished = True
+                return res
+    finally:
+        tracer.close()
+        res.trace = tracer.summary()
+        if resumed:
+            _write_trace(summary_path, res.trace)
+        elif finished:
+            _write_summary(summary_path, res)
 
 
 def _close_libraries(libs: Mapping[str, memory.MemoryConnector], *, suppress: bool) -> None:

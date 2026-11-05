@@ -25,7 +25,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Sequence, TypeVar
 
-from . import context
+from . import context, trace
 from . import prompts as P
 from .proposer import Proposer, ProposerError
 from .spec import BenchmarkAdapter, BenchPrompts, RunView, resolve_prompts
@@ -276,6 +276,33 @@ def run_selection(
     work_dir: Path,
     pool_kind: str = "mixed",
 ) -> Selection:
+    """Run the selector inside its SELECTION span and record the outcome."""
+    with trace.span(trace.Kind.SELECTION, mode=mode, pool=sorted(candidates)) as sp:
+        sel = _run_selection(
+            task_id,
+            k,
+            mode,
+            candidates,
+            adapter=adapter,
+            prop=prop,
+            work_dir=work_dir,
+            pool_kind=pool_kind,
+        )
+        sp.set(chosen_label=sel.chosen_label, ok=sel.ok, usd=sel.usd, error=sel.error)
+        return sel
+
+
+def _run_selection(
+    task_id: str,
+    k: int,
+    mode: str,
+    candidates: dict[str, RunView],
+    *,
+    adapter: BenchmarkAdapter,
+    prop: Proposer,
+    work_dir: Path,
+    pool_kind: str = "mixed",
+) -> Selection:
     """Pick one output. A selector failure falls back to a delivered base and never raises;
     an adapter bug does raise, because it is a bug and not a selection outcome.
 
@@ -366,6 +393,22 @@ def trivial_selection(
     adapter: BenchmarkAdapter,
     work_dir: Path,
 ) -> Selection:
+    """Deliver the single k=1 final inside its SELECTION span."""
+    with trace.span(trace.Kind.SELECTION, mode=mode, pool=sorted(candidates)) as sp:
+        sel = _trivial_selection(task_id, k, mode, candidates, adapter=adapter, work_dir=work_dir)
+        sp.set(chosen_label=sel.chosen_label, ok=sel.ok, usd=sel.usd, error=sel.error)
+        return sel
+
+
+def _trivial_selection(
+    task_id: str,
+    k: int,
+    mode: str,
+    candidates: dict[str, RunView],
+    *,
+    adapter: BenchmarkAdapter,
+    work_dir: Path,
+) -> Selection:
     """Deliver the single k=1 final without a selector session.
 
     The same non-answer drop rules apply, and the record is written with the standard
@@ -409,6 +452,57 @@ def reflect_adoption(
     work_dir: Path,
     decisions: dict[str, str] | None = None,
 ) -> dict:
+    """Run the adoption reflection inside its REFLECTION span.
+
+    The span reports only what the reflection itself spent and did: `usd` is the rise in
+    `sel.usd` during the call (the selection's own cost is already on its SELECTION span),
+    `ok` is whether an experience came back, and `error` says why it did not.
+    """
+    spend_before = sel.usd
+    reasons: list[str] = []
+    with trace.span(trace.Kind.REFLECTION, mode=sel.mode) as sp:
+        try:
+            experience = _reflect_adoption(
+                task_id,
+                sel,
+                candidates,
+                adapter=adapter,
+                prop=prop,
+                work_dir=work_dir,
+                decisions=decisions,
+                reasons=reasons,
+            )
+        finally:
+            # Always report what the reflection spent, even when it raised.
+            sp.set(usd=sel.usd - spend_before)
+        ok = bool(experience)
+        if not sel.ok:
+            error = "skipped: selection not ok" + (f": {sel.error}" if sel.error else "")
+        elif candidates.get(sel.chosen_label) is None:
+            error = "skipped: chosen candidate not in the pool"
+        elif not ok:
+            error = reasons[-1] if reasons else "reflection returned no experience"
+        else:
+            error = ""
+        sp.set(
+            chosen_label=sel.chosen_label,
+            ok=ok,
+            error=error,
+        )
+        return experience
+
+
+def _reflect_adoption(
+    task_id: str,
+    sel: Selection,
+    candidates: dict[str, RunView],
+    *,
+    adapter: BenchmarkAdapter,
+    prop: Proposer,
+    work_dir: Path,
+    decisions: dict[str, str] | None = None,
+    reasons: list[str] | None = None,
+) -> dict:
     """Learn from harness edits, decisions, trajectories, and deliverables after adoption."""
     chosen = candidates.get(sel.chosen_label)
     if not sel.ok or chosen is None:
@@ -444,7 +538,14 @@ def reflect_adoption(
     context.assert_no_leak_paths(root, adapter.spec.leak_globs)
     context.assert_no_grader_verdicts(root)
     experience = _distil(
-        task_id, sel, candidates, adapter=adapter, prop=prop, root=root, layout=evidence.layout
+        task_id,
+        sel,
+        candidates,
+        adapter=adapter,
+        prop=prop,
+        root=root,
+        layout=evidence.layout,
+        reasons=reasons,
     )
     sel.experience = experience
     _persist(sel, Path(work_dir) / "selection" / f"{sel.mode}{sel.k}", str(chosen.run_dir))
@@ -461,6 +562,7 @@ def _distil(
     root: Path,
     bp: BenchPrompts | None = None,
     layout: str = "",
+    reasons: list[str] | None = None,
 ) -> dict:
     """Extract a supported lesson from the complete task-local improvement record."""
     mission = "\n\n".join(
@@ -482,6 +584,8 @@ def _distil(
         reply = prop.call(mission, exp_root, f"experience.{sel.mode}{sel.k}")
     except ProposerError as exc:
         sel.usd += exc.cost_usd
+        if reasons is not None:
+            reasons.append(f"ProposerError: {exc}"[:300])
         return {}
     sel.usd += reply.cost_usd
     edits = _EDITS.search(reply.text)
@@ -489,6 +593,8 @@ def _distil(
         (root / "edits.md").write_text(edits.group(1).strip() + "\n", encoding="utf-8")
     m = _EXP.search(reply.text)
     if not m:
+        if reasons is not None:
+            reasons.append("no experience in the reply")
         return {}
     out: dict = {}
     for line in m.group(1).strip().splitlines():
@@ -498,6 +604,8 @@ def _distil(
             if key in ("cue", "lesson", "evidence", "confidence"):
                 out[key] = val.strip()
     if not all(out.get(key) for key in ("cue", "lesson", "evidence")):
+        if reasons is not None:
+            reasons.append("incomplete experience in the reply: missing cue, lesson or evidence")
         return {}
     if edits:
         out["edits"] = edits.group(1).strip()
