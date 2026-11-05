@@ -268,23 +268,26 @@ def rollout_cost_usd(adapter: BenchmarkAdapter, run_id: str, run_dir: Path) -> f
     """What one rollout cost, when the adapter can say; 0.0 otherwise.
 
     The optional adapter method `rollout_cost_usd(run_id, run_dir)` is the source. An
-    exception, a negative value, a non-number (bool included) or a non-finite number all
-    report 0.0, so a broken cost never stops a rollout or a run.
+    exception, a negative value, a non-number (bool included) or a non-finite number (an
+    int too large for a float included) all report 0.0, so a broken cost never stops a
+    rollout or a run.
     """
     fn = getattr(adapter, "rollout_cost_usd", None)
     if not callable(fn):
         return 0.0
     try:
         value = fn(run_id, run_dir)
+        if (
+            isinstance(value, (int, float))
+            and not isinstance(value, bool)
+            and math.isfinite(value)
+            and value >= 0
+        ):
+            return float(value)
     except Exception:
+        # The check and the conversion themselves can raise (an int too big for a float
+        # overflows `math.isfinite`); a broken cost is 0.0, never a stopped rollout.
         return 0.0
-    if (
-        isinstance(value, (int, float))
-        and not isinstance(value, bool)
-        and math.isfinite(value)
-        and value >= 0
-    ):
-        return float(value)
     return 0.0
 
 

@@ -53,6 +53,11 @@ class RolloutCostUsdTest(unittest.TestCase):
                 got = spec.rollout_cost_usd(FixedCostAdapter(value), "r1", Path("run"))
                 self.assertEqual(got, 0.0)
 
+    def test_an_int_too_large_for_a_float_costs_nothing(self):
+        # `math.isfinite(10**400)` raises OverflowError if the check runs outside the try.
+        got = spec.rollout_cost_usd(FixedCostAdapter(10**400), "r1", Path("run"))
+        self.assertEqual(got, 0.0)
+
     def test_an_exception_costs_nothing(self):
         adapter = FixedCostAdapter(RuntimeError("events.jsonl is unreadable"))
         self.assertEqual(spec.rollout_cost_usd(adapter, "r1", Path("run")), 0.0)
