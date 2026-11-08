@@ -148,9 +148,17 @@ class MemoryTraceTest(TraceTestBase):
                 "task_id": "t1",
                 "chars": len(text),
                 "sha256": hashlib.sha256(text.encode("utf-8")).hexdigest(),
+                "mode": "",
             },
         )
         self.assertNotIn("the lesson body", json.dumps(dict(event.attrs)))
+
+    def test_recall_records_the_mode_it_is_given(self):
+        conn = FakeMemory("the lesson body")
+        with trace.use(self.tracer()):
+            memory.recall(conn, "t1", 100, mode="agg")
+        event = self.one(trace.Kind.MEMORY_RECALL)
+        self.assertEqual(event.attrs["mode"], "agg")
 
     def test_recall_of_more_than_the_limit_emits_the_cut_text(self):
         conn = FakeMemory("abcdefghij")
@@ -193,8 +201,22 @@ class MemoryTraceTest(TraceTestBase):
                 "label": "improve",
                 "stored": True,
                 "path": str(path),
+                "mode": "",
             },
         )
+
+    def test_store_records_the_mode_it_is_given(self):
+        conn = FakeMemory(path=None)
+        with trace.use(self.tracer()):
+            memory.store(
+                conn,
+                "t1",
+                {"HARNESS.md": "body"},
+                experience={"cue": "c", "lesson": "l", "evidence": "e"},
+                mode="seq",
+            )
+        event = self.one(trace.Kind.MEMORY_STORE)
+        self.assertEqual(event.attrs["mode"], "seq")
 
     def test_store_is_stored_true_even_when_the_connector_returns_none(self):
         conn = FakeMemory(path=None)
@@ -219,6 +241,7 @@ class MemoryTraceTest(TraceTestBase):
         event = self.one(trace.Kind.MEMORY_STORE)
         self.assertIs(event.attrs["stored"], False)
         self.assertIsNone(event.attrs["path"])
+        self.assertEqual(event.attrs["mode"], "")
 
     def test_a_grader_verdict_stops_the_store_before_the_event(self):
         conn = FakeMemory()
@@ -270,7 +293,11 @@ class ImproverTraceTest(TraceTestBase):
         self.assertEqual(switch.attrs["role"], "improver")
         self.assertEqual(dict(switch.attrs["from"]), choice_attrs(A))
         self.assertEqual(dict(switch.attrs["to"]), choice_attrs(B))
-        self.assertEqual(switch.attrs["reason"], "rate limited")
+        self.assertEqual(
+            switch.attrs["reason"],
+            f"sha256={trace.digest('rate limited')} chars=12",
+        )
+        self.assertNotIn("rate limited", switch.attrs["reason"])
 
     def test_each_connector_call_emits_one_route(self):
         _conn, prop = self.connector([A], [OK, OK])
@@ -301,6 +328,16 @@ class ImproverTraceTest(TraceTestBase):
         self.assertIsNone(choice)
         switch = self.one(trace.Kind.MODEL_SWITCH)
         self.assertIsNone(switch.attrs["to"])
+
+    def test_a_switch_without_an_error_text_has_an_empty_reason(self):
+        gone = models.SessionResult(text="", ok=False, unavailable=True, error="")
+        conn, prop = self.connector([A], [gone])
+        with trace.use(self.tracer()):
+            text, _cost, _error, choice = self.run_connector(prop)
+        self.assertEqual(text, "")
+        self.assertIsNone(choice)
+        switch = self.one(trace.Kind.MODEL_SWITCH)
+        self.assertEqual(switch.attrs["reason"], "")
 
     def test_a_candidate_without_a_fence_emits_fence(self):
         other = models.ModelChoice("opencode", "prov/x")

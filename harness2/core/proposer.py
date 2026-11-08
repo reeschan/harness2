@@ -440,6 +440,7 @@ class Proposer:
                     (later for later in candidates[index + 1 :] if later.runner in session.fenced),
                     None,
                 )
+                text = error or ""
                 trace.event(
                     trace.Kind.MODEL_SWITCH,
                     **{
@@ -447,7 +448,7 @@ class Proposer:
                         "to": _choice_attrs(following) if following is not None else None,
                     },
                     role="improver",
-                    reason=(error or "")[:200],
+                    reason=f"sha256={trace.digest(text)} chars={len(text)}" if text else "",
                 )
                 continue
             return "", cost, error or "session failed", choice
@@ -501,7 +502,10 @@ class Proposer:
         text = str(payload.get("result") or payload.get("text") or "")
         err = ""
         if payload.get("is_error") or payload.get("subtype") not in (None, "success"):
-            err = f"CLI error: {payload.get('subtype')} {str(text)[:200]}"
+            err = (
+                f"CLI error: {payload.get('subtype')} reply sha256={trace.digest(text)} "
+                f"chars={len(text)}"
+            )
             text = ""
         elif p.returncode != 0 and not text.strip():
             err = f"rc={p.returncode}: {(p.stderr or '')[-300:]}"

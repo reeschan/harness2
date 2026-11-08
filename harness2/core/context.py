@@ -35,6 +35,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Mapping, Sequence
 
+from . import trace
 from . import tree as harness_tree
 from .spec import BenchmarkAdapter, RunView
 
@@ -482,11 +483,13 @@ def assert_no_grader_verdicts(
         for m in markers:
             if m in body:
                 where = body.index(m)
+                excerpt = body[max(0, where - 60) : where + 120]
                 raise ValueError(
                     f"grader verdict would enter model context: {rel!r} contains marker {m!r} "
-                    f"at offset {where} ({body[max(0, where - 60) : where + 120]!r}). The "
-                    f"tripwire in core.context fired -- this is a leak, not a false positive "
-                    f"to widen around. Find the read path that produced it."
+                    f"at offset {where} (excerpt sha256={trace.digest(excerpt)} "
+                    f"chars={len(excerpt)}). The tripwire in core.context fired -- this is a "
+                    f"leak, not a false positive to widen around. Find the read path that "
+                    f"produced it."
                 )
 
 
@@ -510,11 +513,12 @@ def assert_tree_has_no_grader_verdicts(
         for m in markers:
             if m in body:
                 where = body.index(m)
+                excerpt = body[max(0, where - 60) : where + 120]
                 raise ValueError(
                     f"harness file {rel!r} contains grader-verdict marker {m!r} at offset "
-                    f"{where} ({body[max(0, where - 60) : where + 120]!r}); remove or rename "
-                    f"that string -- files carrying it cannot be served as evidence to later "
-                    f"tasks"
+                    f"{where} (excerpt sha256={trace.digest(excerpt)} chars={len(excerpt)}); "
+                    f"remove or rename that string -- files carrying it cannot be served as "
+                    f"evidence to later tasks"
                 )
 
 
