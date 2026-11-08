@@ -17,10 +17,11 @@
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 
-from harness2.core import evaluate, graph, trace
+from harness2.core import evalgraph, evaluate, graph, trace
 from harness2.core.evaluate import EvalRequest, Severity
 from harness2.core.trace_file import FILE_NAME, FileSink
 from harness2.evaluators.rules import RulesEvaluator
@@ -207,6 +208,32 @@ def make_two_mode_summary(*, ledger_usd=4.0, models_usd=7.0):
     }
 
 
+def emit_requested_modes(*, modes=("agg", "seq"), ran=("agg",), resumed=False):
+    """A k=1 task that asked for `modes` but traced only `ran`, as a killed process leaves it."""
+
+    def body():
+        with trace.span(trace.Kind.TASK, task_id="task-1", k=1, modes=list(modes)) as task_span:
+            task_span.set(resumed=resumed)
+            with trace.span(trace.Kind.ROLLOUT, role="base", mode="", label="base0") as base:
+                base.set(usd=1.0)
+            for mode in ran:
+                with trace.span(trace.Kind.MODE, mode=mode):
+                    for index in range(2):
+                        with trace.span(
+                            trace.Kind.ROLLOUT, role="candidate", mode=mode, label=f"c{index}"
+                        ):
+                            pass
+                    with trace.span(trace.Kind.ROLLOUT, role="final", mode=mode, label="f0"):
+                        pass
+                    for index in range(3):
+                        with trace.span(
+                            trace.Kind.STAGE, label=f"{mode}{index}", dim="compose", mode=mode
+                        ) as stage:
+                            stage.set(attempts=1, fell_back=False, error="")
+
+    return body
+
+
 class RulesTestCase(unittest.TestCase):
     def setUp(self):
         self._tmp = tempfile.TemporaryDirectory()
@@ -275,7 +302,8 @@ class BudgetTests(RulesTestCase):
         )
         findings = self.evaluator.evaluate(request)
         self.assertEqual(len(findings), 1)
-        self.assertEqual(findings[0].key, "rules:budget:ledger:task-1:agg")
+        path = next(iter(request.summaries))
+        self.assertEqual(findings[0].key, f"rules:budget:ledger:task-1:{path}:agg")
 
     def test_a_resumed_mode_is_not_counted(self):
         def body():
@@ -285,6 +313,88 @@ class BudgetTests(RulesTestCase):
 
         summary = {"task_id": "task-1", "k": 1, "modes": {}}
         self.assertEqual(self.findings([("run-1", body, summary)]), [])
+
+    def test_a_ledger_count_that_is_not_an_int_is_major(self):
+        summary = make_summary()
+        summary["modes"]["agg"]["ledger"]["R"] = "4"
+        findings = self.findings([("run-1", emit_task(), summary)])
+        self.assertEqual(len(findings), 1)
+        self.assertEqual(findings[0].viewpoint, "budget")
+        self.assertEqual(findings[0].severity, Severity.MAJOR)
+        self.assertIn("ledger", findings[0].key)
+
+    def test_a_ledger_missing_a_count_is_major(self):
+        summary = make_summary()
+        del summary["modes"]["agg"]["ledger"]["expected_P"]
+        findings = self.findings([("run-1", emit_task(), summary)])
+        self.assertEqual(len(findings), 1)
+        self.assertIn("ledger", findings[0].key)
+        self.assertIn("expected_P", findings[0].claim)
+
+    def test_a_ledger_without_k_but_with_a_string_count_is_major(self):
+        def body():
+            with trace.span(trace.Kind.TASK, task_id="task-1"):
+                with trace.span(trace.Kind.MODE, mode="agg"):
+                    pass
+
+        summary = {
+            "task_id": "task-1",
+            "modes": {
+                "agg": {"ledger": {"R": "4", "P": "3", "expected_R": "4", "expected_P": "3"}}
+            },
+        }
+        findings = self.findings([("run-1", body, summary)])
+        self.assertEqual([finding.viewpoint for finding in findings], ["budget"])
+        self.assertEqual(findings[0].severity, Severity.MAJOR)
+
+    def test_a_requested_mode_with_no_span_and_no_ledger_is_major(self):
+        summary = make_summary()
+        findings = self.findings([("run-1", emit_requested_modes(), summary)])
+        self.assertEqual(len(findings), 1)
+        self.assertEqual(findings[0].viewpoint, "budget")
+        self.assertEqual(findings[0].severity, Severity.MAJOR)
+        self.assertIn(":missing:", findings[0].key)
+        self.assertIn("seq", findings[0].claim)
+
+    def test_a_requested_mode_with_a_ledger_is_quiet(self):
+        summary = make_two_mode_summary()
+        findings = self.findings([("run-1", emit_requested_modes(), summary)])
+        self.assertEqual(findings, [])
+
+    def test_a_resumed_task_is_not_checked_for_a_missing_mode(self):
+        summary = make_summary()
+        findings = self.findings([("run-1", emit_requested_modes(resumed=True), summary)])
+        self.assertEqual(findings, [])
+
+
+class LegacySummaryTests(RulesTestCase):
+    def test_a_ledger_under_arms_is_checked(self):
+        summary = make_summary()
+        summary["modes"]["agg"]["ledger"]["R"] = 3
+        summary["arms"] = summary.pop("modes")
+        findings = self.findings([("run-1", emit_task(), summary)])
+        self.assertEqual(len(findings), 1)
+        self.assertEqual(findings[0].viewpoint, "budget")
+        self.assertIn("ledger", findings[0].key)
+
+    def test_the_cost_of_a_summary_under_arms_is_checked(self):
+        summary = make_summary()
+        summary["modes"]["agg"]["ledger"]["rollout_usd"] = 0.0
+        summary["arms"] = summary.pop("modes")
+        findings = self.findings([("run-1", emit_task(), summary)])
+        self.assertEqual([finding.viewpoint for finding in findings], ["cost"])
+
+
+class SummaryShapeTests(RulesTestCase):
+    def test_a_summary_that_is_not_a_mapping_is_skipped(self):
+        task_dir = Path(tempfile.mkdtemp(dir=self.root, prefix="bad-"))
+        write_run(task_dir, "run-1", emit_task())
+        request = EvalRequest(
+            graph=graph.build([task_dir / FILE_NAME]),
+            summaries={task_dir: [1, 2]},
+            viewpoints=evaluate.VIEWPOINTS,
+        )
+        self.assertEqual(self.evaluator.evaluate(request), [])
 
 
 class CostTests(RulesTestCase):
@@ -336,11 +446,33 @@ class CostTests(RulesTestCase):
         )
         self.assertEqual(self.evaluator.evaluate(request), [])
 
-    def test_the_cost_key_names_the_task(self):
-        runs = [("run-1", emit_two_modes(), make_two_mode_summary(models_usd=5.0))]
-        findings = self.findings(runs)
+    def test_the_cost_key_names_the_task_and_its_run_directory(self):
+        request = build_request(
+            self.root, [("run-1", emit_two_modes(), make_two_mode_summary(models_usd=5.0))]
+        )
+        findings = self.evaluator.evaluate(request)
         self.assertEqual(len(findings), 1)
-        self.assertEqual(findings[0].key, "rules:cost:task-1")
+        path = next(iter(request.summaries))
+        self.assertEqual(findings[0].key, f"rules:cost:task-1:{path}")
+
+    def test_the_same_task_in_two_experiments_stays_two_cost_findings(self):
+        runs = [
+            ("run-1", emit_two_modes(), make_two_mode_summary(models_usd=5.0)),
+            ("run-2", emit_two_modes(), make_two_mode_summary(models_usd=6.0)),
+        ]
+        request = build_request(self.root, runs)
+        findings = [
+            finding
+            for finding in self.evaluator.evaluate(request)
+            if finding.key.startswith("rules:cost:")
+        ]
+        self.assertEqual(len(findings), 2)
+        self.assertNotEqual(findings[0].key, findings[1].key)
+        result = evalgraph.run(evalgraph.default_config(["rules"]), request)
+        aggregated = [
+            finding for finding in result.findings if finding.key.startswith("rules:cost:")
+        ]
+        self.assertEqual(len(aggregated), 2)
 
     def test_a_trace_of_only_a_resumed_run_reads_its_last_run(self):
         request = build_resumed_request(
@@ -425,9 +557,9 @@ def emit_fence(*, succeeded, selection_succeeded=False):
 class FenceTests(RulesTestCase):
     def test_no_success_after_the_fence_is_major(self):
         findings = self.findings([("run-1", emit_fence(succeeded=False), {})])
-        self.assertEqual(len(findings), 1)
-        self.assertEqual(findings[0].viewpoint, "safety")
-        self.assertEqual(findings[0].severity, Severity.MAJOR)
+        safety = [finding for finding in findings if finding.viewpoint == "safety"]
+        self.assertEqual(len(safety), 1)
+        self.assertEqual(safety[0].severity, Severity.MAJOR)
 
     def test_a_later_stage_success_is_info(self):
         findings = self.findings([("run-1", emit_fence(succeeded=True), {})])
@@ -437,8 +569,9 @@ class FenceTests(RulesTestCase):
     def test_a_successful_selection_alone_does_not_count(self):
         body = emit_fence(succeeded=False, selection_succeeded=True)
         findings = self.findings([("run-1", body, {})])
-        self.assertEqual(len(findings), 1)
-        self.assertEqual(findings[0].severity, Severity.MAJOR)
+        safety = [finding for finding in findings if finding.viewpoint == "safety"]
+        self.assertEqual(len(safety), 1)
+        self.assertEqual(safety[0].severity, Severity.MAJOR)
 
     def test_all_stages_falling_back_is_major(self):
         def body():
@@ -454,9 +587,9 @@ class FenceTests(RulesTestCase):
                         selection.set(ok=True, chosen_label="agg1", error="")
 
         findings = self.findings([("run-1", body, {})])
-        self.assertEqual(len(findings), 1)
-        self.assertEqual(findings[0].viewpoint, "safety")
-        self.assertEqual(findings[0].severity, Severity.MAJOR)
+        safety = [finding for finding in findings if finding.viewpoint == "safety"]
+        self.assertEqual(len(safety), 1)
+        self.assertEqual(safety[0].severity, Severity.MAJOR)
 
     def test_a_stage_before_the_fence_does_not_count(self):
         def body():
@@ -468,6 +601,38 @@ class FenceTests(RulesTestCase):
         findings = self.findings([("run-1", body, {})])
         self.assertEqual(len(findings), 1)
         self.assertEqual(findings[0].severity, Severity.MAJOR)
+
+    def test_a_fence_of_a_stage_that_succeeded_is_recovered(self):
+        def body():
+            with trace.span(trace.Kind.TASK, task_id="task-1"):
+                with trace.span(trace.Kind.STAGE, label="inv1") as inv:
+                    trace.event(trace.Kind.MODEL_FENCE, role="improver", fenced=False, model="m")
+                    inv.set(attempts=1, fell_back=False, error="")
+                with trace.span(trace.Kind.STAGE, label="dom1") as dom:
+                    trace.event(trace.Kind.MODEL_FENCE, role="improver", fenced=False, model="m")
+                    dom.set(attempts=1, fell_back=False, error="")
+                with trace.span(trace.Kind.STAGE, label="agg1") as agg:
+                    agg.set(attempts=1, fell_back=True, error="no fenced runner")
+
+        findings = self.findings([("run-1", body, {})])
+        safety = [finding for finding in findings if finding.viewpoint == "safety"]
+        self.assertEqual(len(safety), 1)
+        self.assertEqual(safety[0].severity, Severity.INFO)
+
+    def test_one_unrecovered_fence_keeps_the_task_major(self):
+        def body():
+            with trace.span(trace.Kind.TASK, task_id="task-1"):
+                trace.event(trace.Kind.MODEL_FENCE, role="improver", fenced=False, model="m")
+                with trace.span(trace.Kind.STAGE, label="inv1") as inv:
+                    inv.set(attempts=1, fell_back=False, error="")
+                trace.event(trace.Kind.MODEL_FENCE, role="improver", fenced=False, model="m")
+                with trace.span(trace.Kind.STAGE, label="agg1") as agg:
+                    agg.set(attempts=1, fell_back=True, error="no fenced runner")
+
+        findings = self.findings([("run-1", body, {})])
+        safety = [finding for finding in findings if finding.viewpoint == "safety"]
+        self.assertEqual(len(safety), 1)
+        self.assertEqual(safety[0].severity, Severity.MAJOR)
 
     def test_no_fence_means_no_finding(self):
         def body():
@@ -537,6 +702,85 @@ class ErrorTests(RulesTestCase):
 
         findings = self.findings([("run-1", body, {})])
         self.assertEqual(len(findings[0].evidence), 10)
+
+    def test_a_caught_failure_of_a_rollout_is_counted(self):
+        def emit(task_id):
+            def body():
+                with trace.span(trace.Kind.TASK, task_id=task_id):
+                    with trace.span(trace.Kind.ROLLOUT, role="base") as rollout:
+                        rollout.set(ok=False, error="executor crashed")
+
+            return body
+
+        findings = self.findings([("run-1", emit("task-1"), {}), ("run-2", emit("task-2"), {})])
+        self.assertEqual([finding.key for finding in findings], ["rules:errors:rollout"])
+        self.assertEqual(findings[0].severity, Severity.MINOR)
+        self.assertEqual(len(findings[0].evidence), 2)
+
+    def test_a_caught_failure_of_a_fallback_stage_is_counted(self):
+        def body():
+            with trace.span(trace.Kind.TASK, task_id="task-1"):
+                with trace.span(trace.Kind.STAGE, label="agg1") as stage:
+                    stage.set(attempts=1, fell_back=True, error="no fenced runner")
+
+        findings = self.findings([("run-1", body, {})])
+        self.assertEqual([finding.key for finding in findings], ["rules:errors:stage"])
+
+    def test_a_failed_mode_is_counted_once_through_its_error_event(self):
+        def body():
+            with trace.span(trace.Kind.TASK, task_id="task-1"):
+                with trace.span(trace.Kind.MODE, mode="agg") as mode_span:
+                    trace.event(trace.Kind.ERROR, where="mode:agg", message="agg: boom")
+                    mode_span.set(ok=False, error="agg: boom")
+
+        findings = self.findings([("run-1", body, {})])
+        self.assertEqual([finding.key for finding in findings], ["rules:errors:mode:agg"])
+        self.assertEqual(len(findings[0].evidence), 1)
+
+
+class ScaleTests(unittest.TestCase):
+    def test_three_hundred_runs_finish_in_seconds(self):
+        runs, per_run = 300, 100
+        nodes = {}
+        for index in range(runs):
+            run_id = f"run-{index}"
+            source = Path("/synthetic/trace.jsonl")
+            nodes[(run_id, "task")] = graph.Node(
+                key=(run_id, "task"),
+                kind=trace.Kind.TASK,
+                run_id=run_id,
+                span_id="task",
+                parent=None,
+                attrs={"task_id": f"task-{index}", "k": 1},
+                start_ts="2026-01-01T00:00:00+00:00",
+                end_ts="2026-01-01T00:00:01+00:00",
+                status="ok",
+                dur_s=1.0,
+                source=source,
+            )
+            for number in range(per_run):
+                span_id = f"r{number:03d}"
+                nodes[(run_id, span_id)] = graph.Node(
+                    key=(run_id, span_id),
+                    kind=trace.Kind.ROLLOUT,
+                    run_id=run_id,
+                    span_id=span_id,
+                    parent=(run_id, "task"),
+                    attrs={"role": "base", "ok": True},
+                    start_ts="2026-01-01T00:00:02+00:00",
+                    end_ts="2026-01-01T00:00:03+00:00",
+                    status="ok",
+                    dur_s=1.0,
+                    source=source,
+                )
+        request = EvalRequest(
+            graph=graph.Graph(nodes=nodes),
+            summaries={},
+            viewpoints=evaluate.VIEWPOINTS,
+        )
+        started = time.perf_counter()
+        self.assertEqual(RulesEvaluator().evaluate(request), [])
+        self.assertLess(time.perf_counter() - started, 5.0)
 
 
 class FindingShapeTests(RulesTestCase):
