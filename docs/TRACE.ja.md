@@ -65,18 +65,21 @@ events = read(task_dir / "trace.jsonl")
 | Kind | 値 | 形 | 属性 |
 |---|---|---|---|
 | `TASK` | `task` | span | `task_id`、`domain`、`k`、`seed`、`modes`。`resumed`（開始イベントでは `false`、再開した実行の終了イベントでは `true`） |
+| `MODE` | `mode` | span | `mode`、再開したタスクのライブラリを書き戻す span では `resumed`（`true`）。モードの本体が例外を投げたときは終了イベントに `ok` と `error` が入り、`status` は `"ok"` のまま |
 | `ROLLOUT` | `rollout` | span | `role`（`base` / `candidate` / `final`）、`mode`、`label`、`run_id`（トレースの run id ではなくロールアウトの run id）。終了イベントには `ok`、`delivered`、`usd`、`error` |
 | `STAGE` | `stage` | span | `label`、`dim`（`INV` / `DOM` / `compose`）、`mode`。終了イベントには `kept_base`、`fell_back`、`attempts`、`cached`、`usd`、`error` |
 | `TREE_DIFF` | `tree.diff` | point | `label`、`files`: `{path, sha256, change}` のリスト。`change` は `added`、`changed`、`removed` のいずれか |
 | `SELECTION` | `selection` | span | `mode`、`pool`（候補のラベル）。終了イベントには `chosen_label`、`ok`、`usd`、`error` |
 | `REFLECTION` | `reflection` | span | `mode`。終了イベントには `chosen_label`、`ok`、`usd`、`error` |
-| `MEMORY_RECALL` | `memory.recall` | point | `connector`、`task_id`、`chars`、呼び出した本文の `sha256`。本文は決して入れない |
-| `MEMORY_STORE` | `memory.store` | point | `connector`、`task_id`、`label`、`stored`（bool）、`path`（`null` のこともある） |
+| `MEMORY_RECALL` | `memory.recall` | point | `connector`、`task_id`、`chars`、`mode`、呼び出した本文の `sha256`。本文は決して入れない |
+| `MEMORY_STORE` | `memory.store` | point | `connector`、`task_id`、`label`、`mode`、`stored`（bool）、`path`（`null` のこともある） |
 | `MODEL_ROUTE` | `model.route` | point | `role`、`candidates`: `{runner, model, effort}` のリスト。実行役は `skipped_other_runners` も持つ |
-| `MODEL_SWITCH` | `model.switch` | point | `role`、`from` と `to`（`{runner, model, effort}`）、`reason`。候補が残っていないときの `to` は `null` |
+| `MODEL_SWITCH` | `model.switch` | point | `role`、`from` と `to`（`{runner, model, effort}`）、`reason`（改善役ではエラー文を `sha256=<hex> chars=<n>` にしたもの。executor では空）。候補が残っていないときの `to` は `null` |
 | `MODEL_FENCE` | `model.fence` | point | `role`、`fenced`、`runners`、`problems`、`model` |
 | `COST` | `cost` | point | 各モードの終わりに `mode`、`usd`、`rollout_usd`、`session_usd`、`R`、`P` |
 | `ERROR` | `error` | point | `where`、`message` |
+
+失敗したモードでも、終了イベントの `status` は `"ok"` です。モードの例外は span の中で実行が握るからです。失敗は、span の終了イベントの `ok: false` と `error`、そして `where` が `mode:<mode>` の `ERROR` イベントで表れます。
 
 ## 親と子
 
@@ -84,7 +87,7 @@ events = read(task_dir / "trace.jsonl")
 
 - `TASK` の span が根で、その開始イベントの `parent_id` は `null` です。
 - span の親は、それが始まったときに現在だった span です。point event の親は、それが出力されたときに現在の span です。現在の span は context 変数に持つので、呼ばれる側は引数で受け取る必要がありません。
-- これにより、`ROLLOUT`、`STAGE`、`SELECTION`、`REFLECTION`、`COST`、`ERROR`、`MEMORY_*` は `TASK` の span の下に（囲む span を足したときはその下に）入り、`TREE_DIFF` はその段の下に、`MODEL_*` は現在の span の下に入ります。
+- `MODE` の span はモードごとに 1 つ、`TASK` の下に下がります。その子はそのモードの部分です。`role` が `candidate` か `final` の `ROLLOUT`、`STAGE` とその `TREE_DIFF`、`SELECTION` と `REFLECTION`、そのモードの `COST`、`ERROR`、そして `MEMORY_*` のイベントです。`base` のロールアウトはモードより前に動くので `TASK` の下に残り、再開したタスクが書き戻す `MEMORY_STORE` は `resumed: true` のそれ専用の `MODE` の span の中で動きます。`MODEL_*` は現在の span の下に残ります。
 - `trace.use(tracer)` は tracer を現在のものにし、引きずっていた span を落とします。新しい実行が前の実行の span につくことはありません。tracer は閉じないので、開いた側が閉じます。
 - スレッドプールでは、渡す関数を `trace.bind(fn)` で包みます。包んだ関数は呼び出し側の tracer と span を引き継ぎ、呼び出しごとにその context の新しいコピーに入るので、同じ関数を複数のスレッドで同時に動かせます。
 
@@ -109,6 +112,7 @@ with trace.span(trace.Kind.STAGE, label="demo", dim="INV", mode="parallel") as s
 
 - プロンプト、成果物、ハーネスの中身、改善役の返答は決して入れません。ファイルはパスと sha256 だけです。`trace.digest(data)` が sha256 の hex を返します（`str` は UTF-8 としてハッシュする）。
 - `Tracer` はシンクに渡す前にすべての属性値を整えます。JSON にできる値はそのまま、512 文字（`trace.MAX_ATTR_CHARS`）を超える文字列は `{"sha256": <hex>, "chars": <長さ>}` に置き換えます。入れ子の dict や list の中も同じです。JSON にできない値は `str()` にし（そのあと同じ長さの決まりに従う）、有限でない float は文字列にし、深さが 32 を超える入れ子は文字列にします。長い文字列をハッシュに置き換えるのは大きさで弾く安全網で、本文かどうかを見分けるものではありません。512 文字以下の文字列はそのまま残るので、本文は呼ぶ側が渡さないでください。長さの決まりが当たるのは文字列の値で、マッピングのキーには当たりません。
+- エラー文も、本文を引用し得る場所では同じ決まりに従います。grader verdict を拒む検査は、ファイル名・マーカー・オフセットを残し、抜粋を `(excerpt sha256=<hex> chars=<n>)` に置き換えます。改善役の CLI のエラーは、subtype を残し、返答を `reply sha256=<hex> chars=<n>` に置き換えます。改善役の `model.switch` の `reason` も `sha256=<hex> chars=<n>` にします。短いエラー文にも本文は入らず、`summary.json` の `errors` にも入りません。CLI 自身の stderr の抜粋（`rc=...`）は残します。これは道具の診断で、本文ではないからです。
 - 採点は手法側のトレースに入れません。スコア、判定、private_criteria は入れません。`judge.`（`trace.JUDGE_PREFIX`）で始まる種類は採点側の予約です。手法側は 1 つも出しません。採点側のコードは、採点した `ROLLOUT` の `span_id` を `parent_id` にして、同じ `run_id` に自分のイベント（例えば `judge.score`）を追記できます。イベントは `harness2.core.trace_file.read` で読み戻せます。
 
 ## トレースを止める

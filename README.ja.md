@@ -63,7 +63,7 @@ Harness² が想定するのは**オープンワールド**、つまりハーネ
 <p align="center">
   <picture>
     <source media="(prefers-color-scheme: dark)" srcset="assets/architecture/architecture-dark.svg">
-    <img src="assets/architecture/architecture-light.svg" alt="Harness² のアーキテクチャ図。CLI（harness2-setup/-check、harness2、harness2-demo、harness2-judge/-report）が harness2.core を動かす。core では schedule がタスクごとに k 回の共有ベースロールアウトを実行し、タスクレベルの再帰が c1..c8 のハーネスツリーと正解を含まない証拠ツリーを使って Propose・Probe・Compose を行い、selection が k 個の最終候補から 1 つを盲目的に選んで振り返る。採用されたハーネスと教訓はドメイン別ライブラリ（MemoryConnector。既定は FileConnector で、entry point の harness2.memory_connectors に登録したインストール済みのパッケージや、module:Attr で差し込むものに差し替えられる）に入り、次のタスクを導く。ModelConnector（既定は env で、entry point の harness2.model_connectors に登録したインストール済みのパッケージや、module:Attr で差し込むものに差し替えられる）が、固定したサブストレートの上で実行役のモデルの候補と切り替えの順を決め、柵を掛けた改善役のセッションを回すこともできる。タスクの実行ごとに、TraceSink（既定は file で、タスクのディレクトリに trace.jsonl を書く。entry point の harness2.trace_sinks に登録したインストール済みのパッケージや、module:Attr で差し込むものに差し替えられる）がトレースを残す。span は parent_id でつながり、パスとハッシュだけを持ち本文は入れない。core は実行・評価側を呼び出す。ベンチマークアダプタ（JobBench、LAB、WorkBuddy-Bench）がサブストレート（OpenCode または Codex CLI）上でロールアウトを起動し、サブストレートは Vertex AI のモデル（実行器・採点用の Gemini、改善用の Claude または Gemini）を呼ぶ。タスクの取り込みでは、任意のタスクコネクター（同梱のローカルのフォルダ、entry point の harness2.task_connectors に登録したインストール済みのパッケージ、または module:Attr で差し込むもの）が受け取ったタスクを正規化に渡して TaskSpec にし、IntakeAdapter がベンチマークのアダプターと同じように実行する（private_criteria は採点者だけが読む）。コードのタスクでは、ロールアウトはそれぞれ専用の git worktree で動き、コネクターの workspace policy の確認を通ったあと、選ばれた実行の diff だけをソースのリポジトリに当てる。出力は runs/ に保存される。" width="100%">
+    <img src="assets/architecture/architecture-light.svg" alt="Harness² のアーキテクチャ図。CLI（harness2-setup/-check、harness2、harness2-demo、harness2-judge/-report、harness2-evaluate）が harness2.core を動かす。core では schedule がタスクごとに k 回の共有ベースロールアウトを実行し、タスクレベルの再帰が c1..c8 のハーネスツリーと正解を含まない証拠ツリーを使って Propose・Probe・Compose を行い、selection が k 個の最終候補から 1 つを盲目的に選んで振り返る。採用されたハーネスと教訓はドメイン別ライブラリ（MemoryConnector。既定は FileConnector で、entry point の harness2.memory_connectors に登録したインストール済みのパッケージや、module:Attr で差し込むものに差し替えられる）に入り、次のタスクを導く。ModelConnector（既定は env で、entry point の harness2.model_connectors に登録したインストール済みのパッケージや、module:Attr で差し込むものに差し替えられる）が、固定したサブストレートの上で実行役のモデルの候補と切り替えの順を決め、柵を掛けた改善役のセッションを回すこともできる。タスクの実行ごとに、TraceSink（既定は file で、タスクのディレクトリに trace.jsonl を書く。entry point の harness2.trace_sinks に登録したインストール済みのパッケージや、module:Attr で差し込むものに差し替えられる）がトレースを残す。span は parent_id でつながり、パスとハッシュだけを持ち本文は入れない。harness2-evaluate はそのトレースから実行のグラフを作り、評価者（既定は同梱の決定的な rules。entry point の harness2.evaluators と harness2.rebutters、または module:Attr で差し替えられる）を回し、所見を集約して findings.json に書く。core は実行・評価側を呼び出す。ベンチマークアダプタ（JobBench、LAB、WorkBuddy-Bench）がサブストレート（OpenCode または Codex CLI）上でロールアウトを起動し、サブストレートは Vertex AI のモデル（実行器・採点用の Gemini、改善用の Claude または Gemini）を呼ぶ。タスクの取り込みでは、任意のタスクコネクター（同梱のローカルのフォルダ、entry point の harness2.task_connectors に登録したインストール済みのパッケージ、または module:Attr で差し込むもの）が受け取ったタスクを正規化に渡して TaskSpec にし、IntakeAdapter がベンチマークのアダプターと同じように実行する（private_criteria は採点者だけが読む）。コードのタスクでは、ロールアウトはそれぞれ専用の git worktree で動き、コネクターの workspace policy の確認を通ったあと、選ばれた実行の diff だけをソースのリポジトリに当てる。出力は runs/ に保存される。" width="100%">
   </picture>
 </p>
 
@@ -145,6 +145,8 @@ harness2-judge --bench lab --k 1 --mode parallel
 harness2-report --bench lab --k 1 --mode parallel
 ```
 
+実行が残したトレースは `harness2-evaluate --runs runs/lab` で評価できます。`findings.json` と、観点ごとのファイルを `<runs>/evaluation` の下に書きます。実行のグラフ、観点、同梱の `rules` の検査、評価者の足し方は[評価の手順](docs/EVALUATION.ja.md)にあります。
+
 > [!IMPORTANT]
 > モデルを使う実行には API 料金がかかります。まずは少数のタスクから始めてください。`harness2` に `--dry-run` を付けると、モデルを呼ばずにタスクの選択結果だけを確認できます。採点とレポートは、改良時と同じベンチマーク・実行器・サブセット・`--k`・`--mode`・シードで実行する必要があります。
 
@@ -197,6 +199,10 @@ harness2-report --bench lab --k 1 --mode parallel
 | [`harness2/core/intake_local.py`](harness2/core/intake_local.py) | ローカルのフォルダのタスクコネクター（inbox、outbox、failed） |
 | [`harness2/core/models.py`](harness2/core/models.py) | モデルのコネクター: `ModelConnector` の契約、`ModelChoice`、セッションと結果の型、既定の `env` コネクター、`harness2.model_connectors` の登録 ([手順](docs/MODEL_CONNECTORS.ja.md)) |
 | [`harness2/core/trace.py`](harness2/core/trace.py) | トレースのシンク: `TraceEvent`、シンクの契約、`harness2.trace_sinks` の登録、実行ごとの `Tracer`（[手順](docs/TRACE.ja.md)） |
+| [`harness2/core/graph.py`](harness2/core/graph.py) | トレースから作る実行のグラフ: `Node`、`Edge`、`Graph`、`build`、`load_runs`（[手順](docs/EVALUATION.ja.md)） |
+| [`harness2/core/evaluate.py`](harness2/core/evaluate.py) | 評価: 観点、`Finding`、`Evaluator` の契約、`harness2.evaluators` の登録（[手順](docs/EVALUATION.ja.md)） |
+| [`harness2/core/evalgraph.py`](harness2/core/evalgraph.py) | 評価のグラフ: JSON の設定から評価者・反論・集約のノードを動かし、所見をまとめる（[手順](docs/EVALUATION.ja.md)） |
+| [`harness2/evaluators/`](harness2/evaluators) | 同梱の `rules` 評価者: 実行のグラフに対する決定的な検査（[手順](docs/EVALUATION.ja.md)） |
 | [`harness2/substrate/`](harness2/substrate) | 共通インターフェースの背後にある実行器: OpenCode と Codex CLI |
 | [`harness2/benchmarks/`](harness2/benchmarks) | JobBench、LAB、WorkBuddy-Bench のアダプタ |
 | [`harness2/benchmarks/intake.py`](harness2/benchmarks/intake.py) | ベンチマーク以外のタスク向けの IntakeAdapter と `run_intake` |

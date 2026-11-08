@@ -119,4 +119,5 @@ than being counted as zero. Use a new `HARNESS2_RUNS_DIR` when changing models o
 task selection.
 
 Refinement, judging, and reporting use `harness2`, `harness2-judge`, and
-`harness2-report`; each supports `--help`.
+`harness2-report`; `harness2-evaluate` turns the runs' traces into findings
+([evaluation guide](EVALUATION.md)). Each supports `--help`.
