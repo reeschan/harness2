@@ -37,6 +37,17 @@ class FixedRebutter:
         return list(self._verdicts)
 
 
+class RecordingRebutter:
+    """A rebutter that records how many findings it was given."""
+
+    def __init__(self):
+        self.counts = []
+
+    def rebut(self, findings, request):
+        self.counts.append(len(findings))
+        return []
+
+
 class BoomEvaluator:
     """An evaluator that raises once it runs."""
 
@@ -154,6 +165,29 @@ class DefaultConfigTests(EvalGraphCase):
         result = evalgraph.run(evalgraph.default_config(["alpha", "beta"]), self.request)
         self.assertEqual(result.errors, [])
         self.assertEqual([finding.key for finding in result.findings], ["a", "b"])
+
+    def test_the_aggregate_id_moves_out_of_the_way_of_an_evaluator(self):
+        config = evalgraph.default_config(["aggregate", "beta"])
+        self.assertEqual(
+            [node["id"] for node in config["nodes"]],
+            ["aggregate", "beta", "aggregate_1"],
+        )
+        self.assertEqual(config["nodes"][-1]["type"], "aggregate")
+        self.assertEqual(
+            config["edges"],
+            [["aggregate", "aggregate_1"], ["beta", "aggregate_1"]],
+        )
+
+    def test_the_aggregate_id_keeps_moving_past_a_taken_suffix(self):
+        config = evalgraph.default_config(["aggregate", "aggregate_1"])
+        self.assertEqual(config["nodes"][-1]["id"], "aggregate_2")
+        self.assertEqual(config["edges"][-1], ["aggregate_1", "aggregate_2"])
+
+    def test_an_evaluator_named_aggregate_runs(self):
+        self.register("aggregate", [self.finding(key="a")])
+        result = evalgraph.run(evalgraph.default_config(["aggregate"]), self.request)
+        self.assertEqual(result.errors, [])
+        self.assertEqual([finding.key for finding in result.findings], ["a"])
 
 
 class LoadConfigTests(EvalGraphCase):
@@ -543,6 +577,34 @@ class RunTests(EvalGraphCase):
         self.assertEqual(result.findings[0].evidence, (good,))
         self.assertEqual(result.dropped["no_evidence"], 0)
 
+    def test_evidence_ids_that_are_not_strings_are_errors(self):
+        self.register(
+            "bad",
+            [
+                Finding(
+                    viewpoint="cost",
+                    severity=Severity.MAJOR,
+                    claim="run",
+                    evidence=(Evidence(["x"], "y"),),
+                    key="run",
+                ),
+                Finding(
+                    viewpoint="cost",
+                    severity=Severity.MAJOR,
+                    claim="span",
+                    evidence=(Evidence("x", ["y"]),),
+                    key="span",
+                ),
+            ],
+        )
+        self.register("good", [self.finding(key="good")])
+        result = evalgraph.run(self.config(["bad", "good"]), self.request)
+        self.assertEqual(len(result.errors), 2)
+        for error in result.errors:
+            self.assertIn("evidence", error)
+            self.assertIn("str", error)
+        self.assertEqual([finding.key for finding in result.findings], ["good"])
+
     def test_deny_drops_the_finding(self):
         self.register("alpha", [self.finding(key="k")])
         self.register_rebutter("deny", [evalgraph.Verdict("k", "deny")])
@@ -569,6 +631,29 @@ class RunTests(EvalGraphCase):
         result = evalgraph.run(config, self.request)
         self.assertEqual(len(result.findings), 1)
         self.assertEqual(result.dropped["denied"], 0)
+
+    def test_a_diamond_of_rebut_nodes_does_not_duplicate_findings(self):
+        self.register("alpha", [self.finding(key="k")])
+        rebutter = RecordingRebutter()
+        evalgraph.register_rebutter("record", lambda **options: rebutter)
+        nodes = [{"id": "alpha", "type": "evaluator", "evaluator": "alpha"}]
+        edges = []
+        previous = "alpha"
+        for layer in range(2):
+            left, right, join = f"left{layer}", f"right{layer}", f"join{layer}"
+            nodes += [
+                {"id": name, "type": "rebut", "rebutter": "record"} for name in (left, right, join)
+            ]
+            edges += [[previous, left], [previous, right], [left, join], [right, join]]
+            previous = join
+        nodes.append({"id": "aggregate", "type": "aggregate"})
+        edges.append([previous, "aggregate"])
+        result = evalgraph.run(
+            {"nodes": nodes, "edges": edges, "allow_scores": False}, self.request
+        )
+        self.assertEqual(result.errors, [])
+        self.assertEqual(rebutter.counts, [1] * 6)
+        self.assertEqual([finding.key for finding in result.findings], ["k"])
 
     def test_duplicates_merge_the_viewpoints_and_the_severity(self):
         self.register(

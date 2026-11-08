@@ -16,10 +16,11 @@
 
 Reads every `trace.jsonl` under `--runs` with the `summary.json` next to it, runs the
 evaluation graph over the resulting run graph, and writes the aggregated findings, the
-findings dropped or refused, the errors, and the number of traces and runs read. Each
-viewpoint also gets its own pre-aggregation list under `findings/<viewpoint>.json`.
+findings dropped or refused, the errors, the graph warnings, and the number of traces and
+runs read. Each viewpoint also gets its own pre-aggregation list under
+`findings/<viewpoint>.json`; a rerun removes the files of viewpoints it no longer has.
 
-    harness2-evaluate --runs runs/jb-oc-agg-k1
+    harness2-evaluate --runs runs/jb/adapt/jb-oc-agg1
 
 `--evaluators` names the evaluators of the default graph (one node per name, all wired to one
 aggregate node); `--graph` takes a JSON graph config instead and wins over `--evaluators`.
@@ -147,12 +148,22 @@ def main(argv: list[str] | None = None) -> int:
         print(f"error: {exc}", file=sys.stderr, flush=True)
         return 2
 
-    payload = dict(result.to_dict(), traces=len(paths), runs=len(level.runs()))
+    for warning in level.warnings:
+        print(f"warning: {warning}", file=sys.stderr, flush=True)
+    payload = dict(
+        result.to_dict(),
+        warnings=list(level.warnings),
+        traces=len(paths),
+        runs=len(level.runs()),
+    )
     findings_path = out / "findings.json"
     out.mkdir(parents=True, exist_ok=True)
     _write_json(findings_path, payload)
     per_viewpoint = out / "findings"
     per_viewpoint.mkdir(parents=True, exist_ok=True)
+    for stale in per_viewpoint.glob("*.json"):
+        if stale.is_file() and stale.stem not in result.by_viewpoint:
+            stale.unlink()
     for name in sorted(result.by_viewpoint):
         items = [item.to_dict() for item in result.by_viewpoint[name]]
         _write_json(per_viewpoint / f"{name}.json", items)

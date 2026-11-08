@@ -15,6 +15,7 @@
 """Tests for `harness2.core.graph`."""
 
 import json
+import os
 import tempfile
 import time
 import unittest
@@ -258,6 +259,42 @@ class BuildTests(GraphCase):
     def test_find_returns_none_for_an_unknown_span(self):
         self.assertIsNone(self.build().find("nope", "nope"))
 
+    def test_start_read_after_end_keeps_the_end_attrs(self):
+        task_dir = self.root / "run"
+        start_ts = "2026-01-01T00:00:00+00:00"
+        end_ts = "2026-01-01T00:00:01+00:00"
+        sink = FileSink(task_dir)
+        sink.emit(
+            trace.TraceEvent(
+                run_id="r1",
+                span_id="s1",
+                parent_id=None,
+                kind=trace.Kind.STAGE,
+                ts=end_ts,
+                attrs={"phase": "end", "status": "ok", "ok": False, "dur_s": 1.0},
+            )
+        )
+        sink.emit(
+            trace.TraceEvent(
+                run_id="r1",
+                span_id="s1",
+                parent_id=None,
+                kind=trace.Kind.STAGE,
+                ts=start_ts,
+                attrs={"phase": "start", "ok": None, "label": "s"},
+            )
+        )
+
+        node = self.build().find("r1", "s1")
+        self.assertIsNotNone(node)
+        self.assertIs(node.attrs["ok"], False)
+        self.assertEqual(node.attrs["label"], "s")
+        self.assertEqual(node.attrs["status"], "ok")
+        self.assertEqual(node.status, "ok")
+        self.assertEqual(node.dur_s, 1.0)
+        self.assertEqual(node.start_ts, start_ts)
+        self.assertEqual(node.end_ts, end_ts)
+
 
 class LoadRunsTests(GraphCase):
     def test_load_runs_reads_nested_traces_and_summaries(self):
@@ -284,6 +321,51 @@ class LoadRunsTests(GraphCase):
         built, summaries = graph.load_runs(self.root)
         self.assertEqual(built.nodes, {})
         self.assertEqual(summaries, {})
+
+    def test_an_unreadable_trace_is_a_warning_and_the_rest_is_read(self):
+        good = self.root / "good"
+        bad = self.root / "bad"
+        for task_dir in (good, bad):
+            tracer = trace.Tracer(FileSink(task_dir), run_id="r1")
+            with trace.use(tracer):
+                with trace.span(trace.Kind.TASK):
+                    trace.event(trace.Kind.COST, usd=0.1)
+            tracer.close()
+        if os.geteuid() == 0:
+            self.skipTest("file permissions do not stop root")
+        bad_trace = bad / FILE_NAME
+        bad_trace.chmod(0o000)
+        self.addCleanup(bad_trace.chmod, 0o644)
+
+        built, summaries = graph.load_runs(self.root)
+        self.assertEqual(len(built.roots()), 1)
+        self.assertEqual({node.source for node in built.nodes.values()}, {good / FILE_NAME})
+        self.assertEqual(summaries, {})
+        self.assertTrue(
+            any(warning.startswith(f"cannot read {bad_trace}") for warning in built.warnings)
+        )
+
+    def test_a_summary_that_is_not_a_json_object_is_a_warning(self):
+        first = self.root / "a"
+        second = self.root / "b"
+        for task_dir in (first, second):
+            tracer = trace.Tracer(FileSink(task_dir), run_id="r1")
+            with trace.use(tracer):
+                with trace.span(trace.Kind.TASK):
+                    trace.event(trace.Kind.COST, usd=0.1)
+            tracer.close()
+        (first / "summary.json").write_text("[1, 2]", encoding="utf-8")
+        (second / "summary.json").write_text(json.dumps({"status": "ok"}), encoding="utf-8")
+
+        built, summaries = graph.load_runs(self.root)
+        self.assertEqual(set(summaries), {second})
+        self.assertEqual(len(built.roots()), 2)
+        self.assertTrue(
+            any(
+                f"summary {first / 'summary.json'} is not a JSON object" in warning
+                for warning in built.warnings
+            )
+        )
 
 
 class IndexTests(unittest.TestCase):

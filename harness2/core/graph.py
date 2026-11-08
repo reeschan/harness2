@@ -208,12 +208,18 @@ def build(paths: Iterable[Path], *, include_judge: bool = False) -> Graph:
     winning, `phase` is dropped, and `status` and `dur_s` are taken from the end. A point
     event's `ts` becomes `start_ts` and its `status` and `dur_s` stay None. Parent links
     that name a node that is not in the graph leave the child a root and add a warning.
-    Kinds starting with `trace.JUDGE_PREFIX` are read only when `include_judge` is true.
+    A trace that cannot be read is skipped with a warning. Kinds starting with
+    `trace.JUDGE_PREFIX` are read only when `include_judge` is true.
     """
     graph = Graph()
     for raw in paths:
         path = Path(raw)
-        for event in trace_file.read(path):
+        try:
+            events = trace_file.read(path)
+        except OSError as exc:
+            graph.warnings.append(f"cannot read {path}: {exc}")
+            continue
+        for event in events:
             if not include_judge and event.kind.startswith(trace.JUDGE_PREFIX):
                 continue
             key = (event.run_id, event.span_id)
@@ -236,6 +242,7 @@ def build(paths: Iterable[Path], *, include_judge: bool = False) -> Graph:
             elif node.parent is None:
                 node.parent = _parent_key(event)
             phase = event.attrs.get("phase")
+            ended = node.end_ts is not None
             if phase == "end":
                 node.end_ts = event.ts
                 node.status = event.attrs.get("status")
@@ -243,7 +250,11 @@ def build(paths: Iterable[Path], *, include_judge: bool = False) -> Graph:
             elif node.start_ts is None:
                 node.start_ts = event.ts
             for name, value in event.attrs.items():
-                if name != "phase":
+                if name == "phase":
+                    continue
+                if phase != "end" and ended:
+                    node.attrs.setdefault(name, value)
+                else:
                     node.attrs[name] = value
     graph.edges = _edges(graph)
     graph._reindex()
@@ -279,7 +290,8 @@ def load_runs(root: Path, *, include_judge: bool = False) -> tuple[Graph, dict[P
     """The graph of every `trace.jsonl` under `root` and the summaries next to them.
 
     The summaries are keyed by the task run directory; a directory without a
-    `summary.json` is left out. A summary that cannot be read is a graph warning.
+    `summary.json` is left out. A summary that cannot be read or is not a JSON object
+    is left out and adds a graph warning.
     """
     base = Path(root)
     paths = sorted(path for path in base.rglob(TRACE_NAME) if path.is_file())
@@ -290,7 +302,12 @@ def load_runs(root: Path, *, include_judge: bool = False) -> tuple[Graph, dict[P
         if not summary_path.is_file():
             continue
         try:
-            summaries[path.parent] = json.loads(summary_path.read_text(encoding="utf-8"))
+            summary = json.loads(summary_path.read_text(encoding="utf-8"))
         except (OSError, ValueError) as exc:
             graph.warnings.append(f"cannot read {summary_path}: {exc}")
+            continue
+        if not isinstance(summary, dict):
+            graph.warnings.append(f"summary {summary_path} is not a JSON object")
+            continue
+        summaries[path.parent] = summary
     return graph, summaries

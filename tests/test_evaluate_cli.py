@@ -23,6 +23,7 @@ from pathlib import Path
 
 from harness2.cli import evaluate as cli_evaluate
 from harness2.core import evaluate, trace
+from harness2.core.evaluate import Evidence, Finding
 from harness2.core.trace_file import FileSink
 
 
@@ -63,6 +64,27 @@ class ScoreRecorder:
     def evaluate(self, request):
         self.requests.append(request)
         return []
+
+
+class OneViewpoint:
+    """An evaluator that always reports one minor finding for a fixed viewpoint."""
+
+    def __init__(self, viewpoint):
+        self.viewpoint = viewpoint
+
+    def viewpoints(self):
+        return [evaluate.viewpoint(self.viewpoint)]
+
+    def evaluate(self, request):
+        run_id, task = sorted(request.graph.runs().items())[0]
+        return [
+            Finding(
+                self.viewpoint,
+                "minor",
+                f"old {self.viewpoint}",
+                (Evidence(run_id, task.span_id),),
+            )
+        ]
 
 
 class EvaluateCliTests(unittest.TestCase):
@@ -196,6 +218,77 @@ class EvaluateCliTests(unittest.TestCase):
         self.assertTrue(
             any(node.kind.startswith(trace.JUDGE_PREFIX) for node in loud.graph.nodes.values())
         )
+
+    def test_graph_warnings_are_written_and_printed(self):
+        task_dir = self.make_run()
+        (task_dir / "summary.json").write_text("{", encoding="utf-8")
+        code, _, err = self.run_main(["--runs", str(self.runs)])
+        self.assertEqual(code, 0)
+        data = json.loads((self.runs / "evaluation" / "findings.json").read_text())
+        self.assertEqual(len(data["warnings"]), 1)
+        self.assertIn("summary.json", data["warnings"][0])
+        self.assertEqual(err.count("warning: "), 1)
+        self.assertIn(data["warnings"][0], err)
+
+    def test_rerun_removes_stale_viewpoint_files(self):
+        self.make_run()
+        evaluate.register("onecost", lambda **options: OneViewpoint("cost"))
+        evaluate.register("onesafety", lambda **options: OneViewpoint("safety"))
+        code, _, _ = self.run_main(["--runs", str(self.runs), "--evaluators", "onecost"])
+        self.assertEqual(code, 0)
+        findings_dir = self.runs / "evaluation" / "findings"
+        self.assertTrue((findings_dir / "cost.json").is_file())
+        code, _, _ = self.run_main(["--runs", str(self.runs), "--evaluators", "onesafety"])
+        self.assertEqual(code, 0)
+        self.assertFalse((findings_dir / "cost.json").exists())
+        self.assertTrue((findings_dir / "safety.json").is_file())
+        data = json.loads((self.runs / "evaluation" / "findings.json").read_text())
+        self.assertEqual([item["viewpoint"] for item in data["findings"]], ["safety"])
+
+    def test_graph_config_gates_scores_with_the_flag(self):
+        self.make_run(judge=True)
+        recorders = []
+
+        def factory(**options):
+            recorder = ScoreRecorder()
+            recorders.append(recorder)
+            return recorder
+
+        evaluate.register("score-recorder", factory)
+        for config_allow in (True, False):
+            config = self.root / f"graph-{config_allow}.json"
+            config.write_text(
+                json.dumps(
+                    {
+                        "nodes": [
+                            {"id": "rec", "type": "evaluator", "evaluator": "score-recorder"},
+                            {"id": "agg", "type": "aggregate"},
+                        ],
+                        "edges": [["rec", "agg"]],
+                        "allow_scores": config_allow,
+                    }
+                ),
+                encoding="utf-8",
+            )
+            for flag in (False, True):
+                with self.subTest(config_allow=config_allow, flag=flag):
+                    code, _, _ = self.run_main(
+                        ["--runs", str(self.runs), "--graph", str(config)]
+                        + (["--allow-scores"] if flag else [])
+                    )
+                    self.assertEqual(code, 0)
+                    request = recorders[-1].requests[-1]
+                    judge_nodes = [
+                        node
+                        for node in request.graph.nodes.values()
+                        if node.kind.startswith(trace.JUDGE_PREFIX)
+                    ]
+                    if config_allow and flag:
+                        self.assertEqual([item["score"] for item in request.scores["run-1"]], [1.0])
+                        self.assertTrue(judge_nodes)
+                    else:
+                        self.assertIsNone(request.scores)
+                        self.assertFalse(judge_nodes)
 
 
 if __name__ == "__main__":

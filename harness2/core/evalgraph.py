@@ -29,6 +29,8 @@ A config is a JSON dict with three keys:
 
 A node's `id` is unique, its `type` is `evaluator`, `rebut` or `aggregate`; the nodes and the
 edges must form a DAG with exactly one aggregate node, which is the sink every node reaches.
+`default_config` names that node `aggregate`, or `aggregate_1`, `aggregate_2`, ... when an
+evaluator already has that name.
 An evaluator node runs its evaluator (built with `evaluate.evaluator_for`) and keeps the
 findings of the node's `viewpoints` (or of every viewpoint the evaluator declares); a rebut
 node passes the findings it receives to its rebutter and keeps the verdicts' stances; the
@@ -89,14 +91,30 @@ def load_config(path: Path | str) -> dict:
 
 
 def default_config(evaluators: Sequence[str], *, allow_scores: bool = False) -> dict:
-    """One evaluator node per name (id = name), all wired to one aggregate node `aggregate`."""
+    """One evaluator node per name (id = name), all wired to one aggregate node.
+
+    The aggregate id is `aggregate`, or `aggregate_1`, `aggregate_2`, ... when one of the
+    evaluators already uses that name.
+    """
+    aggregate_id = _aggregate_id(evaluators)
     nodes = [{"id": name, "type": "evaluator", "evaluator": name} for name in evaluators]
-    nodes.append({"id": _AGGREGATE_ID, "type": "aggregate"})
+    nodes.append({"id": aggregate_id, "type": "aggregate"})
     return {
         "nodes": nodes,
-        "edges": [[name, _AGGREGATE_ID] for name in evaluators],
+        "edges": [[name, aggregate_id] for name in evaluators],
         "allow_scores": allow_scores,
     }
+
+
+def _aggregate_id(evaluators: Sequence[str]) -> str:
+    """An aggregate node id that none of `evaluators` uses."""
+    taken = set(evaluators)
+    candidate = _AGGREGATE_ID
+    index = 0
+    while candidate in taken:
+        index += 1
+        candidate = f"{_AGGREGATE_ID}_{index}"
+    return candidate
 
 
 def check_config(
@@ -447,10 +465,19 @@ class _Batch:
 
 
 def _combine(batches: Iterable[_Batch]) -> _Batch:
-    """One batch with every finding of `batches` and the union of their stances."""
+    """One batch with every finding of `batches` and the union of their stances.
+
+    An item reaches this point along one path per incoming edge, so an `origin` already added
+    is skipped: a diamond of rebut nodes must not let the same finding through more than once.
+    """
     combined = _Batch()
+    seen: set[tuple[str, int]] = set()
     for batch in batches:
-        combined.items.extend(batch.items)
+        for item in batch.items:
+            if item.origin in seen:
+                continue
+            seen.add(item.origin)
+            combined.items.append(item)
         for key, values in batch.stances.items():
             combined.stances.setdefault(key, set()).update(values)
     return combined
@@ -513,6 +540,26 @@ def _run_evaluator(node: Mapping[str, Any], request: EvalRequest, result: EvalRe
                     node_id,
                     name,
                     f"evaluate() returned {type(finding).__name__}, not a Finding",
+                )
+            )
+            continue
+        bad_evidence = next(
+            (
+                reference
+                for reference in finding.evidence
+                if not isinstance(reference.run_id, str) or not isinstance(reference.span_id, str)
+            ),
+            None,
+        )
+        if bad_evidence is not None:
+            result.errors.append(
+                _message(
+                    "evaluator",
+                    node_id,
+                    name,
+                    "finding evidence run_id and span_id must be str, "
+                    f"not {type(bad_evidence.run_id).__name__} and "
+                    f"{type(bad_evidence.span_id).__name__}",
                 )
             )
             continue
