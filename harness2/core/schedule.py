@@ -223,15 +223,17 @@ def _restore_libraries(
         tree = harness_tree.read_tree(surface, n.task_dir(runs_root, task_id) / "harnesses" / label)
         if not tree:
             continue
-        memory.store(
-            lib,
-            task_id,
-            tree,
-            why=str(sel.get("why") or ""),
-            label=label,
-            run_id=str(sel.get("chosen_run_id") or ""),
-            experience=sel.get("experience") or {},
-        )
+        with trace.span(trace.Kind.MODE, mode=mode, resumed=True):
+            memory.store(
+                lib,
+                task_id,
+                tree,
+                why=str(sel.get("why") or ""),
+                label=label,
+                run_id=str(sel.get("chosen_run_id") or ""),
+                experience=sel.get("experience") or {},
+                mode=mode,
+            )
 
 
 @dataclass
@@ -657,7 +659,7 @@ def _recall_tree(
     """
     if recorded is None or (isinstance(recorded, Mapping) and not recorded):
         room = recall_block.room(surface, base_tree)
-        text = memory.recall(mode_lib, task_id, room, query=query)
+        text = memory.recall(mode_lib, task_id, room, query=query, mode=mode)
     else:
         if not isinstance(recorded, Mapping) or not isinstance(recorded.get("text"), str):
             raise ValueError(f"recorded memory_recall for {mode} has no text")
@@ -767,6 +769,7 @@ def _run_one_mode(
             label=sel.chosen_label,
             run_id=sel.chosen_run_id,
             experience=sel.experience,
+            mode=mode,
         )
 
 
@@ -896,62 +899,64 @@ def run_task(
                 prompt: str | None = None
                 for mode in modes:
                     n = Namespace(bench, sub, mode, k, seed, tag)
-                    try:
-                        mode_lib = mode_libs.get(mode)
-                        mode_tree = base_tree
-                        if memory_recall and mode_lib is not None:
-                            recorded = recorded_recall.get(mode)
-                            if prompt is None and not recorded:
-                                try:
-                                    prompt = adapter.task_prompt(task_id)
-                                except Exception:
-                                    prompt = ""
-                            mode_tree = _recall_tree(
+                    with trace.span(trace.Kind.MODE, mode=mode) as mode_span:
+                        try:
+                            mode_lib = mode_libs.get(mode)
+                            mode_tree = base_tree
+                            if memory_recall and mode_lib is not None:
+                                recorded = recorded_recall.get(mode)
+                                if prompt is None and not recorded:
+                                    try:
+                                        prompt = adapter.task_prompt(task_id)
+                                    except Exception:
+                                        prompt = ""
+                                mode_tree = _recall_tree(
+                                    mode,
+                                    task_id,
+                                    surface=surface,
+                                    base_tree=base_tree,
+                                    mode_lib=mode_lib,
+                                    query=prompt or "",
+                                    recorded=recorded,
+                                    res=res,
+                                )
+                            _run_one_mode(
                                 mode,
                                 task_id,
-                                surface=surface,
-                                base_tree=base_tree,
+                                k,
+                                base,
+                                adapter=adapter,
+                                prop=prop,
+                                selector=selector,
+                                n=n,
+                                runs_root=runs_root,
                                 mode_lib=mode_lib,
-                                query=prompt or "",
-                                recorded=recorded,
+                                base_tree=mode_tree,
+                                surface=surface,
+                                pool_policy=pool_policy,
                                 res=res,
                             )
-                        _run_one_mode(
-                            mode,
-                            task_id,
-                            k,
-                            base,
-                            adapter=adapter,
-                            prop=prop,
-                            selector=selector,
-                            n=n,
-                            runs_root=runs_root,
-                            mode_lib=mode_lib,
-                            base_tree=mode_tree,
-                            surface=surface,
-                            pool_policy=pool_policy,
-                            res=res,
-                        )
-                    except Exception as exc:
-                        failed = {
-                            "ok": False,
-                            "error": f"{type(exc).__name__}: {exc}",
-                            "traceback": traceback.format_exc()[-1500:],
-                        }
-                        previous = res.modes.get(mode)
-                        if isinstance(previous, dict):
-                            # Keep the ledger the mode recorded before it failed.
-                            previous.update(failed)
-                            res.modes[mode] = previous
-                        else:
-                            res.modes[mode] = failed
-                        message = f"{mode}: {type(exc).__name__}: {exc}"
-                        res.errors.append(message)
-                        trace.event(trace.Kind.ERROR, where=f"mode:{mode}", message=message)
-                    _trace_cost(mode, res)
-                    res.status = "partial"
-                    res.models, res.model_connector = _adapter_models(adapter, task_id)
-                    _write_summary(summary_path, res)
+                        except Exception as exc:
+                            failed = {
+                                "ok": False,
+                                "error": f"{type(exc).__name__}: {exc}",
+                                "traceback": traceback.format_exc()[-1500:],
+                            }
+                            previous = res.modes.get(mode)
+                            if isinstance(previous, dict):
+                                # Keep the ledger the mode recorded before it failed.
+                                previous.update(failed)
+                                res.modes[mode] = previous
+                            else:
+                                res.modes[mode] = failed
+                            message = f"{mode}: {type(exc).__name__}: {exc}"
+                            res.errors.append(message)
+                            trace.event(trace.Kind.ERROR, where=f"mode:{mode}", message=message)
+                            mode_span.set(ok=False, error=message)
+                        _trace_cost(mode, res)
+                        res.status = "partial"
+                        res.models, res.model_connector = _adapter_models(adapter, task_id)
+                        _write_summary(summary_path, res)
 
                 res.status = _merged_status(res.to_dict())
                 res.models, res.model_connector = _adapter_models(adapter, task_id)

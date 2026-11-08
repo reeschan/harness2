@@ -286,6 +286,7 @@ def store(
     label: str = "",
     run_id: str = "",
     experience: dict | None = None,
+    mode: str = "",
 ) -> Path | None:
     """Hand one adopted harness and its experience to `conn`.
 
@@ -295,7 +296,8 @@ def store(
 
     A MEMORY_STORE event records whether `conn.add` was called (`stored`) and what it returned
     (`path`), so a connector that stores and returns None is still `stored=True`. Nothing is
-    emitted when the grader-verdict check raises: the exception is the caller's.
+    emitted when the grader-verdict check raises: the exception is the caller's. `mode` is
+    recorded on the event (as "" when the caller has none); it is not handed to `conn`.
     """
     if not library.has_experience(experience):
         trace.event(
@@ -305,6 +307,7 @@ def store(
             label=label,
             stored=False,
             path=None,
+            mode=mode,
         )
         return None
     harness = recall_block.strip(harness)
@@ -318,11 +321,14 @@ def store(
         label=label,
         stored=True,
         path=str(path) if path is not None else None,
+        mode=mode,
     )
     return path
 
 
-def recall(conn: MemoryConnector, task_id: str, limit_chars: int, *, query: str = "") -> str:
+def recall(
+    conn: MemoryConnector, task_id: str, limit_chars: int, *, query: str = "", mode: str = ""
+) -> str:
     """The connector's recall text for `task_id`, cut to `limit_chars`.
 
     Recall is optional: a connector without a callable `recall`, or a `limit_chars` of zero or
@@ -333,7 +339,8 @@ def recall(conn: MemoryConnector, task_id: str, limit_chars: int, *, query: str 
 
     A MEMORY_RECALL event carries the connector, the task, the length and the sha256 of the
     returned text, and never the text itself; a connector without a recall, or a limit of zero
-    or less, emits it with chars=0.
+    or less, emits it with chars=0. `mode` is recorded on the event (as "" when the caller has
+    none); it is not handed to the connector.
     """
     fn = getattr(conn, "recall", None)
     text = ""
@@ -359,6 +366,7 @@ def recall(conn: MemoryConnector, task_id: str, limit_chars: int, *, query: str 
         task_id=task_id,
         chars=len(text),
         sha256=trace.digest(text),
+        mode=mode,
     )
     return text
 

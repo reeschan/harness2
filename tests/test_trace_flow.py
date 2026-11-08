@@ -22,7 +22,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from harness2.core import recursion, schedule, selection, trace
+from harness2.core import memory, recursion, schedule, selection, trace
 from harness2.core.ledger import Ledger
 from harness2.core.proposer import ProposerError, Reply
 from harness2.core.spec import RunView
@@ -200,6 +200,34 @@ class TraceFlowTests(unittest.TestCase):
             span_id = parents[span_id]
         return span_id
 
+    def libraries(self):
+        surface = self.adapter.substrate.surface()
+        return {
+            mode: memory.connector_for(
+                self.root / "lib" / mode, self.adapter.domain_of(TASK_ID), surface
+            )
+            for mode in schedule.MODES
+        }
+
+    def run_with_memory(self, k=1):
+        return schedule.run_task(
+            TASK_ID,
+            k,
+            adapter=self.adapter,
+            prop=self.proposer,
+            runs_root=self.adapter.spec.runs_root,
+            libraries=self.libraries(),
+            memory_recall=True,
+        )
+
+    def mode_spans(self, events):
+        """span_id -> mode for every MODE start event."""
+        return {
+            event["span_id"]: event["attrs"]["mode"]
+            for event in events
+            if event["kind"] == trace.Kind.MODE and event["attrs"].get("phase") == "start"
+        }
+
     def assert_spans_are_paired(self, events):
         phases = {}
         for event in events:
@@ -275,38 +303,84 @@ class TraceFlowTests(unittest.TestCase):
         self.assertEqual(recorded["events"], len(same_run))
         self.assertEqual(set(event["run_id"] for event in same_run), {recorded["run_id"]})
 
-    def test_pooled_stages_and_rollouts_keep_the_task_as_parent(self):
-        self.run_one(k=2)
+    def test_pooled_stages_and_rollouts_hang_from_the_mode_span(self):
+        result = self.run_with_memory(k=2)
+        self.assertEqual(result.status, "ok")
         events = self.events(k=2)
         parents = self.parents(events)
-        task_starts = [
-            event
-            for event in events
-            if event["kind"] == trace.Kind.TASK and event["attrs"].get("phase") == "start"
-        ]
+        starts = [event for event in events if event["attrs"].get("phase") == "start"]
+        task_starts = [event for event in starts if event["kind"] == trace.Kind.TASK]
+        self.assertEqual(len(task_starts), 1)
         task_id = task_starts[0]["span_id"]
-        stage_starts = [
+        mode_ids = self.mode_spans(events)
+        self.assertTrue(mode_ids)
+        for span_id, mode in mode_ids.items():
+            self.assertEqual(parents[span_id], task_id, "a MODE span must hang from TASK")
+            self.assertIn(mode, schedule.MODES)
+
+        for kind in (
+            trace.Kind.STAGE,
+            trace.Kind.SELECTION,
+            trace.Kind.REFLECTION,
+        ):
+            found = [event for event in starts if event["kind"] == kind]
+            self.assertTrue(found, f"no {kind} events")
+            for event in found:
+                self.assertIn(event["parent_id"], mode_ids, f"{kind} must hang from MODE")
+        for kind in (trace.Kind.COST, trace.Kind.MEMORY_RECALL, trace.Kind.MEMORY_STORE):
+            found = [event for event in events if event["kind"] == kind]
+            self.assertTrue(found, f"no {kind} events")
+            for event in found:
+                self.assertIn(event["parent_id"], mode_ids, f"{kind} must hang from MODE")
+                self.assertEqual(event["attrs"]["mode"], mode_ids[event["parent_id"]])
+
+        base_rollouts = [
             event
-            for event in events
-            if event["kind"] == trace.Kind.STAGE and event["attrs"].get("phase") == "start"
+            for event in starts
+            if event["kind"] == trace.Kind.ROLLOUT and event["attrs"].get("role") == "base"
         ]
-        agg_stages = [event for event in stage_starts if event["attrs"].get("mode") == "agg"]
-        self.assertTrue(agg_stages)
-        for event in agg_stages:
-            self.assertEqual(event["parent_id"], task_id)
-        agg_rollouts = [
+        self.assertTrue(base_rollouts)
+        for event in base_rollouts:
+            self.assertEqual(event["parent_id"], task_id, "a base ROLLOUT must hang from TASK")
+        mode_rollouts = [
             event
-            for event in events
+            for event in starts
             if event["kind"] == trace.Kind.ROLLOUT
-            and event["attrs"].get("phase") == "start"
-            and event["attrs"].get("mode") == "agg"
+            and event["attrs"].get("role") in ("candidate", "final")
         ]
-        self.assertTrue(agg_rollouts)
-        for event in agg_rollouts:
-            self.assertEqual(event["parent_id"], task_id)
+        self.assertTrue(mode_rollouts)
+        for event in mode_rollouts:
+            self.assertIn(
+                event["parent_id"], mode_ids, "a candidate/final ROLLOUT must hang from MODE"
+            )
+            self.assertEqual(event["attrs"]["mode"], mode_ids[event["parent_id"]])
         for event in events:
             self.assertEqual(self.root_of(event["span_id"], parents), task_id)
         self.assert_spans_are_paired(events)
+
+    def test_one_mode_span_per_mode_with_its_mode(self):
+        self.run_one()
+        events = self.events()
+        starts = [
+            event
+            for event in events
+            if event["kind"] == trace.Kind.MODE and event["attrs"].get("phase") == "start"
+        ]
+        ends = [
+            event
+            for event in events
+            if event["kind"] == trace.Kind.MODE and event["attrs"].get("phase") == "end"
+        ]
+        self.assertEqual(sorted(event["attrs"]["mode"] for event in starts), sorted(schedule.MODES))
+        self.assertEqual(
+            sorted(event["span_id"] for event in starts),
+            sorted(event["span_id"] for event in ends),
+        )
+        self.assertEqual({event["run_id"] for event in starts}, {event["run_id"] for event in ends})
+        for event in starts:
+            self.assertIn(event["attrs"]["mode"], schedule.MODES)
+        for event in ends:
+            self.assertEqual(event["attrs"]["status"], "ok")
 
     def test_disabled_tracing_writes_no_file_and_says_so(self):
         with patch.dict(os.environ, {trace.ENABLE_VAR: "0"}):
@@ -379,6 +453,29 @@ class TraceFlowTests(unittest.TestCase):
             (self.adapter.execution_count, len(self.proposer._calls)), (executions, calls)
         )
         self.assertEqual(self.summary()["trace"]["run_id"], third.trace["run_id"])
+
+    def test_resume_wraps_each_mode_write_back_in_a_resumed_mode_span(self):
+        first = self.run_with_memory()
+        self.assertEqual(first.status, "ok")
+        second = self.run_with_memory()
+        self.assertEqual(second.status, "skipped")
+        events = [event for event in self.events() if event["run_id"] == second.trace["run_id"]]
+        mode_ids = self.mode_spans(events)
+        self.assertEqual(sorted(mode_ids.values()), sorted(schedule.MODES))
+        mode_starts = [
+            event
+            for event in events
+            if event["kind"] == trace.Kind.MODE and event["attrs"].get("phase") == "start"
+        ]
+        for event in mode_starts:
+            self.assertIs(event["attrs"]["resumed"], True)
+        stores = [event for event in events if event["kind"] == trace.Kind.MEMORY_STORE]
+        self.assertTrue(stores)
+        for event in stores:
+            self.assertIn(
+                event["parent_id"], mode_ids, "a resumed MEMORY_STORE must hang from MODE"
+            )
+            self.assertEqual(event["attrs"]["mode"], mode_ids[event["parent_id"]])
 
     def test_write_trace_leaves_a_missing_summary_alone(self):
         work = self.task_dir()
@@ -625,6 +722,14 @@ class TraceFlowTests(unittest.TestCase):
         self.assertEqual(len(costs), 1)
         self.assertEqual(costs[0]["attrs"]["usd"], record["ledger"]["usd"])
         self.assertEqual(costs[0]["attrs"]["R"], record["ledger"]["R"])
+        mode_ends = [
+            event
+            for event in self.events(2)
+            if event["kind"] == trace.Kind.MODE and event["attrs"].get("phase") == "end"
+        ]
+        self.assertEqual(len(mode_ends), 1)
+        self.assertIs(mode_ends[0]["attrs"]["ok"], False)
+        self.assertEqual(mode_ends[0]["attrs"]["error"], "agg: RuntimeError: selector exploded")
 
     def test_a_midrun_summary_keeps_the_previous_trace(self):
         work = self.task_dir()

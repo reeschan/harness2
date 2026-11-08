@@ -92,6 +92,7 @@ class Kind:
     """
 
     TASK = "task"
+    MODE = "mode"
     ROLLOUT = "rollout"
     STAGE = "stage"
     TREE_DIFF = "tree.diff"

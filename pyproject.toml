@@ -32,6 +32,7 @@ harness2-check = "harness2.cli.check:main"
 harness2-demo = "harness2.cli.demo:main"
 harness2-bridge = "harness2.cli.bridge:main"
 harness2-intake = "harness2.cli.intake:main"
+harness2-evaluate = "harness2.cli.evaluate:main"
 
 [tool.setuptools.packages.find]
 include = ["harness2*"]

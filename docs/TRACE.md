@@ -92,18 +92,25 @@ failed.
 | Kind | Value | Shape | Attributes |
 |---|---|---|---|
 | `TASK` | `task` | span | `task_id`, `domain`, `k`, `seed`, `modes`, and `resumed` (`false` on the start event; `true` on the end event when the run resumed) |
+| `MODE` | `mode` | span | `mode`, and `resumed` (`true` on the span that restores the libraries of a resumed task); on the end event `ok` and `error` when the mode body raised, while `status` stays `"ok"` |
 | `ROLLOUT` | `rollout` | span | `role` (`base` / `candidate` / `final`), `mode`, `label`, `run_id` (the rollout's run id, not the trace's); on the end event `ok`, `delivered`, `usd`, `error` |
 | `STAGE` | `stage` | span | `label`, `dim` (`INV` / `DOM` / `compose`), `mode`; on the end event `kept_base`, `fell_back`, `attempts`, `cached`, `usd`, `error` |
 | `TREE_DIFF` | `tree.diff` | point | `label`, `files`: a list of `{path, sha256, change}`, where `change` is `added`, `changed` or `removed` |
 | `SELECTION` | `selection` | span | `mode`, `pool` (the candidate labels); on the end event `chosen_label`, `ok`, `usd`, `error` |
 | `REFLECTION` | `reflection` | span | `mode`; on the end event `chosen_label`, `ok`, `usd`, `error` |
-| `MEMORY_RECALL` | `memory.recall` | point | `connector`, `task_id`, `chars`, `sha256` of the recalled text; never the text |
-| `MEMORY_STORE` | `memory.store` | point | `connector`, `task_id`, `label`, `stored` (bool), `path` (may be `null`) |
+| `MEMORY_RECALL` | `memory.recall` | point | `connector`, `task_id`, `chars`, `mode`, `sha256` of the recalled text; never the text |
+| `MEMORY_STORE` | `memory.store` | point | `connector`, `task_id`, `label`, `mode`, `stored` (bool), `path` (may be `null`) |
 | `MODEL_ROUTE` | `model.route` | point | `role`, `candidates`: a list of `{runner, model, effort}`; the executor also has `skipped_other_runners` |
-| `MODEL_SWITCH` | `model.switch` | point | `role`, `from` and `to` as `{runner, model, effort}`, `reason`; `to` is `null` when no candidate is left |
+| `MODEL_SWITCH` | `model.switch` | point | `role`, `from` and `to` as `{runner, model, effort}`, `reason` (for the improver, the error as `sha256=<hex> chars=<n>`; empty for the executor); `to` is `null` when no candidate is left |
 | `MODEL_FENCE` | `model.fence` | point | `role`, `fenced`, `runners`, `problems`, `model` |
 | `COST` | `cost` | point | `mode`, `usd`, `rollout_usd`, `session_usd`, `R`, `P`, at the end of each mode |
 | `ERROR` | `error` | point | `where`, `message` |
+
+A mode that failed still ends with `status: "ok"`: the run catches the mode's exception inside the
+span. The failure shows as `ok: false` and `error` on the span's end event, and as an `ERROR`
+event with `where` `mode:<mode>`. The one `MODE` span without that catch is the restore of a
+resumed task (`resumed: true`): if the restore raises, its end event has `status: "error"` and
+`error`, with no `ok` and no `ERROR` event, and the exception propagates to the `TASK` span.
 
 ## Parent and child
 
@@ -113,9 +120,12 @@ failed.
 - A span's parent is the span that was current when it started, and a point event's parent is
   the span that is current when it is emitted. The current span lives in a context variable,
   so a helper does not have to receive it as an argument.
-- This puts `ROLLOUT`, `STAGE`, `SELECTION`, `REFLECTION`, `COST`, `ERROR` and the `MEMORY_*`
-  events under the `TASK` span (or under an enclosing span when one is added), a `TREE_DIFF`
-  under its stage, and the `MODEL_*` events under whichever span is current.
+- A `MODE` span hangs from `TASK`, one per mode. Its children are the parts of that mode: the
+  `ROLLOUT` spans of role `candidate` or `final`, the `STAGE` spans and their `TREE_DIFF`, the
+  `SELECTION` and `REFLECTION` spans, the mode's `COST`, its `ERROR`, and the `MEMORY_*` events.
+  A `base` rollout runs before the modes and stays under `TASK`, and the `MEMORY_STORE` that a
+  resumed task writes back runs in a `MODE` span of its own with `resumed: true`. The
+  `MODEL_*` events stay under whichever span is current.
 - `trace.use(tracer)` makes a tracer current and drops any span carried in, so a new run never
   attaches to the span of an earlier one. It does not close the tracer; the caller that opened
   it does.
@@ -156,6 +166,13 @@ A trace is metadata, not a copy of the work:
   with its hash is a size-based safety net for big values, not a check for bodies: a string of
   512 characters or fewer is kept as it is, so the caller must not pass a body. The length
   rule applies to string values, not to mapping keys.
+- An error text follows the same rule where it could quote a body. The check that refuses a
+  grader verdict keeps the file name, the marker and the offset, and replaces the excerpt with
+  `(excerpt sha256=<hex> chars=<n>)`; the improver's CLI error keeps the subtype and replaces
+  the reply with `reply sha256=<hex> chars=<n>`; the improver's `model.switch` keeps its
+  `reason` as `sha256=<hex> chars=<n>`. A short error therefore carries no body, and
+  neither do the `errors` of `summary.json`. The CLI's own stderr excerpt (`rc=...`) is kept:
+  it is the tool's diagnostic, not a body.
 - Grading stays out of the method's trace: no scores, verdicts or private criteria. Kinds
   starting with `judge.` (`trace.JUDGE_PREFIX`) are reserved for the grading side. The method
   side never emits one; grading code may append its own events (for example, `judge.score`) to
