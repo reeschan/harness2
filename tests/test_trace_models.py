@@ -24,7 +24,7 @@ from unittest import mock
 
 from harness2.benchmarks import intake_worktree as iw
 from harness2.core import memory, models, trace
-from harness2.core.proposer import ModelSession, Proposer
+from harness2.core.proposer import ModelSession, Proposer, ProposerError
 from harness2.core.spec import ChannelSpec
 
 CONNECTOR_SPEC = ChannelSpec("connector", "")
@@ -338,6 +338,46 @@ class ImproverTraceTest(TraceTestBase):
         self.assertIsNone(choice)
         switch = self.one(trace.Kind.MODEL_SWITCH)
         self.assertEqual(switch.attrs["reason"], "")
+
+    def test_the_terminal_error_hashes_the_connector_text(self):
+        gone = models.SessionResult(text="", ok=False, unavailable=True, error="BODY-TEXT")
+        conn, prop = self.connector([A], [gone])
+        with trace.use(self.tracer()):
+            text, _cost, error, choice = self.run_connector(prop)
+        self.assertEqual(text, "")
+        self.assertIsNone(choice)
+        self.assertEqual(
+            error,
+            f"no fenced improver model: sha256={trace.digest('BODY-TEXT')} chars=9",
+        )
+        self.assertNotIn("BODY-TEXT", error)
+
+    def test_the_proposer_error_hashes_the_connector_text(self):
+        gone = models.SessionResult(text="", ok=False, unavailable=True, error="BODY-TEXT")
+        conn, prop = self.connector([A], [gone])
+        with trace.use(self.tracer()):
+            with self.assertRaises(ProposerError) as caught:
+                prop.call("mission", None, "improve", max_attempts=1)
+        message = str(caught.exception)
+        self.assertIn(f"sha256={trace.digest('BODY-TEXT')} chars=9", message)
+        self.assertNotIn("BODY-TEXT", message)
+
+    def test_a_failed_candidate_hashes_the_connector_text(self):
+        failed = models.SessionResult(text="", ok=False, error="BODY-TEXT")
+        conn, prop = self.connector([A], [failed])
+        with trace.use(self.tracer()):
+            text, _cost, error, choice = self.run_connector(prop)
+        self.assertEqual(text, "")
+        self.assertEqual(choice, A)
+        self.assertEqual(error, f"sha256={trace.digest('BODY-TEXT')} chars=9")
+        self.assertNotIn("BODY-TEXT", error)
+
+    def test_a_failed_candidate_without_error_text_says_session_failed(self):
+        failed = models.SessionResult(text="", ok=False, error="")
+        conn, prop = self.connector([A], [failed])
+        with trace.use(self.tracer()):
+            _text, _cost, error, _choice = self.run_connector(prop)
+        self.assertEqual(error, "session failed")
 
     def test_a_candidate_without_a_fence_emits_fence(self):
         other = models.ModelChoice("opencode", "prov/x")

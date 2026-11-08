@@ -71,6 +71,11 @@ def _obj(d: dict, key: str) -> dict:
     return v if isinstance(v, dict) else {}
 
 
+def _error_digest(text: str) -> str:
+    """The trace-safe form of a connector error text; empty stays empty."""
+    return f"sha256={trace.digest(text)} chars={len(text)}" if text else ""
+
+
 class ProposerError(RuntimeError):
     """A call did not produce a usable reply. Never swallowed into an empty string."""
 
@@ -435,7 +440,7 @@ class Proposer:
             if ok:
                 return res.text, cost, error, choice
             if unavailable:
-                last = error or "unavailable"
+                last = _error_digest(error) or "unavailable"
                 following = next(
                     (later for later in candidates[index + 1 :] if later.runner in session.fenced),
                     None,
@@ -448,9 +453,13 @@ class Proposer:
                         "to": _choice_attrs(following) if following is not None else None,
                     },
                     role="improver",
-                    reason=f"sha256={trace.digest(text)} chars={len(text)}" if text else "",
+                    reason=_error_digest(text),
                 )
                 continue
+            # The connector's own text is hashed; the fixed notes ("empty reply",
+            # "connector ran X instead of Y") are kept as they are.
+            if error and error == res.error:
+                error = _error_digest(error)
             return "", cost, error or "session failed", choice
         detail = f": {last}" if last else ""
         return "", cost, f"no fenced improver model{detail}", None
