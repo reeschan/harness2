@@ -37,13 +37,13 @@ flowchart LR
    objects; a rebut node adds a stance to the findings it receives; the aggregate node drops,
    merges and orders what reaches it.
 4. **The findings.** `harness2-evaluate` writes `findings.json` (after aggregation, with the
-   dropped counts and the errors of the run) and one `findings/<viewpoint>.json` per viewpoint
-   (before aggregation).
+   dropped counts, the errors of the run and the warnings from building the graph) and one
+   `findings/<viewpoint>.json` per viewpoint (before aggregation).
 
 ## Running the evaluation
 
 ```bash
-harness2-evaluate --runs runs/jb-oc-agg-k1
+harness2-evaluate --runs runs/jb/adapt/jb-oc-agg1
 ```
 
 The command reads every trace under `--runs` and writes its output under
@@ -83,6 +83,7 @@ what to evaluate is the graph config's job: the command does not filter by task 
   ],
   "dropped": {"no_evidence": 0, "denied": 0},
   "errors": [],
+  "warnings": [],
   "traces": 4,
   "runs": 4
 }
@@ -93,13 +94,18 @@ what to evaluate is the graph config's job: the command does not filter by task 
 | `findings` | The aggregated findings, heaviest first |
 | `dropped` | How many findings the aggregate dropped, by reason (`no_evidence`, `denied`) |
 | `errors` | One line per node that failed after its name resolved; the run kept going |
+| `warnings` | One line per problem while building the graph: a trace or summary that could not be read, a summary that is not a JSON object, or a node whose parent span is missing. A skipped check is visible here instead of failing the run |
 | `traces` | How many `trace.jsonl` files were read |
 | `runs` | How many `task` nodes the graph holds |
+
+The warnings are also printed to standard error, one `warning: ...` line each, so a problem in
+the input shows up without opening `findings.json`.
 
 `findings/<viewpoint>.json` holds the findings that viewpoint's evaluator wrote, before the
 aggregate node touched them, as a JSON list of the plain seven-field findings. Every chosen
 viewpoint gets a file, even when the list is empty; the file name is the viewpoint name, so a
-viewpoint name is always `[a-z][a-z0-9_]*`.
+viewpoint name is always `[a-z][a-z0-9_]*`. A rerun replaces the directory's contents: a file
+of a viewpoint the new graph no longer chooses is removed, so `findings/` matches the last run.
 
 ## The run graph
 
@@ -131,9 +137,10 @@ A `Graph` is what the traces say happened. Nothing in it knows harness2's kinds 
 | `find(run_id, span_id)` | The node, or `None` |
 
 `graph.build(paths)` builds from explicit files; `graph.load_runs(root)` finds every
-`trace.jsonl` under `root` and reads the `summary.json` in the same directory. A summary that
-cannot be read is a warning, and a directory without one is left out. A node whose parent span
-is missing stays a root and adds a warning, so reading never fails. Kinds starting with
+`trace.jsonl` under `root` and reads the `summary.json` in the same directory. A trace that
+cannot be read is a warning, and so is a summary that cannot be read; a directory without a
+summary is left out. A node whose parent span is missing stays a root and adds a warning, so
+reading never fails. Kinds starting with
 `trace.JUDGE_PREFIX` (`judge.`) are left out unless `include_judge=True`; the default view is
 the method side.
 
@@ -142,7 +149,7 @@ from pathlib import Path
 
 from harness2.core import graph, trace
 
-level, summaries = graph.load_runs(Path("runs/jb-oc-agg-k1"))
+level, summaries = graph.load_runs(Path("runs/jb/adapt/jb-oc-agg1"))
 for node in level.of_kind(trace.Kind.MODE):
     print(node.run_id, node.attrs.get("mode"), node.status, node.dur_s)
 ```
@@ -175,35 +182,52 @@ trace, so the same request gives the same findings. It is registered under the n
 | Check | Viewpoint | Severity | Evidence |
 |---|---|---|---|
 | The ledger identity: each mode's `ledger` must record `R = 4k` and `P = 3k`, with `R == expected_R` and `P == expected_P` | `budget` | `major` | The `mode` span and its `cost` children, else the `task` node |
+| A ledger whose `R`, `P`, `expected_R` or `expected_P` is missing or not an integer | `budget` | `major` | The `mode` span and its `cost` children, else the `task` node |
 | The same identity on the trace: a mode's `candidate` and `final` rollouts plus the shared base rollouts must number `4k`, and its stages `3k` | `budget` | `major` | The `mode` span and up to two rollouts and stages |
+| A mode the `task` span's `modes` asks for that has neither a `MODE` span nor a ledger entry, in a run that is not a resume | `budget` | `major` | The `task` node |
 | The cost agreement: the sum of the modes' ledger `rollout_usd`, with the shared base rollouts counted once, against the sum of `summary.json`'s `models.executor[].cost_usd` | `cost` | `major` | The `task` node and the `cost` events |
 | More model switches in one task than `max_switches` | `reproducibility` | `minor` | Every `model.switch` of the task |
 | A stage whose `attempts` exceed `max_attempts` | `reproducibility` | `minor` | The stage spans |
-| A fenced model candidate (`model.fence` with `fenced` false) while no stage succeeded after the fence | `safety` | `major` | The fence events |
-| The same fence, when a stage that did not fall back succeeded after it | `safety` | `info` | The fence events |
-| Errors: `error` events and failed spans, grouped by `where` (or the kind when `where` is absent) | `reproducibility` | `minor` for two or more tasks, else `info` | Up to ten nodes of the group |
+| A fenced model candidate (`model.fence` with `fenced` false) while at least one fence of the task was not recovered | `safety` | `major` | The fence events |
+| The same fences, when every fence of the task was recovered | `safety` | `info` | The fence events |
+| Errors: `error` events, failed spans, and spans that ended `status: "ok"` with an `error` or `ok: false`, grouped by `where` (or the kind when `where` is absent) | `reproducibility` | `minor` for two or more tasks, else `info` | Up to ten nodes of the group |
 
 The identity is `4k` and `3k` because the budget is fixed per mode at four rollouts and three
 improvement stages for each of the `k` recursion steps. `k` comes from `summary.json`, else from
-the `task` span's attrs; without it the ledger check compares the recorded values with the
-`expected_*` ones and the trace-count check is skipped. The trace-count check runs per run and
-skips a resumed mode's span, and the base rollouts are counted once, not once per mode.
+the `task` span's attrs. A summary may keep its modes under the older key `arms` instead of
+`modes`; the ledger and cost checks read either. If any of `R`, `P`, `expected_R` or
+`expected_P` is missing or not an integer, the ledger check reports a finding instead of
+passing the mode. Without `k` the check compares the recorded values with the `expected_*` ones
+and the trace-count check is skipped.
+
+The trace-count check runs per run and skips a resumed mode's span, and the base rollouts are
+counted once, not once per mode. In a run that is not a resume, a mode named in the `task`
+span's `modes` but with neither a `MODE` span nor a ledger entry gets a budget finding, because
+the mode did not run.
 
 The two checks that read the summary, the ledger identity and the cost agreement, run once per
 task run directory, because a resumed task adds a second run to the same trace and reads the
 same `summary.json`. They read the graph of the last run that is not a resume (a `task` span
 whose end attrs do not say `resumed`), or the last run when every run is a resume. Their keys
-name the task (`rules:cost:<task>`, `rules:budget:ledger:<task>:<mode>`), so one wrong ledger is
-one finding however many runs the trace holds.
+name the task and the task run directory (the summary's path as a string), such as
+`rules:cost:...`, so one wrong ledger is one finding however many runs the trace holds, while
+the same task in two experiments stays two findings.
 
 The cost check allows the larger of `cost_tolerance_usd` and `cost_tolerance_ratio` times the
 larger of the two totals. It also reports a total of `0.0` on one side against a non-zero total
 on the other, because no tolerance covers that.
 
-A fence counts as followed by success when a `stage` of the same run has `status == "ok"`, no
-`error` attr, an `ok` attr that is not `false`, `fell_back` not set, and a `start_ts` later than
-the fence event. A `selection` does not count: a `k=1` selection succeeds even when every
-improvement stage fell back.
+A fence counts as recovered when a `stage` of the same run ended `ok` with no `error` attr, an
+`ok` attr that is not `false` and no `fell_back`, and either that stage is an ancestor of the
+fence (a parallel stage that emitted the fence and overlapped it) or it started after the fence
+event. A `selection` does not count: a `k=1` selection succeeds even when every improvement
+stage fell back. The task is judged as a whole: one unrecovered fence is a `major` finding, and
+only the case where every fence is recovered is `info`.
+
+A span is counted as a failure when it ended `status: "error"`, and also when it ended
+`status: "ok"` but carries an `error` or `ok: false`, as a failed rollout or a failed mode does.
+A failed mode is still counted once: its `mode:<mode>` `ERROR` event carries it, and its `MODE`
+span is not counted again.
 
 `rules` never reads `request.scores`. The options are keyword arguments of the factory:
 
@@ -245,7 +269,7 @@ evaluators into one aggregate:
 ```
 
 Save it as `eval-graph.json` and run
-`harness2-evaluate --runs runs/jb-oc-agg-k1 --graph eval-graph.json`. Replace
+`harness2-evaluate --runs runs/jb/adapt/jb-oc-agg1 --graph eval-graph.json`. Replace
 `my_package.checks:make_checks` with a name that resolves in your installation before running,
 because the config is checked when it is read, not lazily.
 
@@ -514,6 +538,9 @@ see it, so an evidence reference to a `judge.` node is dropped like any other mi
 - **`errors` is not empty.** A node failed after its name resolved. The line names the node, the
   name and the exception; the rest of the graph still ran. Fix the evaluator or rebutter, or the
   data it expected.
+- **`warnings` is not empty.** The graph was built from an incomplete input: a trace or summary
+  that could not be read, a summary that is not a JSON object, or a node whose parent span is
+  missing. The findings still describe what was read; the warning names what was left out.
 - **The same problem appears twice.** Give the finding a `key` that names the problem, not the
   wording, so the aggregate merges the two.
 

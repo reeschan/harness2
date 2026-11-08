@@ -79,7 +79,7 @@ events = read(task_dir / "trace.jsonl")
 | `COST` | `cost` | point | 各モードの終わりに `mode`、`usd`、`rollout_usd`、`session_usd`、`R`、`P` |
 | `ERROR` | `error` | point | `where`、`message` |
 
-失敗したモードでも、終了イベントの `status` は `"ok"` です。モードの例外は span の中で実行が握るからです。失敗は、span の終了イベントの `ok: false` と `error`、そして `where` が `mode:<mode>` の `ERROR` イベントで表れます。
+失敗したモードでも、終了イベントの `status` は `"ok"` です。モードの例外は span の中で実行が握るからです。失敗は、span の終了イベントの `ok: false` と `error`、そして `where` が `mode:<mode>` の `ERROR` イベントで表れます。例外を握らない `MODE` の span は、再開したタスクの書き戻し（`resumed: true`）だけです。書き戻しが例外を投げると、その span は `status: "error"` と `error` で終わり、`ok` も `ERROR` イベントも無く、例外は `TASK` の span まで伝わります。
 
 ## 親と子
 

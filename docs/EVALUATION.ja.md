@@ -21,12 +21,12 @@ flowchart LR
 1. **トレース。** 各タスク実行は、`summary.json` のあるタスクの実行ディレクトリに `trace.jsonl` を書きます。イベントの種類と親子のつなぎ方は[トレースのシンク](TRACE.ja.md)にあります。ここで重要なのは span（`task`、`mode`、`rollout`、`stage`、`selection`、`reflection`）と point event（`tree.diff`、`memory.*`、`model.*`、`cost`、`error`）です。
 2. **実行のグラフ。** `graph.load_runs(root)` が `root` の下の `trace.jsonl` をすべて読み、span の開始と終了を 1 つのノードにまとめ、親から子へ辺を張ります。隣の `summary.json` も読みます。結果は `Graph` と summary の `dict` です。
 3. **評価のグラフ。** `evalgraph.run(config, request)` が評価者のノード、反論のノード、1 つの集約ノードを DAG として動かします。評価者のノードはグラフの一部を `Finding` に変え、反論のノードは受け取った所見に立場を足し、集約ノードが届いたものを落とし・まとめ・並べます。
-4. **所見。** `harness2-evaluate` が `findings.json`（集約の後。落とした数と実行中のエラーつき）と、観点ごとの `findings/<viewpoint>.json`（集約の前）を書きます。
+4. **所見。** `harness2-evaluate` が `findings.json`（集約の後。落とした数、実行中のエラー、グラフを作るときの警告つき）と、観点ごとの `findings/<viewpoint>.json`（集約の前）を書きます。
 
 ## 評価を回す
 
 ```bash
-harness2-evaluate --runs runs/jb-oc-agg-k1
+harness2-evaluate --runs runs/jb/adapt/jb-oc-agg1
 ```
 
 このコマンドは `--runs` の下のトレースをすべて読み、既定では `<runs>/evaluation` の下に出力を書きます。コマンドはパッケージと一緒に入ります。`uv pip install -e .`（またはリポジトリの通常のインストール）のあと、`harness2-evaluate` がパスに載ります。
@@ -62,6 +62,7 @@ harness2-evaluate --runs runs/jb-oc-agg-k1
   ],
   "dropped": {"no_evidence": 0, "denied": 0},
   "errors": [],
+  "warnings": [],
   "traces": 4,
   "runs": 4
 }
@@ -72,10 +73,13 @@ harness2-evaluate --runs runs/jb-oc-agg-k1
 | `findings` | 集約後の所見。重い順 |
 | `dropped` | 集約が落とした所見の数。理由（`no_evidence`、`denied`）ごと |
 | `errors` | 名前が解決したあとに失敗したノードの 1 行。実行は続く |
+| `warnings` | グラフを作るときの問題の 1 行。読めないトレースや summary、JSON オブジェクトでない summary、親 span の無いノード。飛ばした検査はここに出て、実行は止まらない |
 | `traces` | 読んだ `trace.jsonl` の数 |
 | `runs` | グラフが持つ `task` ノードの数 |
 
-`findings/<viewpoint>.json` には、その観点の評価者が書いた所見を、集約ノードが触る前の形で JSON のリストとして入れます。選ばれた観点には、リストが空でもファイルができます。ファイル名が観点名になるので、観点名は必ず `[a-z][a-z0-9_]*` です。
+警告は標準エラーにも 1 行ずつ `warning: ...` で出るので、`findings.json` を開かなくても入力の問題に気づけます。
+
+`findings/<viewpoint>.json` には、その観点の評価者が書いた所見を、集約ノードが触る前の形で JSON のリストとして入れます。選ばれた観点には、リストが空でもファイルができます。ファイル名が観点名になるので、観点名は必ず `[a-z][a-z0-9_]*` です。回し直すとディレクトリの中身は入れ替わります。新しいグラフが選ばない観点のファイルは消えるので、`findings/` は最後の回の内容になります。
 
 ## 実行のグラフ
 
@@ -105,14 +109,14 @@ harness2-evaluate --runs runs/jb-oc-agg-k1
 | `subgraph(kinds=None, run_ids=None)` | 条件に合うノード。残った最も近い祖先につなぎ直す |
 | `find(run_id, span_id)` | そのノード。無ければ `None` |
 
-`graph.build(paths)` はファイルを明示して作り、`graph.load_runs(root)` は `root` の下の `trace.jsonl` をすべて探し、同じディレクトリの `summary.json` を読みます。読めない summary は警告になり、無いディレクトリは省かれます。親 span が無いノードは根として残り警告が加わるので、読み込みが失敗することはありません。`trace.JUDGE_PREFIX`（`judge.`）で始まる種類は `include_judge=True` のときだけ入り、既定は手法側の見え方です。
+`graph.build(paths)` はファイルを明示して作り、`graph.load_runs(root)` は `root` の下の `trace.jsonl` をすべて探し、同じディレクトリの `summary.json` を読みます。読めないトレースは警告になり、読めない summary も警告になり、summary の無いディレクトリは省かれます。親 span が無いノードは根として残り警告が加わるので、読み込みが失敗することはありません。`trace.JUDGE_PREFIX`（`judge.`）で始まる種類は `include_judge=True` のときだけ入り、既定は手法側の見え方です。
 
 ```python
 from pathlib import Path
 
 from harness2.core import graph, trace
 
-level, summaries = graph.load_runs(Path("runs/jb-oc-agg-k1"))
+level, summaries = graph.load_runs(Path("runs/jb/adapt/jb-oc-agg1"))
 for node in level.of_kind(trace.Kind.MODE):
     print(node.run_id, node.attrs.get("mode"), node.status, node.dur_s)
 ```
@@ -139,21 +143,27 @@ for node in level.of_kind(trace.Kind.MODE):
 | 検査 | 観点 | 重さ | 根拠 |
 |---|---|---|---|
 | 台帳の恒等式: モードごとの `ledger` が `R = 4k` と `P = 3k` を記録し、`R == expected_R` と `P == expected_P` であること | `budget` | `major` | `mode` の span とその `cost` の子。無ければ `task` のノード |
+| `R`、`P`、`expected_R`、`expected_P` のどれかが無いか int でない台帳 | `budget` | `major` | `mode` の span とその `cost` の子。無ければ `task` のノード |
 | 同じ恒等式をトレースで: モードの `candidate` と `final` のロールアウトに共有のベースのロールアウトを足して `4k`、段が `3k` であること | `budget` | `major` | `mode` の span と、最大 2 つのロールアウトと段 |
+| 再開でない run で、`task` の span の `modes` が名指すモードに `MODE` の span も台帳も無い | `budget` | `major` | `task` のノード |
 | 費用の一致: モードの台帳の `rollout_usd` の合計（共有のベースは 1 回だけ数える）と、`summary.json` の `models.executor[].cost_usd` の合計 | `cost` | `major` | `task` のノードと `cost` のイベント |
 | 1 タスクのモデルの切り替えが `max_switches` を超える | `reproducibility` | `minor` | そのタスクの全 `model.switch` |
 | `attempts` が `max_attempts` を超える段 | `reproducibility` | `minor` | その段の span |
-| 柵で外したモデル候補（`fenced` が false の `model.fence`）があり、柵より後に成功した段が無い | `safety` | `major` | 柵のイベント |
-| 同じ柵で、柵より後に、フォールバックしなかった段が成功した | `safety` | `info` | 柵のイベント |
-| エラーの集計: `error` のイベントと失敗した span を、`where`（無ければ種類）ごとに数える | `reproducibility` | 2 タスク以上なら `minor`、1 つなら `info` | その組のノード（最大 10 件） |
+| 柵で外したモデル候補（`fenced` が false の `model.fence`）があり、回復していない柵が 1 つでもある | `safety` | `major` | 柵のイベント |
+| 同じ柵で、そのタスクの柵がすべて回復した | `safety` | `info` | 柵のイベント |
+| エラーの集計: `error` のイベント、失敗した span、`status` が `"ok"` でも `error` か `ok: false` を持つ span を、`where`（無ければ種類）ごとに数える | `reproducibility` | 2 タスク以上なら `minor`、1 つなら `info` | その組のノード（最大 10 件） |
 
-恒等式が `4k` と `3k` なのは、予算がモードごとに再帰 `k` 回分のロールアウト 4 つと改善段 3 つに固定されているからです。`k` は `summary.json`、無ければ `task` の span の attrs から取ります。無いときは、台帳の検査が記録値と `expected_*` を比べ、トレースの数の検査は飛ばします。トレースの数の検査は run ごとに行い、再開したモードの span は数から外します。ベースのロールアウトはモードごとではなく 1 回だけ数えます。
+恒等式が `4k` と `3k` なのは、予算がモードごとに再帰 `k` 回分のロールアウト 4 つと改善段 3 つに固定されているからです。`k` は `summary.json`、無ければ `task` の span の attrs から取ります。古い summary はモードを `modes` ではなく `arms` に持つことがあり、台帳と費用の検査はどちらも読みます。`R`、`P`、`expected_R`、`expected_P` のどれかが無いか int でないときは、そのモードをそのまま通さずに所見を出します。`k` が無いときは、台帳の検査が記録値と `expected_*` を比べ、トレースの数の検査は飛ばします。
 
-summary を根拠にする 2 つの検査（台帳の恒等式と費用の一致）は、タスクの実行ディレクトリごとに 1 回だけ行います。再開したタスクは同じトレースに 2 つ目の run を足し、同じ `summary.json` を読むからです。根拠にするグラフは、そのトレースの再開でない run（`task` の span の終了の attrs が `resumed` でないもの）のうち最後のもの、再開でない run が無ければ最後の run です。キーは run_id ではなくタスクを名指す（`rules:cost:<task>`、`rules:budget:ledger:<task>:<mode>`）ので、1 つの台帳の誤りは、トレースに run がいくつあっても 1 件の所見になります。
+トレースの数の検査は run ごとに行い、再開したモードの span は数から外します。ベースのロールアウトはモードごとではなく 1 回だけ数えます。再開でない run では、`task` の span の `modes` が名指すモードに `MODE` の span も台帳も無ければ、そのモードが動かなかったものとして budget の所見を出します。
+
+summary を根拠にする 2 つの検査（台帳の恒等式と費用の一致）は、タスクの実行ディレクトリごとに 1 回だけ行います。再開したタスクは同じトレースに 2 つ目の run を足し、同じ `summary.json` を読むからです。根拠にするグラフは、そのトレースの再開でない run（`task` の span の終了の attrs が `resumed` でないもの）のうち最後のもの、再開でない run が無ければ最後の run です。キーはタスクとタスクの実行ディレクトリ（summary の辞書のキーの Path を文字列にしたもの）を名指す（`rules:cost:...` など）ので、1 つの台帳の誤りは、トレースに run がいくつあっても 1 件の所見になり、別の実験の同じタスクは別々の所見のままです。
 
 費用の検査は、`cost_tolerance_usd` と `cost_tolerance_ratio` × 2 つの合計の大きい方の、大きい方を許します。片方が `0.0` でもう片方が 0 でない場合も報告します。その差は許容で埋まらないからです。
 
-柵のあとに成功があったとみなすのは、同じ run の `stage` が `status == "ok"` で、`error` の attr が無く、`ok` の attr が `false` でなく、`fell_back` も無く、`start_ts` が柵のイベントより後であるときです。`selection` は数えません。`k=1` の選択は、改善段がすべてフォールバックしても成功で終わるからです。
+柵のあとに成功があったとみなすのは、同じ run の `stage` が `status == "ok"` で、`error` の attr が無く、`ok` の attr が `false` でなく、`fell_back` も無く、しかもその段が柵のイベントの祖先（柵を出して重なって動いた並列の段）か、柵のイベントより後に始まったものであるときです。`selection` は数えません。`k=1` の選択は、改善段がすべてフォールバックしても成功で終わるからです。判定はタスク単位で、回復していない柵が 1 つでもあれば `major`、すべて回復していれば `info` です。
+
+span は、`status: "error"` で終わったときだけでなく、`status: "ok"` で終わっても `error` か `ok: false` を持つとき（失敗したロールアウトや失敗したモードなど）も失敗として数えます。失敗したモードは 1 回だけ数えます。`mode:<mode>` の `ERROR` イベントがそれを表し、その `MODE` の span は数えません。
 
 `rules` は `request.scores` を読みません。オプションはファクトリーのキーワード引数です:
 
@@ -193,7 +203,7 @@ summary を根拠にする 2 つの検査（台帳の恒等式と費用の一致
 }
 ```
 
-`eval-graph.json` として保存し、`harness2-evaluate --runs runs/jb-oc-agg-k1 --graph eval-graph.json` で回します。設定は遅延ではなく読んだ時点で検査されるので、`my_package.checks:make_checks` は実行前に、インストール済みで解決できる名前に置き換えてください。
+`eval-graph.json` として保存し、`harness2-evaluate --runs runs/jb/adapt/jb-oc-agg1 --graph eval-graph.json` で回します。設定は遅延ではなく読んだ時点で検査されるので、`my_package.checks:make_checks` は実行前に、インストール済みで解決できる名前に置き換えてください。
 
 ノードのキーは次のとおりです:
 
@@ -387,6 +397,7 @@ def make_rebutter(**options) -> KeepFenceFindings:
 - **`error: graph config ...`（終了コード 2）。** メッセージが最初の問題を名指しします。知らないキー、重複した id、集約に届かないノード、2 つ目の集約ノード、知らない観点、解決しない名前のどれかです。設定を直して回し直してください。ノードは 1 つも動いていません。
 - **所見が消えた。** `dropped` を見てください。`no_evidence` は根拠がリクエストのグラフの span を指していなかったこと（`--allow-scores` 無しの `judge.` の span がよくある原因）、`denied` は反論がキーを deny したことです。観点ごとのファイルには、評価者が書いたものが残っています。
 - **`errors` が空でない。** 名前が解決したあとにノードが失敗しています。1 行がノード、名前、例外を名指しし、残りのグラフは動いています。評価者か反論か、それが期待したデータを直してください。
+- **`warnings` が空でない。** 不完全な入力からグラフを作っています。読めないトレースや summary、JSON オブジェクトでない summary、親 span の無いノードのどれかです。所見は読めた範囲を説明したままで、警告が省いたものを名指しします。
 - **同じ問題が 2 回出る。** 所見に、文面ではなく問題を名指す `key` を付けてください。集約が 2 つをまとめます。
 
 ## 関連項目

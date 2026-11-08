@@ -108,7 +108,9 @@ failed.
 
 A mode that failed still ends with `status: "ok"`: the run catches the mode's exception inside the
 span. The failure shows as `ok: false` and `error` on the span's end event, and as an `ERROR`
-event with `where` `mode:<mode>`.
+event with `where` `mode:<mode>`. The one `MODE` span without that catch is the restore of a
+resumed task (`resumed: true`): if the restore raises, its end event has `status: "error"` and
+`error`, with no `ok` and no `ERROR` event, and the exception propagates to the `TASK` span.
 
 ## Parent and child
 
