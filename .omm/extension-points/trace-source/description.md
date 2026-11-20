@@ -1,0 +1,1 @@
+`TraceSource` (`harness2/core/trace_source.py`): `read(location)` returns `SourcedEvent`s with their `Origin` and warnings; external runs follow the `check` rules (one root `task` span naming the `system`, `<system>.` kinds, no built-in kinds). Checked by `harness2/testing/trace_source_contract.py`, which includes `FixedTraceSource`.

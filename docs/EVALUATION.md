@@ -3,12 +3,14 @@
 Evaluation reads what a task run left behind and reports what looks wrong, with a pointer to the
 event that shows it. It never changes a run and never scores one: a run writes a trace, the
 trace becomes a graph, evaluators read the graph, and an evaluation graph turns their findings
-into one list.
+into one list. The records of another system can join the same graph through a trace source,
+so the same evaluators and the same aggregation read them too.
 
-The code is in `harness2/core/graph.py` (the run graph), `harness2/core/evaluate.py` (the
-evaluator contract and the viewpoints), `harness2/core/evalgraph.py` (the evaluation graph),
-`harness2/evaluators/rules.py` (the bundled evaluator) and `harness2/cli/evaluate.py` (the
-`harness2-evaluate` command). It uses the standard library only.
+The code is in `harness2/core/graph.py` (the run graph), `harness2/core/trace_source.py` (the
+trace sources), `harness2/core/evaluate.py` (the evaluator contract and the viewpoints),
+`harness2/core/evalgraph.py` (the evaluation graph), `harness2/evaluators/rules.py` (the bundled
+evaluator) and `harness2/cli/evaluate.py` (the `harness2-evaluate` command). It uses the
+standard library only.
 
 ## Overview
 
@@ -17,6 +19,8 @@ One round has four steps: the trace, the run graph, the evaluation graph and the
 ```mermaid
 flowchart LR
     T["trace.jsonl of each task run"] --> G["run graph (harness2.core.graph)"]
+    X["records of another system"] --> TS["trace source (harness2.core.trace_source)"]
+    TS --> G
     S["summary.json next to each trace"] --> R["EvalRequest"]
     G --> R
     R --> E["evaluation graph (harness2.core.evalgraph)"]
@@ -28,10 +32,12 @@ flowchart LR
    holds `summary.json`. [Trace sinks](TRACE.md) describes the events, their kinds and their
    parent links. The kinds that matter here are the spans (`task`, `mode`, `rollout`, `stage`,
    `selection`, `reflection`) and the point events (`tree.diff`, `memory.*`, `model.*`, `cost`,
-   `error`).
-2. **The run graph.** `graph.load_runs(root)` reads every `trace.jsonl` under `root`, merges the
-   start and end of each span into one node and links parent to child. It also reads the
-   `summary.json` next to each trace. The result is a `Graph` and a `dict` of summaries.
+   `error`). A [trace source](#trace-sources) turns the records of another system into events
+   of the same shape; its runs are [external runs](TRACE.md#external-runs).
+2. **The run graph.** `graph.load_runs(root, sources=...)` reads every `trace.jsonl` under
+   `root` and the events of the trace sources, merges the start and end of each span into one
+   node and links parent to child. It also reads the `summary.json` next to each trace. The
+   result is a `Graph` and a `dict` of summaries; an external run has no summary.
 3. **The evaluation graph.** `evalgraph.run(config, request)` runs evaluator nodes, rebut nodes
    and one aggregate node as a DAG. An evaluator node turns part of the graph into `Finding`
    objects; a rebut node adds a stance to the findings it receives; the aggregate node drops,
@@ -44,23 +50,37 @@ flowchart LR
 
 ```bash
 harness2-evaluate --runs runs/jb/adapt/jb-oc-agg1
+harness2-evaluate --source orchestrator=records/
+harness2-evaluate --runs runs/jb/adapt/jb-oc-agg1 --source orchestrator=records/
 ```
 
-The command reads every trace under `--runs` and writes its output under
-`<runs>/evaluation` by default. The command is installed with the package: after a
-`uv pip install -e .` (or the repository's usual install) `harness2-evaluate` is on the path.
+The first command reads every trace under `--runs` and writes its output under
+`<runs>/evaluation` by default. The second reads `records/` with the trace source named
+`orchestrator` (a made-up name; see [Trace sources](#trace-sources)) and writes under
+`records/evaluation`. The third puts both into one run graph and writes under
+`<runs>/evaluation`. The command is installed with the package: after a `uv pip install -e .`
+(or the repository's usual install) `harness2-evaluate` is on the path.
 
 | Argument | Meaning |
 |---|---|
-| `--runs DIR` | The directory to search for `trace.jsonl` files; required |
+| `--runs DIR` | The directory to search for `trace.jsonl` files; the same as `--source trace=DIR`. Optional, but at least one of `--runs` and `--source` is needed |
+| `--source NAME=LOCATION` | Read `LOCATION` with the trace source `NAME` and add its runs to the run graph; may be repeated. The first `=` splits the name from the location, and neither may be empty |
 | `--evaluators a,b` | The evaluator names of the default graph, one node per name, all wired to the aggregate; default `rules` |
 | `--graph FILE` | A JSON graph config; wins over `--evaluators` |
-| `--out DIR` | The output directory; default `<runs>/evaluation` |
+| `--out DIR` | The output directory; default `<runs>/evaluation`, or, without `--runs`, `<LOCATION>/evaluation` of the first `--source` (next to the file when `LOCATION` is a file) |
 | `--allow-scores` | Let the evaluation see the `judge.*` events and the scores (see below) |
 
-The exit code is `0` when the run finished, findings or not, and `2` for a bad argument, a bad
-graph config, an unknown evaluator name or a directory without any trace. A finer selection of
-what to evaluate is the graph config's job: the command does not filter by task or run.
+`--runs DIR` and `--source trace=DIR` mean the same: `trace` is the built-in trace source, and
+both read every `trace.jsonl` under `DIR` with the `summary.json` next to it. Every trace source
+name is resolved before anything is read, so an unknown name stops the run first.
+
+The exit code is `0` when the run finished, findings or not, and `2` for a bad argument (a
+`--source` without `=`, an empty name or location, neither `--runs` nor `--source`), a bad
+graph config, an unknown evaluator or trace source name, or inputs without any trace and any
+trace source run. A trace source that fails on its location (an `OSError`, any other exception
+of its `read`, or a result that is not an `(events, warnings)` pair) does not stop the run: it is
+one warning, and that source gives no runs. A finer selection of what to evaluate is the graph config's job: the command
+does not filter by task or run.
 
 ### What it writes
 
@@ -85,7 +105,8 @@ what to evaluate is the graph config's job: the command does not filter by task 
   "errors": [],
   "warnings": [],
   "traces": 4,
-  "runs": 4
+  "runs": 6,
+  "sources": {"orchestrator": 2}
 }
 ```
 
@@ -94,9 +115,10 @@ what to evaluate is the graph config's job: the command does not filter by task 
 | `findings` | The aggregated findings, heaviest first |
 | `dropped` | How many findings the aggregate dropped, by reason (`no_evidence`, `denied`) |
 | `errors` | One line per node that failed after its name resolved; the run kept going |
-| `warnings` | One line per problem while building the graph: a trace or summary that could not be read, a summary that is not a JSON object, or a node whose parent span is missing. A skipped check is visible here instead of failing the run |
-| `traces` | How many `trace.jsonl` files were read |
-| `runs` | How many `task` nodes the graph holds |
+| `warnings` | One line per problem while building the graph: a trace or summary that could not be read, a summary that is not a JSON object, a node whose parent span is missing, a record a trace source could not read, an event of an external run that breaks [its rules](TRACE.md#external-runs), or a span that two inputs both gave. A skipped check is visible here instead of failing the run |
+| `traces` | How many `trace.jsonl` files were read, through `--runs` or `--source trace=...` |
+| `runs` | How many `task` nodes the graph holds: the harness2 runs and the external runs together |
+| `sources` | The number of external runs, by the name of the trace source that read them; `{}` when there are none. The runs of the built-in `trace` source are counted in `traces`, not here |
 
 The warnings are also printed to standard error, one `warning: ...` line each, so a problem in
 the input shows up without opening `findings.json`.
@@ -121,7 +143,7 @@ A `Graph` is what the traces say happened. Nothing in it knows harness2's kinds 
 | `Node.status` | The end event's `status` (`"ok"` or `"error"`); `None` on a point event |
 | `Node.dur_s` | The end event's `dur_s`; `None` on a point event |
 | `Node.parent` | The parent's key, or `None` on a root |
-| `Node.source` | The `trace.jsonl` the node came from |
+| `Node.source` | Where the node came from: the `trace.jsonl` path for a node of a trace, and a `trace_source.Origin` (the trace source's name, the file and the line of the node's first event) for a node of an external run |
 | `Edge.src`, `Edge.dst`, `Edge.kind` | Parent, child and `"contains"` |
 
 `Graph` answers the questions an evaluator asks:
@@ -136,13 +158,14 @@ A `Graph` is what the traces say happened. Nothing in it knows harness2's kinds 
 | `subgraph(kinds=None, run_ids=None)` | The nodes that match, relinked to their nearest kept ancestor |
 | `find(run_id, span_id)` | The node, or `None` |
 
-`graph.build(paths)` builds from explicit files; `graph.load_runs(root)` finds every
-`trace.jsonl` under `root` and reads the `summary.json` in the same directory. A trace that
+`graph.build(paths, sources=...)` builds from explicit files and trace source results;
+`graph.load_runs(root, sources=...)` finds every `trace.jsonl` under `root` (one directory,
+several, or `None` for none) and reads the `summary.json` in the same directory. `sources` is a
+list of what each trace source read (`trace_source.read_from(source, location)`). A trace that
 cannot be read is a warning, and so is a summary that cannot be read; a directory without a
-summary is left out. A node whose parent span is missing stays a root and adds a warning, so
-reading never fails. Kinds starting with
-`trace.JUDGE_PREFIX` (`judge.`) are left out unless `include_judge=True`; the default view is
-the method side.
+summary is left out, and so is every external run. A node whose parent span is missing stays a
+root and adds a warning, so reading never fails. Kinds starting with `trace.JUDGE_PREFIX`
+(`judge.`) are left out unless `include_judge=True`; the default view is the method side.
 
 ```python
 from pathlib import Path
@@ -154,11 +177,204 @@ for node in level.of_kind(trace.Kind.MODE):
     print(node.run_id, node.attrs.get("mode"), node.status, node.dur_s)
 ```
 
+## Trace sources
+
+A trace source is a named reader that turns the records of some system into trace events, so
+that its runs enter the run graph next to harness2's own. The records stay where they are: no
+converted copy is written to disk, and the evidence of a finding leads back to the line of the
+original record.
+
+A trace source is any object with one member, `read(location)`. `location` is the string after
+the `=` of `--source`, which the trace source interprets (usually a directory or a file).
+`read` returns the events and the warnings, as a `trace_source.SourceRead` or any
+`(events, warnings)` pair:
+
+- each event is a `SourcedEvent(event, origin)`: a `trace.TraceEvent` of the usual six fields
+  and the `Origin(name, file, line)` it was read from, with the trace source's name, the file
+  and the 1-based line;
+- each warning is one line about a record that could not be read. A broken record is a
+  warning, not an exception, so the rest of the records still reach the graph.
+
+The runs a trace source reads are [external runs](TRACE.md#external-runs) and follow their
+rules: one root `task` span per run whose attrs name the `system`, the namespace
+`<system>.<kind>` on every other kind, and none of harness2's built-in kinds. The run graph
+checks every event against them: an event that breaks a rule is skipped with one warning, and
+the evaluation goes on.
+
+### Choosing a trace source
+
+The name is resolved in the same order as an evaluator's:
+
+1. a built-in registration (`trace_source.register(name, factory)`);
+2. an entry point of that name in the group `harness2.trace_sources`;
+3. for a name containing `:`, a `module:Attr` import path (`Attr` may be a dotted chain).
+
+The factory is called as `factory(**options)` and must return a `TraceSource`; anything else is
+a `TypeError`. `trace_source.names()` lists the registered and entry point names, and
+`trace_source.trace_source_for(name, options={...})` builds one. `harness2-evaluate` passes no
+options, so a trace source used from the command must work with its defaults.
+
+One trace source is built in: `trace` (`TraceFiles`), which reads every `trace.jsonl` under the
+location the way `--runs` does. Its runs are harness2 runs, so the command reads its location
+as a trace root, with the `summary.json` next to each trace, and does not apply the external run
+rules to it.
+
+A package installs a trace source with an entry point:
+
+```toml
+[project.entry-points."harness2.trace_sources"]
+orchestrator = "my_package.trace_source:make_trace_source"
+```
+
+After installing, run `harness2-evaluate --source orchestrator=records/`. Before installing,
+pass the `module:Attr` path directly:
+`harness2-evaluate --source my_package.trace_source:make_trace_source=records/`. The first `=`
+splits the name from the location, so a name never contains `=`.
+
+### Writing a trace source
+
+This one reads a made-up system called `orchestrator`, which writes one `records.jsonl` per run
+with records like the one below. A record of type `run` is the run's root.
+
+```json
+{"run": "r1", "id": "s2", "parent": "s1", "type": "question.asked", "at": "2026-01-01T00:00:00+00:00", "attrs": {}}
+```
+
+```python
+import json
+from pathlib import Path
+
+from harness2.core.trace import TraceEvent
+from harness2.core.trace_source import Origin, SourcedEvent, SourceRead
+
+SYSTEM = "orchestrator"
+
+
+class OrchestratorRecords:
+    """Every records.jsonl under the location, as the events of external runs."""
+
+    def __init__(self, *, name: str = SYSTEM) -> None:
+        self.name = name
+
+    def read(self, location: str) -> SourceRead:
+        events, warnings = [], []
+        for path in sorted(Path(location).rglob("records.jsonl")):
+            lines = path.read_text(encoding="utf-8").split("\n")
+            for number, line in enumerate(lines, start=1):
+                if not line.strip():
+                    continue
+                try:
+                    record = json.loads(line)
+                    kind, attrs = record["type"], dict(record.get("attrs") or {})
+                    if kind == "run":
+                        kind, attrs["system"] = "task", SYSTEM
+                    else:
+                        kind = f"{SYSTEM}.{kind}"
+                    event = TraceEvent(
+                        run_id=record["run"],
+                        span_id=record["id"],
+                        parent_id=record.get("parent"),
+                        kind=kind,
+                        ts=record["at"],
+                        attrs=attrs,
+                    )
+                except (KeyError, TypeError, ValueError) as exc:
+                    warnings.append(f"{path}:{number}: cannot read the record: {exc}")
+                    continue
+                events.append(SourcedEvent(event, Origin(self.name, path, number)))
+        return SourceRead(events, warnings)
+
+
+def make_trace_source(**options) -> OrchestratorRecords:
+    return OrchestratorRecords(**options)
+```
+
+A span is still two events that share a `span_id`, with `attrs.phase` set to `"start"` and
+`"end"`; a record that stands for a one-off event has no `phase` and becomes a point event.
+The `name` in each `Origin` is the trace source's name: it is what `findings.json` counts under
+`sources`, and what a reader sees when following a finding back.
+
+### Following a finding back to the record
+
+A finding's evidence is a `run_id` and a `span_id`. The node of the run graph with that key keeps
+its `source`: for an external run, the `Origin` of the node's first event (for a span, its start
+event), so the evidence leads to the trace source, the file and the line of the original
+record. For a node of a trace, `source` is the `trace.jsonl` path.
+
+```python
+import json
+from pathlib import Path
+
+from harness2.core import graph, trace_source
+
+source = trace_source.trace_source_for("orchestrator")
+level, _ = graph.load_runs(None, sources=[trace_source.read_from(source, "records/")])
+findings = json.loads(Path("records/evaluation/findings.json").read_text(encoding="utf-8"))
+for finding in findings["findings"]:
+    for evidence in finding["evidence"]:
+        node = level.find(evidence["run_id"], evidence["span_id"])
+        if node is not None:
+            # For example: records/r1/records.jsonl:12 (orchestrator)
+            print(finding["claim"], "->", node.source)
+```
+
+An `Origin` prints as `<file>:<line> (<name>)`, and its fields are `name`, `file` (a `Path`)
+and `line`.
+
+### Several inputs in one graph
+
+The trace files (`--runs` and every `--source trace=...`) are one input, and each other
+`--source` is another, read in the order given. When two inputs give the same
+`(run_id, span_id)`, the later input's events of that span are dropped with a warning that names
+both places. A run of a trace source therefore never overwrites a harness2 run, and two trace
+sources that read the same records give one copy of each span.
+
+### Checking a trace source against the contract
+
+`harness2.testing.trace_source_contract` has the checks for a trace source author to run from
+their own tests, built like the evaluator contract:
+
+```python
+import unittest
+
+from harness2.testing.trace_source_contract import TraceSourceContractTests
+
+
+class OrchestratorContractTest(TraceSourceContractTests, unittest.TestCase):
+    trace_source_name = "orchestrator"
+
+    def make_location(self, root):
+        (root / "r1").mkdir()
+        (root / "r1" / "records.jsonl").write_text(
+            '{"run": "r1", "id": "s1", "parent": null, "type": "run",'
+            ' "at": "2026-01-01T00:00:00+00:00", "attrs": {"phase": "start"}}\n'
+            '{"run": "r1", "id": "s1", "parent": null, "type": "run",'
+            ' "at": "2026-01-01T00:00:01+00:00", "attrs": {"phase": "end", "status": "ok"}}\n',
+            encoding="utf-8",
+        )
+        return str(root)
+
+    def make_trace_source(self):
+        return make_trace_source()
+```
+
+`setUp` makes a temporary directory, calls `make_location(root)` to write the records and return
+the location, then calls `make_trace_source()`. The checks make a failure of what the run graph
+only warns about: the object is a `TraceSource`; `read` returns an `(events, warnings)` pair with
+at least one event; every event keeps the external run rules; every origin names the trace
+source (`trace_source_name` when set), a file and a line from 1 up; and every run has a single
+root `task` span and no event whose parent is missing.
+`check_trace_source(source, location, name=...)` runs the same checks on its own,
+`contract_events(system="orchestrator")` builds a small external run that keeps the rules, and
+`FixedTraceSource` returns the events it was given, for a test of the graph rather than of a
+trace source.
+
 ## Viewpoints
 
 A viewpoint is one angle of evaluation: a short name, one English sentence and the kinds it
-reads. The six below are `evaluate.VIEWPOINTS`; an evaluator declares which of them it judges,
-and a graph config may choose a subset.
+reads. The six built-in viewpoints below are `evaluate.VIEWPOINTS`; an evaluator declares which
+of them it judges, and a graph config may choose a subset. An evaluator may also declare a
+viewpoint of its own, a [declared viewpoint](#declared-viewpoints).
 
 | Viewpoint | Question | Reads (kinds) |
 |---|---|---|
@@ -174,10 +390,54 @@ and `generalization` need a judgement the traces alone do not settle, so they wa
 evaluator a package adds; until then a config that chooses them only runs whatever evaluator
 declares them.
 
+### Declared viewpoints
+
+Some questions fit none of the built-in viewpoints, for example whether an external run kept
+the order of its steps and its questions. An evaluator asks such a question under a declared
+viewpoint: a `Viewpoint` it returns from `viewpoints()` whose name is not built in. The
+`Viewpoint` itself has the same three fields as a built-in one.
+
+```python
+Viewpoint(
+    name="ordering",
+    description="Whether the run kept the order of its steps and its questions.",
+    reads=("task", "orchestrator.step", "orchestrator.question.asked"),
+)
+```
+
+The rules:
+
+- A declared name follows the built-in rule `[a-z][a-z0-9_]*`, because it also becomes a file
+  name.
+- A declared viewpoint may not take a built-in name. An evaluator that returns a built-in name
+  with another description or other `reads` is a config error; returning the built-in
+  viewpoint unchanged (as `evaluate.viewpoint("cost")` does) is how an evaluator judges a
+  built-in one.
+- A graph config may choose a built-in viewpoint, or a declared viewpoint that some evaluator of
+  the same graph declares. A name nobody in the graph declares is a config error.
+- When two evaluators declare the same name, the first declaration in node order is used.
+- A declared viewpoint gets its own `findings/<viewpoint>.json` like a built-in one.
+
+The viewpoint names are checked in two steps, and either failure is a config error (exit code
+`2` from the command) before any node evaluates. When the config is read, each name is checked
+for its shape only. After the evaluators are built, and before any of them evaluates, every
+name that is not built in must be declared by an evaluator of the graph, and no evaluator may
+declare a built-in name differently. A built-in name in a config therefore always means the
+built-in viewpoint.
+
 ## The bundled `rules` evaluator
 
 `RulesEvaluator` needs no model: it reads the request graph and the `summary.json` next to each
-trace, so the same request gives the same findings. It is registered under the name `rules`.
+trace, so the same request gives the same findings. Importing `harness2.evaluators` registers it
+under the name `rules`, and `harness2-evaluate` imports that package; an installed harness2 also
+names it through the entry point `rules` of the group `harness2.evaluators` (see
+[Writing an evaluator](#writing-an-evaluator)).
+
+`rules` checks harness2 runs only: a run whose `task` attrs have no `system`, or
+`system: "harness2"`. The nodes of every other run, the external runs a trace source read (or a
+`trace.jsonl` whose `task` names another system), are left out of every check below, the error
+count included, so another system's run never gets a `rules` finding for a missing ledger or
+mode.
 
 | Check | Viewpoint | Severity | Evidence |
 |---|---|---|---|
@@ -281,14 +541,14 @@ A node has these keys:
 | `type` | all | `evaluator`, `rebut` or `aggregate` |
 | `evaluator` | `evaluator` | The evaluator name, resolved as described below |
 | `rebutter` | `rebut` | The rebutter name, in the group `harness2.rebutters` |
-| `viewpoints` | `evaluator`, `rebut` | A non-empty list of known viewpoint names; an evaluator node keeps only the findings of these viewpoints |
+| `viewpoints` | `evaluator`, `rebut` | A non-empty list of viewpoint names, built-in or declared by an evaluator of the graph; an evaluator node keeps only the findings of these viewpoints |
 | `options` | all | A mapping handed to the factory as `factory(**options)` |
 
 The evaluator's `options` are the settings of that node's evaluator; the `options` of
 `EvalRequest` are free settings for the whole run and a different thing.
 
-The config rules are checked before any node runs, and a violation is a `ValueError` (the CLI
-turns it into exit code `2`):
+The config rules are checked before any node evaluates, and a violation is a `ValueError` (the
+CLI turns it into exit code `2`):
 
 - The top-level keys are exactly `nodes`, `edges` and `allow_scores`; `allow_scores` is a
   boolean and defaults to `false`.
@@ -297,7 +557,11 @@ turns it into exit code `2`):
 - The graph is a DAG. Exactly one `aggregate` node exists; it has no outgoing edge, and every
   node reaches it.
 - An `evaluator` node has no incoming edge; a `rebut` node needs one.
-- Every viewpoint name matches `[a-z][a-z0-9_]*` and is one of `VIEWPOINTS`.
+- Every viewpoint name matches `[a-z][a-z0-9_]*` (checked when the config is read) and is
+  either one of `VIEWPOINTS` or a [declared viewpoint](#declared-viewpoints) of an evaluator of
+  the graph (checked after the evaluators are built, before any of them evaluates). An
+  evaluator that declares a built-in name with another description or other `reads` is also a
+  config error.
 - Every evaluator and rebutter name resolves. An unknown name is a config error, not a finding.
   After that check, an exception in a factory, `viewpoints()`, `evaluate()` or `rebut()` adds a
   line to `errors` and the run continues: that node contributes nothing, and a failed rebut
@@ -368,7 +632,9 @@ unknown name.
 An evaluator is any object with two members:
 
 - `viewpoints()` returns a non-empty sequence of `Viewpoint`; the names are what a config can
-  choose, and each must match `[a-z][a-z0-9_]*` because it becomes a file name.
+  choose, and each must match `[a-z][a-z0-9_]*` because it becomes a file name. Return a
+  built-in viewpoint unchanged (`evaluate.viewpoint("cost")`) to judge it, or a `Viewpoint` with
+  a name of its own to declare one (see [Declared viewpoints](#declared-viewpoints)).
 - `evaluate(request)` reads one `EvalRequest` and returns a list of `Finding`. Its evidence must
   point at spans of the request graph, or the aggregate drops the finding.
 
@@ -430,6 +696,25 @@ The name is resolved in this order, the same way as the trace sinks:
 The factory is called as `factory(**options)` and must return an `Evaluator`; anything else is a
 `TypeError`. `evaluate.names()` lists the registered and entry point names.
 `evaluate.evaluator_for(name, options={...})` builds one.
+
+`harness2.core.evaluate` registers nothing itself. The bundled `rules` is registered when
+`harness2.evaluators` is imported, which `harness2-evaluate` does; `core` does not import it,
+because `evaluators` sits on the layer above. A library caller of
+`evaluate.evaluator_for("rules")` (or of `evalgraph.run` with a `rules` node) therefore imports
+the package first:
+
+```python
+import harness2.evaluators  # noqa: F401  (registers rules)
+from harness2.core import evaluate
+
+rules = evaluate.evaluator_for("rules")
+```
+
+Without that import, the name resolves only through the entry point `rules` of the group
+`harness2.evaluators`, which exists once harness2 is installed (for example after
+`uv pip install -e .`). Without the import and without the entry point, for example when the
+code runs from a source tree that was never installed, `evaluator_for("rules")` raises
+`ValueError: unknown evaluator 'rules'`.
 
 A package installs an evaluator with an entry point:
 
@@ -524,13 +809,26 @@ see it, so an evidence reference to a `judge.` node is dropped like any other mi
 - **`error: no trace.jsonl under ...`** (exit 2). `--runs` names a directory with no
   `trace.jsonl` below it. Check the path, and check that tracing was on (`HARNESS2_TRACE` is not
   `0`); see [Tracing off](TRACE.md#turning-tracing-off).
+- **`error: no trace.jsonl under ... and no trace source run`** (exit 2). Neither the trace
+  roots nor any `--source` gave a run. The `warning:` lines printed before it name what the
+  trace sources could not read or skipped; a common cause is an external run whose `task` names
+  no `system`, which drops every event of the run.
+- **`error: give --runs DIR or --source NAME=LOCATION`** or
+  **`error: --source takes NAME=LOCATION, ...`** (exit 2). Give at least one input, and write
+  each `--source` as a name, `=` and a location.
 - **`error: unknown evaluator '...'`** (exit 2). The name is not registered, not an installed
   entry point in `harness2.evaluators`, and not a `module:Attr` path. The message lists the
   registered and entry point names; check the spelling, install the package, or add the missing
-  attribute.
+  attribute. For `rules` from library code, import `harness2.evaluators` first (see
+  [Writing an evaluator](#writing-an-evaluator)).
+- **`error: unknown trace source '...'`** (exit 2). The same, for a trace source: the name is
+  not registered, not an installed entry point in `harness2.trace_sources`, and not a
+  `module:Attr` path.
 - **`error: graph config ...`** (exit 2). The message names the first problem: an unknown key, a
   duplicate id, a node that does not reach the aggregate, a second aggregate node, an unknown
-  viewpoint, or a name that does not resolve. Fix the config and run again; no node ran.
+  viewpoint (a name that is neither built in nor declared by an evaluator of the graph), a
+  built-in viewpoint an evaluator declares differently, or a name that does not resolve. Fix
+  the config or the evaluator and run again; no node evaluated.
 - **A finding vanished.** Look in `dropped`: `no_evidence` means its evidence did not point at a
   span of the request graph (a `judge.` span without `--allow-scores` is the usual cause), and
   `denied` means a rebutter denied its key. The per-viewpoint files still hold what the
@@ -539,14 +837,22 @@ see it, so an evidence reference to a `judge.` node is dropped like any other mi
   name and the exception; the rest of the graph still ran. Fix the evaluator or rebutter, or the
   data it expected.
 - **`warnings` is not empty.** The graph was built from an incomplete input: a trace or summary
-  that could not be read, a summary that is not a JSON object, or a node whose parent span is
-  missing. The findings still describe what was read; the warning names what was left out.
+  that could not be read, a summary that is not a JSON object, a node whose parent span is
+  missing, a record a trace source could not read, an event of an external run that breaks the
+  [external run rules](TRACE.md#external-runs), or a span that two inputs both gave. The
+  findings still describe what was read; the warning names what was left out, with the file
+  and line for a trace source's event.
+- **An external run has no `rules` findings.** That is by design: `rules` checks harness2 runs
+  only. Judge external runs with an evaluator that reads their kinds, under a built-in or a
+  declared viewpoint.
 - **The same problem appears twice.** Give the finding a `key` that names the problem, not the
   wording, so the aggregate merges the two.
 
 ## See also
 
 - `harness2/core/graph.py`: `Node`, `Edge`, `Graph`, `build` and `load_runs`.
+- `harness2/core/trace_source.py`: `TraceSource`, `SourcedEvent`, `Origin`, `SourceRead`, the
+  registry, the built-in `trace` source and the external run check.
 - `harness2/core/evaluate.py`: `Severity`, `Viewpoint`, `VIEWPOINTS`, `Evidence`, `Finding`,
   `EvalRequest`, the `Evaluator` protocol and the registry.
 - `harness2/core/evalgraph.py`: the graph config, `Rebutter`, `Verdict`, `EvalResult`, the
@@ -554,6 +860,9 @@ see it, so an evidence reference to a `judge.` node is dropped like any other mi
 - `harness2/evaluators/rules.py`: the bundled `rules` evaluator.
 - `harness2/cli/evaluate.py`: the `harness2-evaluate` command.
 - `harness2/testing/evaluator_contract.py`: the contract checks and `FixedEvaluator`.
-- [Trace sinks](TRACE.md): the events the run graph is built from, and the rules that keep bodies
-  out.
+- `harness2/testing/trace_source_contract.py`: the trace source contract checks and
+  `FixedTraceSource`.
+- [Trace sinks](TRACE.md): the events the run graph is built from, the rules that keep bodies
+  out, and the rules of external runs.
 - `docs/specs/eval-graph.md`: the design note this implementation follows.
+- `docs/specs/trace-sources.md`: the design note of trace sources and declared viewpoints.

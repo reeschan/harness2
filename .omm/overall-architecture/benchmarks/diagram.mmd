@@ -1,0 +1,15 @@
+graph LR
+    tasks["Task Discovery\nharness2/benchmarks/tasks.py"]
+    jobbench["JB Adapter\nharness2/benchmarks/jobbench.py"]
+    jb-opencode-runner["JB Launcher Script\nharness2/benchmarks/jb_opencode_runner.py"]
+    lab["LAB Adapter\nharness2/benchmarks/lab.py"]
+    workbuddy["WB Adapter\nharness2/benchmarks/workbuddy.py"]
+    wb-render["WB Deliverable Renderer\nharness2/benchmarks/wb_render.py"]
+    intake["Intake Adapter\nharness2/benchmarks/intake.py"]
+    intake-worktree["Worktree Launcher\nharness2/benchmarks/intake_worktree.py"]
+    jobbench -->|"discovers tasks and partitions"| tasks
+    jobbench -->|"runs the script by path for each rollout"| jb-opencode-runner
+    lab -->|"discovers tasks and partitions"| tasks
+    workbuddy -->|"discovers tasks and partitions"| tasks
+    workbuddy -->|"renders deliverables to text"| wb-render
+    intake -->|"runs code-change rollouts in a worktree"| intake-worktree

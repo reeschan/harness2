@@ -1,0 +1,9 @@
+created: 2026-11-20T05:31:44.283Z
+updated: 2026-11-20T05:31:48.877Z
+update_count: 2
+last_field: constraint
+kind: nested-class
+title: config
+children: []
+parentPath:
+  - base

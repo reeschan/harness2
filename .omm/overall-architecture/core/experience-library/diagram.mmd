@@ -1,0 +1,6 @@
+graph LR
+    memory["Memory Connectors\nharness2/core/memory.py"]
+    library["Library\nharness2/core/library.py"]
+    recall["Recall Blocks\nharness2/core/recall.py"]
+    memory -->|"the default connector is the on-disk library"| library
+    memory -->|"injects recalled text into the tree"| recall

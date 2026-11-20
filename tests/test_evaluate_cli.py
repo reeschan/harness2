@@ -25,6 +25,7 @@ from harness2.cli import evaluate as cli_evaluate
 from harness2.core import evaluate, trace
 from harness2.core.evaluate import Evidence, Finding
 from harness2.core.trace_file import FileSink
+from harness2.core.trace_source import Origin, SourcedEvent, SourceRead
 
 
 def emit_task(*, judge=False):
@@ -85,6 +86,121 @@ class OneViewpoint:
                 (Evidence(run_id, task.span_id),),
             )
         ]
+
+
+LATENCY = evaluate.Viewpoint(
+    name="latency",
+    description="How long the run took.",
+    reads=(trace.Kind.TASK,),
+)
+
+
+class LatencyEvaluator:
+    """An evaluator loaded as `module:Attr` that declares `latency` next to the built-in cost.
+
+    Every instance records its `evaluate` calls in the class list `calls`.
+    """
+
+    calls = []
+    declared = (LATENCY, evaluate.viewpoint("cost"))
+
+    def viewpoints(self):
+        return list(self.declared)
+
+    def evaluate(self, request):
+        type(self).calls.append(request)
+        run_id, task = sorted(request.graph.runs().items())[0]
+        evidence = (Evidence(run_id, task.span_id),)
+        return [
+            Finding("latency", "minor", "slow run", evidence, key="slow"),
+            Finding("cost", "minor", "dear run", evidence, key="dear"),
+        ]
+
+
+class RedefiningEvaluator(LatencyEvaluator):
+    """An evaluator that declares the built-in `cost` with another description."""
+
+    calls = []
+    declared = (
+        evaluate.Viewpoint(
+            name="cost",
+            description="Something else.",
+            reads=evaluate.viewpoint("cost").reads,
+        ),
+    )
+
+
+RECORDS_NAME = "records.jsonl"
+
+
+class FakeSource:
+    """A trace source loaded as `module:Attr`: one JSON event per line of `records.jsonl`.
+
+    A line that is not a JSON event is a warning naming the file and the line.
+    """
+
+    def read(self, location):
+        path = Path(location) / RECORDS_NAME
+        events, warnings = [], []
+        for number, line in enumerate(path.read_text(encoding="utf-8").split("\n"), start=1):
+            if not line.strip():
+                continue
+            try:
+                event = trace.TraceEvent.from_dict(json.loads(line))
+            except (AttributeError, TypeError, ValueError, KeyError) as exc:
+                warnings.append(f"{path}:{number}: {exc}")
+                continue
+            events.append(SourcedEvent(event, Origin("orchestrator", path, number)))
+        return SourceRead(events, warnings)
+
+
+class FileSource(FakeSource):
+    """`FakeSource` whose location is the `records.jsonl` file itself."""
+
+    def read(self, location):
+        return super().read(Path(location).parent)
+
+
+class BrokenSource:
+    """A trace source whose `read` fails with an exception that is not an OSError."""
+
+    def read(self, location):
+        raise RuntimeError("broken reader")
+
+
+class BadShapeSource:
+    """A trace source whose `read` returns something that is not an (events, warnings) pair."""
+
+    def read(self, location):
+        return None
+
+
+def external_records(run_id="ext-1"):
+    """An external run that would break the rules if it were a harness2 run.
+
+    The task has a `k` and no ledger, and the step failed; a built-in `error` event is
+    skipped with a warning.
+    """
+    ts = "2026-01-01T00:00:00+00:00"
+
+    def line(span_id, kind, parent_id=None, **attrs):
+        return {
+            "run_id": run_id,
+            "span_id": span_id,
+            "parent_id": parent_id,
+            "kind": kind,
+            "ts": ts,
+            "attrs": attrs,
+        }
+
+    return [
+        line("t", "task", phase="start", system="orchestrator", task_id="pbi-1", k=3),
+        line("q", "orchestrator.question.asked", "t", topic="scope"),
+        line("s", "orchestrator.step", "t", phase="start", label="build"),
+        line("s", "orchestrator.step", "t", phase="end", status="error", error="boom"),
+        line("e", trace.Kind.ERROR, "t", error="boom"),
+        line("t", "task", phase="end", status="error"),
+    ]
 
 
 class EvaluateCliTests(unittest.TestCase):
@@ -245,6 +361,73 @@ class EvaluateCliTests(unittest.TestCase):
         data = json.loads((self.runs / "evaluation" / "findings.json").read_text())
         self.assertEqual([item["viewpoint"] for item in data["findings"]], ["safety"])
 
+    def write_graph(self, evaluator, viewpoints):
+        """A graph config of one `module:Attr` evaluator node choosing `viewpoints`."""
+        path = self.root / "graph.json"
+        path.write_text(
+            json.dumps(
+                {
+                    "nodes": [
+                        {
+                            "id": "fake",
+                            "type": "evaluator",
+                            "evaluator": f"{__name__}:{evaluator}",
+                            "viewpoints": viewpoints,
+                        },
+                        {"id": "aggregate", "type": "aggregate"},
+                    ],
+                    "edges": [["fake", "aggregate"]],
+                }
+            ),
+            encoding="utf-8",
+        )
+        return path
+
+    def test_a_declared_viewpoint_gets_its_own_findings_file(self):
+        self.make_run()
+        LatencyEvaluator.calls.clear()
+        graph = self.write_graph("LatencyEvaluator", ["latency"])
+        code, _, err = self.run_main(["--runs", str(self.runs), "--graph", str(graph)])
+        self.assertEqual(code, 0, err)
+        out_dir = self.runs / "evaluation"
+        data = json.loads((out_dir / "findings.json").read_text())
+        self.assertEqual(data["errors"], [])
+        self.assertEqual([item["key"] for item in data["findings"]], ["slow"])
+        self.assertEqual(data["findings"][0]["viewpoints"], ["latency"])
+        latency = json.loads((out_dir / "findings" / "latency.json").read_text())
+        self.assertEqual([item["claim"] for item in latency], ["slow run"])
+        self.assertEqual(
+            sorted(path.name for path in (out_dir / "findings").iterdir()), ["latency.json"]
+        )
+        self.assertEqual(LatencyEvaluator.calls[0].viewpoints, (LATENCY,))
+
+    def test_a_viewpoint_no_evaluator_declares_is_exit_2(self):
+        self.make_run()
+        LatencyEvaluator.calls.clear()
+        graph = self.write_graph("LatencyEvaluator", ["throughput"])
+        code, _, err = self.run_main(["--runs", str(self.runs), "--graph", str(graph)])
+        self.assertEqual(code, 2)
+        self.assertIn("throughput", err)
+        self.assertEqual(LatencyEvaluator.calls, [])
+        self.assertFalse((self.runs / "evaluation").exists())
+
+    def test_a_redefined_built_in_viewpoint_is_exit_2(self):
+        self.make_run()
+        RedefiningEvaluator.calls.clear()
+        graph = self.write_graph("RedefiningEvaluator", ["cost"])
+        code, _, err = self.run_main(["--runs", str(self.runs), "--graph", str(graph)])
+        self.assertEqual(code, 2)
+        self.assertIn("'cost'", err)
+        self.assertEqual(RedefiningEvaluator.calls, [])
+        self.assertFalse((self.runs / "evaluation").exists())
+
+    def test_a_bad_viewpoint_name_in_the_graph_is_exit_2(self):
+        self.make_run()
+        graph = self.write_graph("LatencyEvaluator", ["Latency"])
+        code, _, err = self.run_main(["--runs", str(self.runs), "--graph", str(graph)])
+        self.assertEqual(code, 2)
+        self.assertIn("[a-z][a-z0-9_]*", err)
+
     def test_graph_config_gates_scores_with_the_flag(self):
         self.make_run(judge=True)
         recorders = []
@@ -289,6 +472,145 @@ class EvaluateCliTests(unittest.TestCase):
                     else:
                         self.assertIsNone(request.scores)
                         self.assertFalse(judge_nodes)
+
+    def make_records(self, records=None, folder="records"):
+        """A directory with `records.jsonl` for `FakeSource`."""
+        location = self.root / folder
+        location.mkdir(parents=True, exist_ok=True)
+        lines = [json.dumps(item) for item in (external_records() if records is None else records)]
+        (location / RECORDS_NAME).write_text("".join(f"{line}\n" for line in lines), "utf-8")
+        return location
+
+    def register_recorder(self):
+        recorders = []
+
+        def factory(**options):
+            recorder = ScoreRecorder()
+            recorders.append(recorder)
+            return recorder
+
+        evaluate.register("score-recorder", factory)
+        return recorders
+
+    def test_a_source_alone_is_evaluated_and_rules_leaves_the_external_run_alone(self):
+        location = self.make_records()
+        with (location / RECORDS_NAME).open("a", encoding="utf-8") as handle:
+            handle.write("not json\n")
+        code, out, err = self.run_main(["--source", f"{__name__}:FakeSource={location}"])
+        self.assertEqual(code, 0, err)
+        findings_path = location / "evaluation" / "findings.json"
+        self.assertIn(str(findings_path), out)
+        data = json.loads(findings_path.read_text())
+        self.assertEqual(data["traces"], 0)
+        self.assertEqual(data["runs"], 1)
+        self.assertEqual(data["sources"], {"orchestrator": 1})
+        self.assertEqual(data["findings"], [])
+        self.assertEqual(data["errors"], [])
+        self.assertEqual(len(data["warnings"]), 2)
+        self.assertTrue(any("built-in kind" in item for item in data["warnings"]))
+        self.assertTrue(any(f"{RECORDS_NAME}:7" in item for item in data["warnings"]))
+        self.assertEqual(err.count("warning: "), 2)
+
+    def test_runs_and_a_source_make_one_run_graph(self):
+        task_dir = self.make_run(ledger_usd=1.0)
+        location = self.make_records()
+        source = f"{__name__}:FakeSource={location}"
+        recorders = self.register_recorder()
+        code, _, err = self.run_main(
+            ["--runs", str(self.runs), "--source", source, "--evaluators", "score-recorder"]
+        )
+        self.assertEqual(code, 0, err)
+        request = recorders[-1].requests[-1]
+        self.assertEqual(set(request.graph.runs()), {"run-1", "ext-1"})
+        self.assertEqual(set(request.summaries), {task_dir})
+        self.assertIsNotNone(request.summary_for("run-1"))
+        self.assertIsNone(request.summary_for("ext-1"))
+        task = request.graph.runs()["ext-1"]
+        self.assertEqual(task.source, Origin("orchestrator", location / RECORDS_NAME, 1))
+        self.assertEqual(request.graph.find("ext-1", "s").source.line, 3)
+        self.assertEqual(request.graph.runs()["run-1"].source, task_dir / "trace.jsonl")
+
+        code, _, err = self.run_main(["--runs", str(self.runs), "--source", source])
+        self.assertEqual(code, 0, err)
+        data = json.loads((self.runs / "evaluation" / "findings.json").read_text())
+        self.assertEqual(data["traces"], 1)
+        self.assertEqual(data["runs"], 2)
+        self.assertEqual(data["sources"], {"orchestrator": 1})
+        self.assertTrue(data["findings"])
+        evidence_runs = {
+            item["run_id"] for finding in data["findings"] for item in finding["evidence"]
+        }
+        self.assertEqual(evidence_runs, {"run-1"})
+        self.assertEqual(data["errors"], [])
+
+    def test_runs_means_the_same_as_the_trace_source(self):
+        task_dir = self.make_run(ledger_usd=1.0)
+        (task_dir / "broken").mkdir()
+        (task_dir / "broken" / "trace.jsonl").write_text("{\n", encoding="utf-8")
+        recorders = self.register_recorder()
+        outputs = []
+        for argv in (["--runs", str(self.runs)], ["--source", f"trace={self.runs}"]):
+            for evaluators in ("rules", "score-recorder"):
+                with self.subTest(argv=argv, evaluators=evaluators):
+                    code, _, err = self.run_main(argv + ["--evaluators", evaluators])
+                    self.assertEqual(code, 0, err)
+                    if evaluators == "rules":
+                        outputs.append((self.runs / "evaluation" / "findings.json").read_text())
+        self.assertEqual(outputs[0], outputs[1])
+        data = json.loads(outputs[0])
+        self.assertEqual((data["traces"], data["runs"], data["sources"]), (2, 1, {}))
+        self.assertTrue(data["findings"])
+        by_runs, by_source = (recorder.requests[-1] for recorder in recorders)
+        self.assertEqual(by_runs.graph.nodes, by_source.graph.nodes)
+        self.assertEqual(by_runs.graph.edges, by_source.graph.edges)
+        self.assertEqual(by_runs.summaries, by_source.summaries)
+
+    def test_an_unknown_trace_source_is_exit_2(self):
+        self.make_run()
+        code, _, err = self.run_main(["--runs", str(self.runs), "--source", f"nope={self.runs}"])
+        self.assertEqual(code, 2)
+        self.assertIn("nope", err)
+        self.assertFalse((self.runs / "evaluation").exists())
+
+    def test_no_trace_and_no_trace_source_run_is_exit_2(self):
+        location = self.make_records([])
+        code, _, err = self.run_main(["--source", f"{__name__}:FakeSource={location}"])
+        self.assertEqual(code, 2)
+        self.assertIn("trace source run", err)
+        self.assertFalse((location / "evaluation").exists())
+
+    def test_a_file_location_writes_next_to_the_file(self):
+        location = self.make_records()
+        records = location / RECORDS_NAME
+        code, out, err = self.run_main(["--source", f"{__name__}:FileSource={records}"])
+        self.assertEqual(code, 0, err)
+        findings_path = location / "evaluation" / "findings.json"
+        self.assertIn(str(findings_path), out)
+        data = json.loads(findings_path.read_text())
+        self.assertEqual(data["sources"], {"orchestrator": 1})
+
+    def test_a_failing_trace_source_is_a_warning_and_the_run_goes_on(self):
+        self.make_run()
+        location = self.make_records()
+        for name in ("BrokenSource", "BadShapeSource"):
+            with self.subTest(name=name):
+                source = f"{__name__}:{name}"
+                code, _, err = self.run_main(
+                    ["--runs", str(self.runs), "--source", f"{source}={location}"]
+                )
+                self.assertEqual(code, 0, err)
+                data = json.loads((self.runs / "evaluation" / "findings.json").read_text())
+                self.assertEqual((data["traces"], data["runs"], data["sources"]), (1, 1, {}))
+                expected = f"trace source {source} failed on {location}: "
+                self.assertTrue(any(item.startswith(expected) for item in data["warnings"]))
+                self.assertIn(f"warning: {expected}", err)
+
+    def test_neither_runs_nor_source_and_a_bad_source_are_exit_2(self):
+        for argv in ([], ["--source", "no-location"], ["--source", "=somewhere"]):
+            with self.subTest(argv=argv):
+                code, _, err = self.run_main(argv)
+                self.assertEqual(code, 2)
+                self.assertIn("error:", err)
 
 
 if __name__ == "__main__":

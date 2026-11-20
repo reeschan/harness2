@@ -1,0 +1,9 @@
+created: 2026-11-20T05:36:54.278Z
+updated: 2026-11-20T05:36:54.279Z
+update_count: 1
+last_field: description
+kind: nested-class
+title: author-tests
+children: []
+parentPath:
+  - testing

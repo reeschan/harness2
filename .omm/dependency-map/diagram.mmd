@@ -1,0 +1,12 @@
+graph TD
+    layer-plugins["plugins\nharness2.plugins"]
+    layer-cli["cli\nharness2.cli"]
+    layer-benchmarks["benchmarks\nharness2.benchmarks, harness2.demo, harness2.preflight"]
+    layer-evaluators-substrate-testing["evaluators, substrate and testing\nharness2.evaluators, harness2.substrate, harness2.testing, harness2.install"]
+    layer-core["core\nharness2.core"]
+    layer-base["base\nharness2, harness2.config"]
+    layer-plugins -.-|"top of the table: imports no harness2 unit, imported by none"| layer-cli
+    layer-cli -->|"may import this layer and every layer below"| layer-benchmarks
+    layer-benchmarks -->|"may import this layer and every layer below"| layer-evaluators-substrate-testing
+    layer-evaluators-substrate-testing -->|"may import this layer and every layer below"| layer-core
+    layer-core -->|"may import this layer"| layer-base

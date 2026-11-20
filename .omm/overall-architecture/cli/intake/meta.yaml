@@ -1,0 +1,9 @@
+created: 2026-11-20T05:39:18.537Z
+updated: 2026-11-20T05:39:18.537Z
+update_count: 1
+last_field: description
+kind: nested-class
+title: intake
+children: []
+parentPath:
+  - cli

@@ -1,0 +1,16 @@
+created: 2026-11-20T05:42:08.945Z
+updated: 2026-11-20T05:42:38.908Z
+update_count: 7
+last_field: note
+git_commit: cfeafea
+git_branch: feature/trace-sources
+children:
+  - contract-checks
+  - evaluator
+  - memory-connector
+  - model-connector
+  - outside-package
+  - rebutter
+  - task-connector
+  - trace-sink
+  - trace-source

@@ -1,0 +1,9 @@
+created: 2026-11-20T05:39:13.945Z
+updated: 2026-11-20T05:39:13.945Z
+update_count: 1
+last_field: description
+kind: nested-class
+title: bridge
+children: []
+parentPath:
+  - cli

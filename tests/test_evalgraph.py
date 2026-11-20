@@ -86,6 +86,22 @@ class RecordingEvaluator:
         return []
 
 
+class DeclaringEvaluator:
+    """An evaluator that declares the given viewpoints and records the requests it sees."""
+
+    def __init__(self, viewpoints, findings=()):
+        self._viewpoints = list(viewpoints)
+        self._findings = list(findings)
+        self.requests = []
+
+    def viewpoints(self):
+        return list(self._viewpoints)
+
+    def evaluate(self, request):
+        self.requests.append(request)
+        return list(self._findings)
+
+
 class EvalGraphCase(unittest.TestCase):
     """A contract request, a clean evaluator registry and an empty entry point list."""
 
@@ -275,12 +291,39 @@ class CheckConfigTests(EvalGraphCase):
         self.assertIn("unknown type", str(caught.exception))
 
     def test_an_unknown_viewpoint_is_an_error(self):
-        self.register("alpha")
+        recorder = RecordingEvaluator()
+        evaluate.register("alpha", lambda **options: recorder)
         config = self.config(["alpha"])
         config["nodes"][0]["viewpoints"] = ["quality"]
+        evalgraph.check_config(config)
         with self.assertRaises(ValueError) as caught:
-            evalgraph.check_config(config)
+            evalgraph.run(config, self.request)
         self.assertIn("quality", str(caught.exception))
+        self.assertEqual(recorder.requests, [])
+
+    def test_a_built_in_viewpoint_passes_when_read(self):
+        self.register("alpha")
+        config = self.config(["alpha"])
+        config["nodes"][0]["viewpoints"] = ["cost", "budget"]
+        evalgraph.check_config(config)
+
+    def test_a_viewpoint_name_that_is_not_built_in_passes_when_read(self):
+        self.register("alpha")
+        path = self.root / "graph.json"
+        config = self.config(["alpha"])
+        config["nodes"][0]["viewpoints"] = ["latency"]
+        path.write_text(json.dumps(config), encoding="utf-8")
+        self.assertEqual(evalgraph.load_config(path)["nodes"][0]["viewpoints"], ["latency"])
+
+    def test_a_bad_viewpoint_name_fails_when_read(self):
+        self.register("alpha")
+        path = self.root / "graph.json"
+        config = self.config(["alpha"])
+        config["nodes"][0]["viewpoints"] = ["two words"]
+        path.write_text(json.dumps(config), encoding="utf-8")
+        with self.assertRaises(ValueError) as caught:
+            evalgraph.load_config(path)
+        self.assertIn("[a-z][a-z0-9_]*", str(caught.exception))
 
     def test_a_viewpoint_name_must_be_an_identifier(self):
         self.register("alpha")
@@ -721,8 +764,146 @@ class RunTests(EvalGraphCase):
 
         evaluate.register("outside", lambda **options: Outside())
         result = evalgraph.run(self.config(["outside"]), self.request)
+        self.assertEqual(result.errors, [])
+        self.assertEqual(result.by_viewpoint, {"mine": []})
+
+    def test_a_declared_viewpoint_can_be_chosen(self):
+        latency = Viewpoint(name="latency", description="How long the run took.", reads=("task",))
+        evaluator = DeclaringEvaluator(
+            [latency, evaluate.viewpoint("cost")],
+            [
+                self.finding(viewpoint="latency", key="slow"),
+                self.finding(viewpoint="cost", key="dear"),
+            ],
+        )
+        evaluate.register("alpha", lambda **options: evaluator)
+        rebutter = RecordingRebutter()
+        evalgraph.register_rebutter("record", lambda **options: rebutter)
+        config = self.rebut_config(rebutter="record")
+        config["nodes"][0]["viewpoints"] = ["latency"]
+        result = evalgraph.run(config, self.request)
+        self.assertEqual(result.errors, [])
+        self.assertEqual(evaluator.requests[0].viewpoints, (latency,))
+        self.assertEqual(list(result.by_viewpoint), ["latency"])
+        self.assertEqual([finding.key for finding in result.by_viewpoint["latency"]], ["slow"])
+        self.assertEqual([finding.key for finding in result.findings], ["slow"])
+        self.assertEqual(result.findings[0].viewpoints, ("latency",))
+        self.assertEqual(rebutter.counts, [1])
+
+    def test_declared_viewpoints_are_added_to_the_request(self):
+        latency = Viewpoint(name="latency", description="How long the run took.")
+        seen = []
+
+        class Recording:
+            def rebut(self, findings, request):
+                seen.append(request.viewpoints)
+                return []
+
+        evaluate.register(
+            "alpha",
+            lambda **options: DeclaringEvaluator([latency], [self.finding(viewpoint="latency")]),
+        )
+        evalgraph.register_rebutter("record", lambda **options: Recording())
+        result = evalgraph.run(self.rebut_config(rebutter="record"), self.request)
+        self.assertEqual(result.errors, [])
+        self.assertEqual(seen, [evaluate.VIEWPOINTS + (latency,)])
+
+    def test_a_viewpoint_no_evaluator_declares_fails_before_any_evaluate(self):
+        first = DeclaringEvaluator([evaluate.viewpoint("cost")])
+        second = DeclaringEvaluator([Viewpoint(name="latency", description="Time.")])
+        evaluate.register("alpha", lambda **options: first)
+        evaluate.register("beta", lambda **options: second)
+        config = self.config(["alpha", "beta"])
+        config["nodes"][1]["viewpoints"] = ["throughput"]
+        with self.assertRaises(ValueError) as caught:
+            evalgraph.run(config, self.request)
+        self.assertIn("throughput", str(caught.exception))
+        self.assertEqual(first.requests, [])
+        self.assertEqual(second.requests, [])
+
+    def test_a_failed_factory_with_a_declared_viewpoint_is_an_error_line(self):
+        def failing(**options):
+            raise RuntimeError("backend down")
+
+        evaluate.register("broken", failing)
+        self.register("alpha", [self.finding(key="a")])
+        config = self.config(["alpha", "broken"])
+        config["nodes"][1]["viewpoints"] = ["throughput"]
+        result = evalgraph.run(config, self.request)
         self.assertEqual(len(result.errors), 1)
-        self.assertIn("not a viewpoint of this run", result.errors[0])
+        self.assertIn("backend down", result.errors[0])
+        self.assertIn("'broken'", result.errors[0])
+        self.assertEqual([finding.key for finding in result.findings], ["a"])
+        self.assertNotIn("throughput", result.by_viewpoint)
+
+    def test_a_viewpoint_declared_by_another_evaluator_passes_the_check(self):
+        latency = Viewpoint(name="latency", description="Time.")
+        evaluate.register(
+            "alpha",
+            lambda **options: DeclaringEvaluator([latency], [self.finding(viewpoint="latency")]),
+        )
+        evaluate.register(
+            "beta", lambda **options: DeclaringEvaluator([evaluate.viewpoint("cost")])
+        )
+        config = self.config(["alpha", "beta"])
+        config["nodes"][1]["viewpoints"] = ["latency"]
+        result = evalgraph.run(config, self.request)
+        self.assertEqual(len(result.errors), 1)
+        self.assertIn("not declared by the evaluator", result.errors[0])
+        self.assertEqual([finding.viewpoint for finding in result.findings], ["latency"])
+
+    def test_a_built_in_name_with_another_description_fails_before_any_evaluate(self):
+        cost = evaluate.viewpoint("cost")
+        self.assert_redefinition_fails(replace(cost, description="Something else."))
+
+    def test_a_built_in_name_with_other_reads_fails_before_any_evaluate(self):
+        cost = evaluate.viewpoint("cost")
+        self.assert_redefinition_fails(replace(cost, reads=(trace.Kind.TASK,)))
+
+    def assert_redefinition_fails(self, redefined):
+        first = DeclaringEvaluator([evaluate.viewpoint("budget")])
+        second = DeclaringEvaluator([redefined])
+        evaluate.register("alpha", lambda **options: first)
+        evaluate.register("beta", lambda **options: second)
+        with self.assertRaises(ValueError) as caught:
+            evalgraph.run(self.config(["alpha", "beta"]), self.request)
+        self.assertIn("'cost'", str(caught.exception))
+        self.assertEqual(first.requests, [])
+        self.assertEqual(second.requests, [])
+
+    def test_a_built_in_viewpoint_declared_as_is_is_accepted(self):
+        cost = evaluate.viewpoint("cost")
+        evaluator = DeclaringEvaluator(
+            [Viewpoint(name=cost.name, description=cost.description, reads=list(cost.reads))],
+            [self.finding(key="a")],
+        )
+        evaluate.register("alpha", lambda **options: evaluator)
+        result = evalgraph.run(self.config(["alpha"]), self.request)
+        self.assertEqual(result.errors, [])
+        self.assertEqual([finding.key for finding in result.findings], ["a"])
+
+    def test_a_declared_name_must_be_an_identifier(self):
+        evaluator = DeclaringEvaluator([Viewpoint(name="Bad Name", description="Bad.")])
+        evaluate.register("alpha", lambda **options: evaluator)
+        with self.assertRaises(ValueError) as caught:
+            evalgraph.run(self.config(["alpha"]), self.request)
+        self.assertIn("'Bad Name'", str(caught.exception))
+        self.assertEqual(evaluator.requests, [])
+
+    def test_the_first_declaration_of_a_viewpoint_wins(self):
+        first_latency = Viewpoint(name="latency", description="First.")
+        second_latency = Viewpoint(name="latency", description="Second.", reads=("task",))
+        first = DeclaringEvaluator([first_latency], [self.finding(viewpoint="latency", key="a")])
+        second = DeclaringEvaluator([second_latency], [self.finding(viewpoint="latency", key="b")])
+        evaluate.register("alpha", lambda **options: first)
+        evaluate.register("beta", lambda **options: second)
+        config = self.config(["alpha", "beta"])
+        config["nodes"][1]["viewpoints"] = ["latency"]
+        result = evalgraph.run(config, self.request)
+        self.assertEqual(result.errors, [])
+        self.assertEqual(first.requests[0].viewpoints, (first_latency,))
+        self.assertEqual(second.requests[0].viewpoints, (first_latency,))
+        self.assertEqual([finding.key for finding in result.by_viewpoint["latency"]], ["a", "b"])
 
     def test_a_node_viewpoint_the_evaluator_lacks_is_an_error(self):
         self.register("alpha", [self.finding(key="a")], [evaluate.viewpoint("cost")])

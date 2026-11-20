@@ -1,0 +1,16 @@
+created: 2026-11-20T05:37:33.503Z
+updated: 2026-11-20T05:37:36.568Z
+update_count: 2
+last_field: diagram
+kind: nested-class
+title: benchmarks
+children:
+  - intake
+  - intake-worktree
+  - jb-opencode-runner
+  - jobbench
+  - lab
+  - tasks
+  - wb-render
+  - workbuddy
+parentPath: []

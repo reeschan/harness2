@@ -1,0 +1,19 @@
+created: 2026-11-20T05:30:49.923Z
+updated: 2026-11-20T05:31:23.580Z
+update_count: 7
+last_field: note
+git_commit: cfeafea
+git_branch: feature/trace-sources
+children:
+  - base
+  - benchmarks
+  - cli
+  - core
+  - demo
+  - evaluators
+  - install
+  - outside-code
+  - plugins
+  - preflight
+  - substrate
+  - testing

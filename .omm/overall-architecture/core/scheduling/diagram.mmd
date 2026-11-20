@@ -1,0 +1,8 @@
+graph LR
+    schedule["Schedule\nharness2/core/schedule.py"]
+    recursion["Recursion\nharness2/core/recursion.py"]
+    ledger["Ledger\nharness2/core/ledger.py"]
+    runmark["Run Mark\nharness2/core/runmark.py"]
+    schedule -->|"runs each recursion mode of a task"| recursion
+    schedule -->|"skips rollouts already finished by this configuration"| runmark
+    recursion -->|"counts rollouts and improvement stages"| ledger

@@ -1,0 +1,27 @@
+graph LR
+    outside-package["Installed Package\n(entry point or module:Attr)"]
+    task-connector["Task Connector\nharness2/core/intake.py"]
+    memory-connector["Memory Connector\nharness2/core/memory.py"]
+    model-connector["Model Connector\nharness2/core/models.py"]
+    trace-sink["Trace Sink\nharness2/core/trace.py"]
+    trace-source["Trace Source\nharness2/core/trace_source.py"]
+    evaluator["Evaluator\nharness2/core/evaluate.py"]
+    rebutter["Rebutter\nharness2/core/evalgraph.py"]
+    contract-checks["Contract Checks\nharness2/testing/"]
+    outside-package -->|"harness2.task_connectors"| task-connector
+    outside-package -->|"harness2.memory_connectors"| memory-connector
+    outside-package -->|"harness2.model_connectors"| model-connector
+    outside-package -->|"harness2.trace_sinks"| trace-sink
+    outside-package -->|"harness2.trace_sources"| trace-source
+    outside-package -->|"harness2.evaluators"| evaluator
+    outside-package -->|"harness2.rebutters"| rebutter
+    contract-checks -->|"connector_contract"| task-connector
+    contract-checks -->|"memory_contract"| memory-connector
+    contract-checks -->|"model_contract"| model-connector
+    contract-checks -->|"trace_contract"| trace-sink
+    contract-checks -->|"trace_source_contract"| trace-source
+    contract-checks -->|"evaluator_contract"| evaluator
+    classDef external fill:#585b70,stroke:#585b70,color:#cdd6f4
+    classDef entry fill:#89b4fa,stroke:#89b4fa,color:#1e1e2e
+    classDef store fill:#a6e3a1,stroke:#a6e3a1,color:#1e1e2e
+    class outside-package external

@@ -22,7 +22,41 @@ import unittest
 from pathlib import Path
 
 from harness2.core import graph, trace
+from harness2.core.evaluate import VIEWPOINTS, EvalRequest
 from harness2.core.trace_file import FILE_NAME, FileSink
+from harness2.core.trace_source import Origin, SourcedEvent, SourceRead
+
+RECORDS = Path("records") / "log.jsonl"
+
+
+def sourced(
+    kind, span_id, line, *, run_id="x1", parent_id=None, ts="2026-01-01T00:00:00+00:00", **attrs
+):
+    """One event an `orchestrator` trace source read from `line` of `RECORDS`."""
+    return SourcedEvent(
+        trace.TraceEvent(
+            run_id=run_id,
+            span_id=span_id,
+            parent_id=parent_id,
+            kind=kind,
+            ts=ts,
+            attrs=attrs,
+        ),
+        Origin("orchestrator", RECORDS, line),
+    )
+
+
+def external_run(run_id="x1"):
+    """The events of one well-formed external run: a task span and two events inside it."""
+    return [
+        sourced(trace.Kind.TASK, "t", 1, run_id=run_id, phase="start", system="orchestrator"),
+        sourced("orchestrator.question.asked", "q", 2, run_id=run_id, parent_id="t"),
+        sourced("orchestrator.step", "s", 3, run_id=run_id, parent_id="t", phase="start"),
+        sourced(
+            "orchestrator.step", "s", 4, run_id=run_id, parent_id="t", phase="end", status="ok"
+        ),
+        sourced(trace.Kind.TASK, "t", 5, run_id=run_id, phase="end", status="ok"),
+    ]
 
 
 def make_tree(count):
@@ -366,6 +400,107 @@ class LoadRunsTests(GraphCase):
                 for warning in built.warnings
             )
         )
+
+
+class SourceTests(GraphCase):
+    def write_harness2_run(self, folder="run", run_id="r1"):
+        task_dir, tracer = self.make_tracer(folder, run_id=run_id)
+        with trace.use(tracer):
+            with trace.span(trace.Kind.TASK, task_id=run_id) as task:
+                trace.event(trace.Kind.COST, usd=0.1)
+        tracer.close()
+        return task_dir, task.id
+
+    def test_external_nodes_carry_the_trace_source_origin(self):
+        _, task_id = self.write_harness2_run()
+        built = graph.build([self.trace_path()], sources=[SourceRead(external_run(), [])])
+        self.assertEqual(built.warnings, [])
+        self.assertEqual(set(built.runs()), {"r1", "x1"})
+        self.assertEqual(built.find("r1", task_id).source, self.trace_path())
+        task = built.find("x1", "t")
+        self.assertEqual(task.source, Origin("orchestrator", RECORDS, 1))
+        self.assertEqual(task.source.name, "orchestrator")
+        self.assertEqual(task.source.file, RECORDS)
+        self.assertEqual(task.source.line, 1)
+        self.assertEqual(task.status, "ok")
+        self.assertEqual(task.attrs["system"], "orchestrator")
+        step = built.find("x1", "s")
+        self.assertEqual(step.source, Origin("orchestrator", RECORDS, 3))
+        self.assertEqual(step.status, "ok")
+        self.assertEqual(built.parent(("x1", "s")).key, ("x1", "t"))
+        self.assertEqual({node.span_id for node in built.children(("x1", "t"))}, {"q", "s"})
+
+    def test_a_span_from_a_second_input_is_dropped_with_a_warning(self):
+        events = external_run()
+        again = [
+            sourced(trace.Kind.TASK, "t2", 6, system="orchestrator"),
+            sourced("orchestrator.step", "s", 7, parent_id="t2", label="later"),
+            sourced("orchestrator.step", "s", 8, parent_id="t2", phase="end", status="error"),
+        ]
+        built = graph.build(sources=[(events, []), (again, [])])
+        self.assertEqual(len(built.warnings), 1)
+        self.assertIn("x1/s", built.warnings[0])
+        self.assertIn("duplicate", built.warnings[0])
+        self.assertIn("log.jsonl:7", built.warnings[0])
+        self.assertIsNotNone(built.find("x1", "t2"))
+        step = built.find("x1", "s")
+        self.assertEqual(step.status, "ok")
+        self.assertEqual(step.source.line, 3)
+        self.assertNotIn("label", step.attrs)
+
+    def test_a_trace_span_wins_over_the_same_span_from_a_trace_source(self):
+        _, task_id = self.write_harness2_run()
+        copy = [
+            sourced(trace.Kind.TASK, "xt", 1, run_id="r1", system="orchestrator"),
+            sourced("orchestrator.step", task_id, 2, run_id="r1", parent_id="xt"),
+        ]
+        built = graph.build([self.trace_path()], sources=[(copy, [])])
+        self.assertEqual(built.find("r1", task_id).source, self.trace_path())
+        self.assertEqual(built.find("r1", task_id).kind, trace.Kind.TASK)
+        self.assertEqual(len(built.warnings), 1)
+        self.assertIn("duplicate", built.warnings[0])
+
+    def test_broken_events_are_warnings_and_the_rest_is_read(self):
+        events = external_run() + [
+            sourced(trace.Kind.TASK, "t2", 6, run_id="x2"),
+            sourced(trace.Kind.MODE, "m", 7, parent_id="t"),
+            sourced("step", "n", 8, parent_id="t"),
+            sourced("orchestrator.orphan", "o", 9, parent_id="gone"),
+        ]
+        built = graph.build(sources=[SourceRead(events, ["records/log.jsonl:10: not JSON"])])
+        self.assertEqual(set(built.runs()), {"x1"})
+        self.assertIsNone(built.find("x1", "m"))
+        self.assertIsNone(built.find("x1", "n"))
+        self.assertIsNone(built.find("x2", "t2"))
+        orphan = built.find("x1", "o")
+        self.assertIsNotNone(orphan)
+        self.assertIsNone(orphan.parent)
+        self.assertEqual(len(built.warnings), 5)
+        self.assertEqual(built.warnings[0], "records/log.jsonl:10: not JSON")
+        self.assertIn("missing parent x1/gone", built.warnings[-1])
+        self.assertIn("log.jsonl:9 (orchestrator)", built.warnings[-1])
+
+    def test_load_runs_takes_sources_and_leaves_external_runs_out_of_the_summaries(self):
+        task_dir, _ = self.write_harness2_run("a")
+        (task_dir / "summary.json").write_text(json.dumps({"status": "ok"}), encoding="utf-8")
+        built, summaries = graph.load_runs(self.root, sources=[SourceRead(external_run(), [])])
+        self.assertEqual(set(built.runs()), {"r1", "x1"})
+        self.assertEqual(set(summaries), {task_dir})
+        request = EvalRequest(graph=built, summaries=summaries, viewpoints=VIEWPOINTS)
+        self.assertEqual(request.summary_for("r1"), {"status": "ok"})
+        self.assertIsNone(request.summary_for("x1"))
+
+    def test_load_runs_of_several_roots_or_none(self):
+        first, _ = self.write_harness2_run("a", run_id="r1")
+        second, _ = self.write_harness2_run("b", run_id="r2")
+        built, _ = graph.load_runs([first, second])
+        self.assertEqual(set(built.runs()), {"r1", "r2"})
+        same, _ = graph.load_runs([self.root, first])
+        self.assertEqual(set(same.nodes), set(built.nodes))
+        self.assertEqual(same.warnings, [])
+        empty, summaries = graph.load_runs(sources=[SourceRead(external_run(), [])])
+        self.assertEqual(set(empty.runs()), {"x1"})
+        self.assertEqual(summaries, {})
 
 
 class IndexTests(unittest.TestCase):

@@ -1,0 +1,15 @@
+created: 2026-11-20T05:43:26.901Z
+updated: 2026-11-20T05:43:55.331Z
+update_count: 7
+last_field: note
+git_commit: cfeafea
+git_branch: feature/trace-sources
+children:
+  - evaluation-graph
+  - external-records
+  - findings
+  - run-graph
+  - task-run
+  - trace-files
+  - trace-source
+  - tracer

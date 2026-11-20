@@ -1,0 +1,9 @@
+created: 2026-11-20T05:41:47.270Z
+updated: 2026-11-20T05:41:47.270Z
+update_count: 1
+last_field: description
+kind: nested-class
+title: demo
+children: []
+parentPath:
+  - layer-benchmarks

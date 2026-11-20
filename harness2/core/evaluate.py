@@ -19,11 +19,17 @@ sequence of `Viewpoint`) and `evaluate(request)` reads one `EvalRequest` and ret
 `Finding`. A `Finding` carries a severity, a claim, and the `Evidence` spans of the request
 graph that back it, so a reader can jump from a finding to the event that caused it.
 
-Evaluators are found by name, like the trace sinks and the memory connectors: a built-in
+Evaluators are found by name, like the trace sinks, the trace sources and the memory connectors
+(`harness2.core.trace_source` shares the lookup below): a built-in
 registration (`register`), then an entry point of the same name in the group
 `harness2.evaluators`, then, for a name containing `:`, a `module:Attr` import path. There is no
 environment variable: the caller names the evaluator. A factory is called as
 `factory(**options)` and must return an `Evaluator`.
+
+This module registers nothing itself and never imports `harness2.evaluators`, which sits on the
+layer above. The bundled `rules` evaluator is registered when `harness2.evaluators` is imported
+(`harness2-evaluate` does so), and an installed package also names it through the entry point
+`rules` of the group `harness2.evaluators`.
 
 Scores are kept out of the method side. An evaluator never reads a scoring file itself: scores
 arrive only in `EvalRequest.scores`, and only when the run allows them (`None` otherwise).
@@ -233,10 +239,11 @@ class EvalRequest:
         """The summary.json next to the trace of run `run_id`, or None.
 
         A trace file that holds more than one run has one summary; every run of that file gets
-        the same summary.
+        the same summary. An external run (read by a trace source, so its node's `source` is
+        not a path) has no summary.
         """
         node = self.graph.runs().get(run_id)
-        if node is None:
+        if node is None or not isinstance(node.source, Path):
             return None
         return self.summaries.get(node.source.parent)
 
@@ -383,17 +390,3 @@ def evaluator_for(name: str, *, options: Mapping[str, Any] | None = None) -> Eva
             "which is not an Evaluator"
         )
     return evaluator
-
-
-def _rules_factory(**options: Any) -> Evaluator:
-    """Build the built-in `rules` evaluator without importing its module until called.
-
-    The import stays inside the function so `harness2.evaluators.rules` may be imported first:
-    a module-level import here would run while that module is only half-loaded.
-    """
-    from ..evaluators.rules import RulesEvaluator
-
-    return RulesEvaluator(**options)
-
-
-register("rules", _rules_factory)

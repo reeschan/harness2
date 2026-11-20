@@ -1,0 +1,22 @@
+graph LR
+    run-sweep["harness2\nharness2/cli/run_sweep.py"]
+    judge["harness2-judge\nharness2/cli/judge.py"]
+    report["harness2-report\nharness2/cli/report.py"]
+    setup["harness2-setup\nharness2/cli/setup.py"]
+    check["harness2-check\nharness2/cli/check.py"]
+    demo["harness2-demo\nharness2/cli/demo.py"]
+    bridge["harness2-bridge\nharness2/cli/bridge.py"]
+    intake["harness2-intake\nharness2/cli/intake.py"]
+    evaluate["harness2-evaluate\nharness2/cli/evaluate.py"]
+    common["Shared Plumbing\nharness2/cli/_common.py"]
+    run-sweep -->|"builds the adapter, names the runs root"| common
+    judge -->|"reads the runs root"| common
+    report -->|"reads judged.json under the runs root"| common
+    report -->|"reuses the selection collection"| judge
+    check -->|"builds the adapter"| common
+    intake -->|"shares argument helpers"| common
+    evaluate -->|"shares argument helpers"| common
+    classDef external fill:#585b70,stroke:#585b70,color:#cdd6f4
+    classDef entry fill:#89b4fa,stroke:#89b4fa,color:#1e1e2e
+    classDef store fill:#a6e3a1,stroke:#a6e3a1,color:#1e1e2e
+    class run-sweep,judge,report,setup,check,demo,bridge,intake,evaluate entry

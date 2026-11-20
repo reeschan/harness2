@@ -1,0 +1,6 @@
+graph LR
+    substrate-interface["Substrate Interface\nharness2/substrate/base.py"]
+    opencode["OpenCode Executor\nharness2/substrate/opencode.py"]
+    codex["Codex Executor\nharness2/substrate/codex.py"]
+    opencode -->|"implements Substrate"| substrate-interface
+    codex -->|"implements Substrate"| substrate-interface

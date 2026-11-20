@@ -18,5 +18,7 @@
 connector contract. `harness2.testing.memory_contract` does the same for memory connectors.
 `harness2.testing.trace_contract` does it for trace sinks and includes a recording fake sink.
 `harness2.testing.evaluator_contract` does it for evaluators and includes a fixed fake
-evaluator.
+evaluator. `harness2.testing.trace_source_contract` does it for trace sources (one root `task`
+naming the `system` per run, the `<system>.` namespace, no built-in kinds, and an origin with
+the trace source's name, the file and the line) and includes a fixed fake trace source.
 """

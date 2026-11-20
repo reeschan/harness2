@@ -1,0 +1,10 @@
+created: 2026-11-20T05:34:54.062Z
+updated: 2026-11-20T05:34:54.063Z
+update_count: 1
+last_field: description
+kind: nested-class
+title: evalgraph
+children: []
+parentPath:
+  - core
+  - run-graph-evaluation

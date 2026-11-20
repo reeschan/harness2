@@ -1,0 +1,16 @@
+created: 2026-11-20T05:44:39.301Z
+updated: 2026-11-20T05:45:06.162Z
+update_count: 7
+last_field: note
+git_commit: cfeafea
+git_branch: feature/trace-sources
+children:
+  - harness2-bridge
+  - harness2-check
+  - harness2-demo
+  - harness2-evaluate
+  - harness2-intake
+  - harness2-judge
+  - harness2-report
+  - harness2-setup
+  - harness2-sweep

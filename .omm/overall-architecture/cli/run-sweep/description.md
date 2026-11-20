@@ -1,0 +1,1 @@
+`harness2/cli/run_sweep.py` (`harness2`): one adaptation sweep over a split, a thin argparse over `core.schedule.run_sweep`; checks readiness and the judge before the first rollout; `--dry-run` prints the stream only.

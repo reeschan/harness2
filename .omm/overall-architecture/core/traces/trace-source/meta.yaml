@@ -1,0 +1,10 @@
+created: 2026-11-20T05:34:17.252Z
+updated: 2026-11-20T05:34:23.141Z
+update_count: 2
+last_field: constraint
+kind: nested-class
+title: trace-source
+children: []
+parentPath:
+  - core
+  - traces

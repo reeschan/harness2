@@ -1,0 +1,9 @@
+created: 2026-11-20T05:39:05.918Z
+updated: 2026-11-20T05:39:05.918Z
+update_count: 1
+last_field: description
+kind: nested-class
+title: check
+children: []
+parentPath:
+  - cli

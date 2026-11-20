@@ -1,0 +1,8 @@
+graph LR
+    intake-contract["Task Connector Contract\nharness2/core/intake.py"]
+    intake-local["Local File Connector\nharness2/core/intake_local.py"]
+    normalize["Normalization\nharness2/core/normalize.py"]
+    intake-report["Report Status\nharness2/core/intake_report.py"]
+    worktree["Git Worktrees\nharness2/core/worktree.py"]
+    intake-local -->|"implements TaskConnector"| intake-contract
+    normalize -->|"turns a RawTask into a valid TaskSpec"| intake-contract

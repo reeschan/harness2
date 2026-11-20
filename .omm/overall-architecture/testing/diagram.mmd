@@ -1,0 +1,18 @@
+graph LR
+    author-tests["Author Tests\n(tests of code built on harness2)"]
+    connector-contract["Task Connector Contract\nharness2/testing/connector_contract.py"]
+    memory-contract["Memory Connector Contract\nharness2/testing/memory_contract.py"]
+    model-contract["Model Connector Contract\nharness2/testing/model_contract.py"]
+    trace-contract["Trace Sink Contract\nharness2/testing/trace_contract.py"]
+    trace-source-contract["Trace Source Contract\nharness2/testing/trace_source_contract.py"]
+    evaluator-contract["Evaluator Contract\nharness2/testing/evaluator_contract.py"]
+    author-tests -->|"check a task connector"| connector-contract
+    author-tests -->|"check a memory connector"| memory-contract
+    author-tests -->|"check a model connector"| model-contract
+    author-tests -->|"check a trace sink"| trace-contract
+    author-tests -->|"check a trace source"| trace-source-contract
+    author-tests -->|"check an evaluator"| evaluator-contract
+    classDef external fill:#585b70,stroke:#585b70,color:#cdd6f4
+    classDef entry fill:#89b4fa,stroke:#89b4fa,color:#1e1e2e
+    classDef store fill:#a6e3a1,stroke:#a6e3a1,color:#1e1e2e
+    class author-tests external

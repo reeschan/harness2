@@ -1,0 +1,12 @@
+created: 2026-11-20T05:33:21.789Z
+updated: 2026-11-20T05:33:26.633Z
+update_count: 2
+last_field: diagram
+kind: nested-class
+title: experience-library
+children:
+  - library
+  - memory
+  - recall
+parentPath:
+  - core

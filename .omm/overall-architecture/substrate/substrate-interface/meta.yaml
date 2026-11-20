@@ -1,0 +1,9 @@
+created: 2026-11-20T05:36:28.367Z
+updated: 2026-11-20T05:36:28.368Z
+update_count: 1
+last_field: description
+kind: nested-class
+title: substrate-interface
+children: []
+parentPath:
+  - substrate

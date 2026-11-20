@@ -1,0 +1,4 @@
+graph LR
+    registration["Registration\nharness2/evaluators/__init__.py"]
+    rules["Rules Evaluator\nharness2/evaluators/rules.py"]
+    registration -->|"registers RulesEvaluator as 'rules'"| rules

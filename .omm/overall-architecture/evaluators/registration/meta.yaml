@@ -1,0 +1,9 @@
+created: 2026-11-20T05:36:06.050Z
+updated: 2026-11-20T05:36:06.050Z
+update_count: 1
+last_field: description
+kind: nested-class
+title: registration
+children: []
+parentPath:
+  - evaluators

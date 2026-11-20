@@ -12,4 +12,21 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Evaluators bundled with harness2."""
+"""Evaluators bundled with harness2.
+
+Importing this package registers each bundled evaluator by name with `harness2.core.evaluate`,
+so `evaluate.evaluator_for("rules")` works after `import harness2.evaluators`. The registration
+lives here, not in `core`, because `core` sits on the layer below and must not import this
+package. An installed package also names `rules` through the entry point of the group
+`harness2.evaluators`, so a caller that skips this import can still resolve it.
+"""
+
+from __future__ import annotations
+
+from ..core import evaluate
+from .rules import NAME as RULES_NAME
+from .rules import RulesEvaluator
+
+evaluate.register(RULES_NAME, RulesEvaluator)
+
+__all__ = ["RulesEvaluator"]

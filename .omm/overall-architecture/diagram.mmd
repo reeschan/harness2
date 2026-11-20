@@ -1,0 +1,38 @@
+graph LR
+    cli["CLI\nharness2/cli/"]
+    benchmarks["Benchmarks\nharness2/benchmarks/"]
+    demo["Demo Adapter\nharness2/demo.py"]
+    preflight["Preflight\nharness2/preflight.py"]
+    evaluators["Evaluators\nharness2/evaluators/"]
+    substrate["Substrate\nharness2/substrate/"]
+    testing["Testing\nharness2/testing/"]
+    install["Install\nharness2/install.py"]
+    core["Core\nharness2/core/"]
+    base["Base\nharness2/__init__.py, harness2/config.py"]
+    plugins["Plugins\nharness2/plugins/"]
+    outside-code["Code Outside harness2\n(for example a task connector)"]
+    cli -->|"builds adapters, runs intake"| benchmarks
+    cli -->|"harness2-demo runs the demo adapter"| demo
+    cli -->|"harness2 and harness2-check check readiness"| preflight
+    cli -->|"harness2-evaluate registers the bundled evaluators"| evaluators
+    cli -->|"sweeps, judging, reports, evaluation graph"| core
+    cli -->|"harness2-setup and harness2-bridge read settings"| base
+    cli -->|"harness2-setup installs benchmark tools"| install
+    benchmarks -->|"run rollouts on an executor"| substrate
+    benchmarks -->|"implement BenchmarkAdapter and BenchSpec"| core
+    benchmarks -->|"locate installed benchmark tools"| install
+    demo -->|"uses the executor surface"| substrate
+    demo -->|"implements BenchmarkAdapter, fakes the Proposer"| core
+    preflight -->|"checks installed runners"| install
+    preflight -->|"checks the executor runtime"| substrate
+    evaluators -->|"implement Evaluator over the run graph"| core
+    substrate -->|"carry component tree surfaces"| core
+    testing -->|"check the connector, sink, source and evaluator contracts"| core
+    install -->|"reads versions and paths"| base
+    core -->|"reads deployment settings"| base
+    outside-code -->|"imports the plugins it needs"| plugins
+    classDef external fill:#585b70,stroke:#585b70,color:#cdd6f4
+    classDef entry fill:#89b4fa,stroke:#89b4fa,color:#1e1e2e
+    classDef store fill:#a6e3a1,stroke:#a6e3a1,color:#1e1e2e
+    class cli entry
+    class outside-code external
