@@ -1,0 +1,10 @@
+created: 2026-11-20T05:40:25.261Z
+updated: 2026-11-20T05:40:31.192Z
+update_count: 2
+last_field: diagram
+kind: nested-class
+title: layer-base
+children:
+  - harness2-config
+  - harness2-root
+parentPath: []

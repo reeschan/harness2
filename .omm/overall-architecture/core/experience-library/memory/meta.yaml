@@ -1,0 +1,10 @@
+created: 2026-11-20T05:33:35.696Z
+updated: 2026-11-20T05:33:35.696Z
+update_count: 1
+last_field: description
+kind: nested-class
+title: memory
+children: []
+parentPath:
+  - core
+  - experience-library

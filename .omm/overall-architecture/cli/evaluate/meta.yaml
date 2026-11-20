@@ -1,0 +1,9 @@
+created: 2026-11-20T05:39:23.258Z
+updated: 2026-11-20T05:39:23.258Z
+update_count: 1
+last_field: description
+kind: nested-class
+title: evaluate
+children: []
+parentPath:
+  - cli

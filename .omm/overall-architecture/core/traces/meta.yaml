@@ -1,0 +1,12 @@
+created: 2026-11-20T05:33:55.151Z
+updated: 2026-11-20T05:34:00.547Z
+update_count: 2
+last_field: diagram
+kind: nested-class
+title: traces
+children:
+  - trace
+  - trace-file
+  - trace-source
+parentPath:
+  - core

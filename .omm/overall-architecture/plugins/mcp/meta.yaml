@@ -1,0 +1,9 @@
+created: 2026-11-20T05:39:37.971Z
+updated: 2026-11-20T05:39:37.971Z
+update_count: 1
+last_field: description
+kind: nested-class
+title: mcp
+children: []
+parentPath:
+  - plugins

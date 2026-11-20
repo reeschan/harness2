@@ -1,0 +1,13 @@
+created: 2026-11-20T05:32:43.853Z
+updated: 2026-11-20T05:32:48.057Z
+update_count: 2
+last_field: diagram
+kind: nested-class
+title: improvement
+children:
+  - context
+  - models
+  - prompts
+  - proposer
+parentPath:
+  - core

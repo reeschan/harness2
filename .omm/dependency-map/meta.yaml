@@ -1,0 +1,13 @@
+created: 2026-11-20T05:39:48.595Z
+updated: 2026-11-20T05:40:19.261Z
+update_count: 7
+last_field: note
+git_commit: cfeafea
+git_branch: feature/trace-sources
+children:
+  - layer-base
+  - layer-benchmarks
+  - layer-cli
+  - layer-core
+  - layer-evaluators-substrate-testing
+  - layer-plugins

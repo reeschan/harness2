@@ -34,6 +34,9 @@ harness2-bridge = "harness2.cli.bridge:main"
 harness2-intake = "harness2.cli.intake:main"
 harness2-evaluate = "harness2.cli.evaluate:main"
 
+[project.entry-points."harness2.evaluators"]
+rules = "harness2.evaluators.rules:RulesEvaluator"
+
 [tool.setuptools.packages.find]
 include = ["harness2*"]
 

@@ -1,0 +1,6 @@
+graph LR
+    graph-builder["Run Graph\nharness2/core/graph.py"]
+    evaluate["Evaluators\nharness2/core/evaluate.py"]
+    evalgraph["Evaluation Graph\nharness2/core/evalgraph.py"]
+    evalgraph -->|"runs evaluator nodes"| evaluate
+    evaluate -->|"an EvalRequest carries the graph"| graph-builder

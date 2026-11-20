@@ -1,0 +1,10 @@
+created: 2026-11-20T05:34:37.372Z
+updated: 2026-11-20T05:34:41.880Z
+update_count: 2
+last_field: note
+kind: nested-class
+title: graph-builder
+children: []
+parentPath:
+  - core
+  - run-graph-evaluation

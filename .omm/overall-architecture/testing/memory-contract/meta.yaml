@@ -1,0 +1,9 @@
+created: 2026-11-20T05:37:04.734Z
+updated: 2026-11-20T05:37:04.734Z
+update_count: 1
+last_field: description
+kind: nested-class
+title: memory-contract
+children: []
+parentPath:
+  - testing

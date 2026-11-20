@@ -1,0 +1,11 @@
+created: 2026-11-20T05:36:17.626Z
+updated: 2026-11-20T05:36:23.113Z
+update_count: 2
+last_field: diagram
+kind: nested-class
+title: substrate
+children:
+  - codex
+  - opencode
+  - substrate-interface
+parentPath: []

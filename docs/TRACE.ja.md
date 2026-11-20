@@ -6,6 +6,8 @@
 
 コードは `harness2/core/trace.py`（イベント、シンクの契約、登録、実行ごとの `Tracer`）と `harness2/core/trace_file.py`（既定の `file` シンク。`trace.jsonl` を書き、読み戻す）にあります。
 
+同じイベントの形は、ほかのシステムの run も運びます。trace source が、評価のためにほかのシステムの記録をトレースのイベントとして読みます。その run は external run で、[external run](#external-run) の決まりに従います。
+
 ## 概要
 
 タスク実行は自分のディレクトリの Tracer を開いてそれを現在のものにし、モジュール関数でイベントを出します。Tracer がイベントを整えてシンクに渡します。最後に実行は Tracer の summary を `summary.json` に読み込み、閉じます。
@@ -60,7 +62,7 @@ events = read(task_dir / "trace.jsonl")
 
 ## 種類と属性
 
-種類は `trace.Kind` の定数です。文字列の値を直書きしないでください。`judge.` で始まる種類は採点側の予約で（後述）、手法側は出しません。属性の列は、span では開始イベントに harness2 が書くもの、point event ではそのイベントが持つものです。span の終了イベントには必ず `status` と `dur_s` が入り、失敗したときは `error` も入ります。
+種類は `trace.Kind` の定数です。文字列の値を直書きしないでください。`judge.` で始まる種類は採点側の予約で（後述）、手法側は出しません。これらが組み込みの種類で、harness2 の run のものです。external run が使うのはこのうち `task` だけです（[external run](#external-run) を参照）。属性の列は、span では開始イベントに harness2 が書くもの、point event ではそのイベントが持つものです。span の終了イベントには必ず `status` と `dur_s` が入り、失敗したときは `error` も入ります。
 
 | Kind | 値 | 形 | 属性 |
 |---|---|---|---|
@@ -246,6 +248,30 @@ tracer.close()
 # sink.events は TASK の開始、COST、TASK の終了の順になる。
 ```
 
+## external run
+
+system は、トレースがその run を記すプログラムです。harness2 は 1 つの system で、ほかの system の run は external run です。そのイベントは `Tracer` やシンクから来ません。trace source がほかの system の記録を元の場所のまま読み、`harness2-evaluate` の実行のグラフにイベントを渡します（[trace source](EVALUATION.ja.md#trace-source) を参照）。イベントは上と同じ 6 つのフィールドと同じ span の形を持ちます。span は同じ `span_id` を持つ開始と終了の 2 つのイベントで、point event は `phase` を持たず、`parent_id` がイベントを木につなぎます。そのうえで、external run は次の決まりを守ります:
+
+- **根の system。** 各 run は根の `task` span（`parent_id: null`）を 1 つ持ち、その attrs の `system` が system の名前（`"orchestrator"` のような空でない文字列）を名乗ります。名前 `harness2` は使えません。それを名乗れるのは harness2 が書くトレースだけです。`system` は span の開始と終了のどちらのイベントにあってもかまいません。
+- **名前空間。** ほかの種類はすべて `<system>.<種類>` で、run の system を接頭辞にし、残りは空にしません。例えば `orchestrator.step` や `orchestrator.question.asked` です。2 つの system が同じ語を別の意味で使っても混ざりません。
+- **組み込みの種類を出さない。** `task` 以外の `trace.Kind` の種類（`mode`、`rollout`、`stage`、`cost`、`error` など）と `judge.` の種類は harness2 の run だけのものです。似た出来事が要る external run は、自分の名前空間で名付けます。例えば `orchestrator.error` です。
+- **出どころ。** 各イベントは、読んだ場所を `Origin` として持ちます。trace source の名前・ファイル・元の記録の 1 から数えた行です。実行のグラフはノードの最初のイベントの出どころを `Node.source` に残すので、所見の根拠（`run_id`・`span_id`）からノードへ、そこから trace source の名前・ファイル・行へたどれます。
+- **`summary.json` を持たない。** external run には summary がありません。実行のグラフが返す summary に入らず、`EvalRequest.summary(run_id)` は `None` を返します。台帳、費用の合計など `summary.json` の中身は harness2 だけのものです。
+
+決まりを破るイベントは、警告を 1 つ足して飛ばし、評価は続きます。警告は trace source の名前・ファイル・行・種類・span を名指します。`system` の無い（または `harness2` を名乗る）`task` は飛ばし、その run のほかのイベントも、属する根が無いのですべて飛ばします。警告は `findings.json` の `warnings` と標準エラーに出ます。
+
+`orchestrator` の run を、trace source が返すイベント（それぞれ出どころを持つ）として書くと次のとおりです:
+
+```json
+{"run_id": "r1", "span_id": "s1", "parent_id": null, "kind": "task", "ts": "2026-01-01T00:00:00+00:00", "attrs": {"phase": "start", "system": "orchestrator"}}
+{"run_id": "r1", "span_id": "s2", "parent_id": "s1", "kind": "orchestrator.question.asked", "ts": "2026-01-01T00:00:05+00:00", "attrs": {"step": "design"}}
+{"run_id": "r1", "span_id": "s1", "parent_id": null, "kind": "task", "ts": "2026-01-01T00:01:00+00:00", "attrs": {"phase": "end", "status": "ok", "dur_s": 60.0}}
+```
+
+harness2 の run は、`task` が `system` を名乗らないもの（harness2 が書く `trace.jsonl` はすべてこれ）か、`harness2` を名乗るものです。`--runs`（または組み込みの trace source `trace`）で読む `trace.jsonl` には上の決まりを当てないので、trace source より前に書かれたトレースも前と同じに読めます。ほかのプログラムが、`task` に自分の system を名乗らせて書いた `trace.jsonl` も、評価者にとっては external run です。同梱の `rules` 評価者は harness2 の run だけを検査します。
+
+[本文を入れない決まり](#本文を入れない決まり)は、harness2 が自分のトレースについて守る約束です。trace source は `Tracer` を通らないので、長い文字列をハッシュにするものはありません。元の記録の何を `attrs` に入れるかは trace source が決めます。
+
 ## トラブルシューティング
 
 - **`trace.jsonl` が無い。** `HARNESS2_TRACE` を確かめてください。トレースを止めるのは `0` だけです。オンなら `summary.json` の `trace` を読みます。`{"enabled": false}` は無効の Tracer が作られたことを意味し、`sink failed:` で始まる `warnings` はシンクを作れなかったことを意味します。
@@ -260,5 +286,8 @@ tracer.close()
 - `harness2/core/trace.py`: `TraceEvent`、`Kind`、`Tracer`、シンクの登録、`digest`。
 - `harness2/core/trace_file.py`: `file` シンクと `read`。
 - `harness2/testing/trace_contract.py`: 契約テストと `RecordingSink`。
+- `harness2/core/trace_source.py`: trace source、`Origin`、external run の検査。
+- [評価](EVALUATION.ja.md#trace-source): trace source の選び方・作り方・確かめ方と、その run の評価のされ方。
 - [モデルのコネクター](MODEL_CONNECTORS.ja.md): 実行役と改善役のモデルについて、同じ名前の探し方とファクトリーの形。
 - `docs/specs/trace-port.md`: この移植が従う設計メモ。
+- `docs/specs/trace-sources.md`: trace source と external run の設計メモ。

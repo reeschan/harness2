@@ -37,6 +37,14 @@ node passes the findings it receives to its rebutter and keeps the verdicts' sta
 aggregate node merges what arrives. An unknown name is a config error (`ValueError`), while an
 exception thrown after a name resolves goes to `EvalResult.errors` and the run keeps going.
 
+A node's `viewpoints` may name a built-in viewpoint or a declared viewpoint: one that is not
+built in but that an evaluator of the graph returns from `viewpoints()`. The names are checked
+in two steps: `check_config` (and so `load_config`) checks their shape, and `run` checks, after
+building the evaluators and before any node evaluates, that every name that is not built in is
+declared, and that no evaluator declares a built-in name with another description or other
+`reads`. Both are config errors. When two evaluators declare the same viewpoint, the first
+declaration is used.
+
 Scores reach an evaluator only when the config says `allow_scores: true`; otherwise the request
 passed on has `scores=None` and the graph is cut down to the nodes that do not start with
 `trace.JUDGE_PREFIX`, so the same rule covers the evidence check.
@@ -117,18 +125,22 @@ def _aggregate_id(evaluators: Sequence[str]) -> str:
     return candidate
 
 
-def check_config(
-    config: Mapping[str, Any], *, viewpoints: Sequence[Viewpoint] = evaluate.VIEWPOINTS
-) -> None:
+def check_config(config: Mapping[str, Any]) -> None:
     """Raise ValueError naming the first problem with a graph config.
 
     The config is a mapping with only `nodes`, `edges` and `allow_scores`. A node has a unique
     non-empty `id`, a known `type`, the name its type needs (`evaluator` or `rebutter`), and
-    optionally `viewpoints` (named in `viewpoints`) and `options` (a mapping). Edges join known
-    ids without self loops or repeats, the graph is a DAG, and exactly one aggregate node is
-    the sink every node reaches. The evaluator and rebutter names must also resolve through
-    `evaluate.resolve_factory` / `resolve_rebutter_factory`: an unknown name is a config error,
-    not a finding, so this raises instead of leaving it to `run`.
+    optionally `viewpoints` (a non-empty list of names matching `[a-z][a-z0-9_]*`) and
+    `options` (a mapping). Edges join known ids without self loops or repeats, the graph is a
+    DAG, and exactly one aggregate node is the sink every node reaches. The evaluator and
+    rebutter names must also resolve through `evaluate.resolve_factory` /
+    `resolve_rebutter_factory`: an unknown name is a config error, not a finding, so this
+    raises instead of leaving it to `run`.
+
+    This is the first of two viewpoint checks. Here only the shape of each name is checked: a
+    built-in name stands for the built-in definition, and a name that is not built in may be a
+    declared viewpoint, which only the evaluators know. `run` builds the evaluators and checks
+    those names before any node evaluates.
     """
     if not isinstance(config, Mapping):
         raise ValueError(f"graph config must be a mapping, not {type(config).__name__}")
@@ -138,7 +150,6 @@ def check_config(
     nodes = config.get("nodes")
     if not isinstance(nodes, list):
         raise ValueError("graph config 'nodes' must be a list")
-    known_viewpoints = {item.name for item in viewpoints}
     kinds: dict[str, str] = {}
     names: dict[str, str] = {}
     for index, node in enumerate(nodes):
@@ -175,7 +186,7 @@ def check_config(
                 f"graph config {where} has unknown keys: {', '.join(unknown_node_keys)}"
             )
         if "viewpoints" in node:
-            _check_viewpoint_names(node["viewpoints"], known_viewpoints, where)
+            _check_viewpoint_names(node["viewpoints"], where)
         if "options" in node and not isinstance(node["options"], Mapping):
             raise ValueError(
                 f"graph config {where} 'options' must be a mapping, "
@@ -259,18 +270,17 @@ def check_config(
             resolve_rebutter_factory(names[node_id])
 
 
-def _check_viewpoint_names(values: Any, known: set[str], where: str) -> None:
-    """Raise ValueError unless `values` is a non-empty list of viewpoint names in `known`."""
+def _check_viewpoint_names(values: Any, where: str) -> None:
+    """Raise ValueError unless `values` is a non-empty list of well-formed viewpoint names.
+
+    Whether a name that is not built in is declared by an evaluator is checked later, by
+    `_run_viewpoints`, once the evaluators exist.
+    """
     if not isinstance(values, list) or not values:
         raise ValueError(f"graph config {where} 'viewpoints' must be a non-empty list of names")
     for value in values:
         if not isinstance(value, str) or not _VIEWPOINT_NAME.fullmatch(value):
             raise ValueError(f"graph config {where} viewpoint {value!r} must match [a-z][a-z0-9_]*")
-        if value not in known:
-            raise ValueError(
-                f"graph config {where} has unknown viewpoint {value!r}; "
-                f"expected one of {', '.join(sorted(known))}"
-            )
 
 
 @dataclass(frozen=True)
@@ -400,14 +410,21 @@ class EvalResult:
 
 
 def run(config: Mapping[str, Any], request: EvalRequest) -> EvalResult:
-    """Check the config, resolve every name, then run the nodes in topological order.
+    """Check the config, build the evaluators, check the viewpoints, then run the nodes.
 
-    A config error (a bad shape, an unknown evaluator or rebutter name) raises ValueError or
-    TypeError before any node runs. After that, a failing factory, `viewpoints()`, `evaluate()`
-    or `rebut()` only adds a line to `errors`; the node's output is empty (a rebut node passes
-    the findings through unchanged).
+    The checks come in two steps. `check_config` checks the shape of the config and of each
+    viewpoint name. Then every evaluator is built and its `viewpoints()` collected, and before
+    any node evaluates, `_run_viewpoints` checks that each chosen name is a viewpoint of the
+    request or one some evaluator of the graph declares, and that no evaluator redefines a
+    built-in viewpoint. The declared viewpoints are added to `request.viewpoints` for the
+    nodes, and get their own entry in `EvalResult.by_viewpoint` like the built-in ones.
+
+    A config error (a bad shape, an unknown evaluator, rebutter or viewpoint name, a built-in
+    viewpoint redefined) raises ValueError or TypeError before any node evaluates. After that,
+    a failing factory, `viewpoints()`, `evaluate()` or `rebut()` only adds a line to `errors`;
+    the node's output is empty (a rebut node passes the findings through unchanged).
     """
-    check_config(config, viewpoints=request.viewpoints)
+    check_config(config)
     result = EvalResult()
     nodes = list(config["nodes"])
     by_id = {node["id"]: node for node in nodes}
@@ -417,7 +434,13 @@ def run(config: Mapping[str, Any], request: EvalRequest) -> EvalResult:
         predecessors[dst].add(src)
     order = list(graphlib.TopologicalSorter(predecessors).static_order())
 
-    node_request = _request_for_run(config, request)
+    prepared = {
+        node["id"]: _prepare_evaluator(node, result)
+        for node in nodes
+        if node["type"] == "evaluator"
+    }
+    viewpoints = _run_viewpoints(nodes, request.viewpoints, prepared)
+    node_request = replace(_request_for_run(config, request), viewpoints=viewpoints)
     batches: dict[str, _Batch] = {}
     findings: list[AggregatedFinding] = []
     for node_id in order:
@@ -426,7 +449,7 @@ def run(config: Mapping[str, Any], request: EvalRequest) -> EvalResult:
             batches[src] for src in sorted(predecessors[node_id], key=position.__getitem__)
         )
         if node["type"] == "evaluator":
-            batches[node_id] = _run_evaluator(node, node_request, result)
+            batches[node_id] = _run_evaluator(node, prepared[node_id], node_request, result)
         elif node["type"] == "rebut":
             batches[node_id] = _run_rebut(node, incoming, node_request, result)
         else:
@@ -483,22 +506,32 @@ def _combine(batches: Iterable[_Batch]) -> _Batch:
     return combined
 
 
-def _run_evaluator(node: Mapping[str, Any], request: EvalRequest, result: EvalResult) -> _Batch:
-    """Run one evaluator node and keep the findings of the viewpoints it chose."""
+@dataclass(frozen=True)
+class _Prepared:
+    """An evaluator built for one node, with the viewpoints it declares."""
+
+    evaluator: evaluate.Evaluator
+    declared: tuple[Viewpoint, ...]
+
+
+def _prepare_evaluator(node: Mapping[str, Any], result: EvalResult) -> _Prepared | None:
+    """Build the evaluator of one node and collect its viewpoints; None after an error.
+
+    A failing factory or `viewpoints()`, or an item that is not a `Viewpoint`, adds a line to
+    `errors`; the node then writes no findings and declares nothing.
+    """
     node_id = node["id"]
     name = node["evaluator"]
-    batch = _Batch()
     try:
         evaluator = evaluate.evaluator_for(name, options=node.get("options") or {})
     except Exception as exc:
         result.errors.append(_error("evaluator", node_id, name, exc))
-        return batch
+        return None
     try:
         declared = list(evaluator.viewpoints())
     except Exception as exc:
         result.errors.append(_error("evaluator", node_id, name, exc))
-        return batch
-    declared_names: list[str] = []
+        return None
     for item in declared:
         if not isinstance(item, Viewpoint):
             result.errors.append(
@@ -509,8 +542,82 @@ def _run_evaluator(node: Mapping[str, Any], request: EvalRequest, result: EvalRe
                     f"viewpoints() returned {type(item).__name__}, not a Viewpoint",
                 )
             )
-            return batch
-        declared_names.append(item.name)
+            return None
+    return _Prepared(evaluator=evaluator, declared=tuple(declared))
+
+
+def _run_viewpoints(
+    nodes: Sequence[Mapping[str, Any]],
+    base: Sequence[Viewpoint],
+    prepared: Mapping[str, _Prepared | None],
+) -> tuple[Viewpoint, ...]:
+    """The viewpoints of the run: `base` plus the declared viewpoints, in first-declared order.
+
+    This is the second viewpoint check, made after the evaluators are built and before any
+    node evaluates. A declared viewpoint is one whose name is neither in `base` nor built in;
+    when two evaluators declare the same one, the first declaration (in node order) wins. It
+    raises ValueError when an evaluator declares a name that does not match
+    `[a-z][a-z0-9_]*`, when it declares a viewpoint of `base` or a built-in one under the same
+    name with another description or other `reads`, and when a node chooses a name that is
+    neither in `base` nor declared by an evaluator of the graph. A node whose evaluator failed
+    to build is left out of that last check: its error is already a line of `errors` and it
+    writes no findings, so the run goes on.
+    """
+    known = {item.name: item for item in base}
+    builtin = {item.name: item for item in evaluate.VIEWPOINTS}
+    added: dict[str, Viewpoint] = {}
+    failed: set[str] = set()
+    for node_id, entry in prepared.items():
+        if entry is None:
+            failed.add(node_id)
+            continue
+        for item in entry.declared:
+            reference = known.get(item.name, builtin.get(item.name))
+            if reference is not None:
+                if item.description != reference.description or tuple(item.reads) != tuple(
+                    reference.reads
+                ):
+                    raise ValueError(
+                        f"graph config node {node_id!r}: the evaluator declares viewpoint "
+                        f"{item.name!r} with another description or other reads than the "
+                        "built-in one; a declared viewpoint needs a name of its own"
+                    )
+                continue
+            if not isinstance(item.name, str) or not _VIEWPOINT_NAME.fullmatch(item.name):
+                raise ValueError(
+                    f"graph config node {node_id!r}: the evaluator declares viewpoint "
+                    f"{item.name!r}, which must match [a-z][a-z0-9_]*"
+                )
+            added.setdefault(item.name, item)
+    for node in nodes:
+        if node["id"] in failed:
+            continue
+        for value in node.get("viewpoints") or ():
+            if value in known or value in added:
+                continue
+            expected = ", ".join(list(known) + list(added)) or "(none)"
+            raise ValueError(
+                f"graph config node {node['id']!r} has unknown viewpoint {value!r}; it is "
+                "neither a viewpoint of the run nor declared by an evaluator of the graph; "
+                f"expected one of {expected}"
+            )
+    return tuple(base) + tuple(added.values())
+
+
+def _run_evaluator(
+    node: Mapping[str, Any],
+    prepared: _Prepared | None,
+    request: EvalRequest,
+    result: EvalResult,
+) -> _Batch:
+    """Run one prepared evaluator node and keep the findings of the viewpoints it chose."""
+    node_id = node["id"]
+    name = node["evaluator"]
+    batch = _Batch()
+    if prepared is None:
+        return batch
+    evaluator = prepared.evaluator
+    declared_names = [item.name for item in prepared.declared]
     by_name = {item.name: item for item in request.viewpoints}
     chosen_names = _chosen_viewpoints(node, declared_names, by_name, result, node_id, name)
     chosen = tuple(by_name[viewpoint_name] for viewpoint_name in chosen_names)

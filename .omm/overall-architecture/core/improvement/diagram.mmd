@@ -1,0 +1,6 @@
+graph LR
+    proposer["Proposer\nharness2/core/proposer.py"]
+    prompts["Prompts\nharness2/core/prompts.py"]
+    context["Context Tree\nharness2/core/context.py"]
+    models["Model Connectors\nharness2/core/models.py"]
+    proposer -->|"asks for the executor and improver models"| models

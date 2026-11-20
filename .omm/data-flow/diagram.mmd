@@ -1,0 +1,21 @@
+graph LR
+    task-run["Task Run\nharness2/core/schedule.py"]
+    tracer["Tracer\nharness2/core/trace.py"]
+    trace-files["trace.jsonl and summary.json\nruns root"]
+    external-records["Records of Another System\n(any location)"]
+    trace-source["Trace Source\nharness2/core/trace_source.py"]
+    run-graph["Run Graph\nharness2/core/graph.py"]
+    evaluation-graph["Evaluation Graph\nharness2/core/evalgraph.py"]
+    findings["Findings Files\nharness2/cli/evaluate.py"]
+    task-run -->|"emits spans and point events"| tracer
+    tracer -->|"FileSink appends one JSON line per event"| trace-files
+    trace-files -->|"read by trace_file.read"| run-graph
+    external-records -->|"read(location)"| trace-source
+    trace-source -->|"SourcedEvent with Origin, checked against the rules"| run-graph
+    run-graph -->|"EvalRequest per viewpoint"| evaluation-graph
+    evaluation-graph -->|"aggregated, dropped and refused findings, errors"| findings
+    classDef external fill:#585b70,stroke:#585b70,color:#cdd6f4
+    classDef entry fill:#89b4fa,stroke:#89b4fa,color:#1e1e2e
+    classDef store fill:#a6e3a1,stroke:#a6e3a1,color:#1e1e2e
+    class external-records external
+    class trace-files,findings store

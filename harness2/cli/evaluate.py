@@ -12,26 +12,41 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Evaluate the runs under one directory and write the findings as files.
+"""Evaluate task runs and the records of other systems, and write the findings as files.
 
-Reads every `trace.jsonl` under `--runs` with the `summary.json` next to it, runs the
-evaluation graph over the resulting run graph, and writes the aggregated findings, the
-findings dropped or refused, the errors, the graph warnings, and the number of traces and
-runs read. Each viewpoint also gets its own pre-aggregation list under
-`findings/<viewpoint>.json`; a rerun removes the files of viewpoints it no longer has.
+Reads every `trace.jsonl` under `--runs` with the `summary.json` next to it, and the records
+each `--source <name>=<location>` names through that trace source, into one run graph. Runs
+the evaluation graph over it and writes the aggregated findings, the findings dropped or
+refused, the errors, the graph warnings, the number of traces read (`traces`), the number of
+runs (`runs`, external runs included) and the number of runs each trace source gave
+(`sources`, by the trace source name of the nodes). Each viewpoint also gets its own
+pre-aggregation list under `findings/<viewpoint>.json`; a rerun removes the files of
+viewpoints it no longer has.
 
     harness2-evaluate --runs runs/jb/adapt/jb-oc-agg1
+    harness2-evaluate --source orchestrator=records/ --runs runs/jb/adapt/jb-oc-agg1
+
+A trace source name is looked up like an evaluator name: a registration, an entry point of
+the group `harness2.trace_sources`, then `module:Attr`. `--source` may be given more than
+once, and `--runs DIR` means the same as `--source trace=DIR` (the built-in trace source).
+At least one of `--runs` and `--source` is needed.
 
 `--evaluators` names the evaluators of the default graph (one node per name, all wired to one
 aggregate node); `--graph` takes a JSON graph config instead and wins over `--evaluators`.
-The default `--out` is `<runs>/evaluation`.
+The default `--out` is `<runs>/evaluation`, or `<location>/evaluation` of the first
+`--source` when `--runs` is not given; a location that is a file puts it next to the file.
+
+A trace source that fails on its location does not stop the run: an OSError, or any other
+exception its `read` raises (a result that is not an `(events, warnings)` pair included), is
+one warning and that source gives no runs.
 
 Scores are kept on the grading side: without `--allow-scores` no `judge.*` node enters the
 graph and `scores` stays `None`. With it, the score files are still used only when the graph
 config also has `allow_scores: true`, so a config that does not opt in never sees them.
 
 Exit codes: 0 when the run finished, findings or not; 2 for a bad argument, a bad graph config,
-an unknown evaluator name or a directory without any trace.
+an unknown evaluator or trace source name, or inputs without any trace and any trace source
+run.
 """
 
 from __future__ import annotations
@@ -42,11 +57,59 @@ import sys
 from pathlib import Path
 from typing import Any
 
+from .. import evaluators  # noqa: F401  (registers the bundled evaluators, `rules` among them)
 from ..core import evalgraph, trace
 from ..core import evaluate as EV
 from ..core import graph as G
+from ..core import trace_source as TS
 from ..core.evaluate import EvalRequest
 from . import _common as C
+
+
+def _source_spec(raw: str) -> tuple[str, str]:
+    """`NAME=LOCATION` as (name, location); the first `=` splits, and both must be non-empty."""
+    name, sep, location = raw.partition("=")
+    name = name.strip()
+    if not sep or not name or not location:
+        raise ValueError(f"--source takes NAME=LOCATION, got {raw!r}")
+    return name, location
+
+
+def _inputs(
+    runs: Path | None, specs: list[tuple[str, str]]
+) -> tuple[list[Path], list[TS.SourceRead]]:
+    """(trace roots, trace source results) of `--runs` and the `--source` arguments.
+
+    Every name is resolved before anything is read, so an unknown name stops the run first. A
+    `--source` of the built-in `trace` adds its location to the roots, the same as `--runs`.
+    A location a trace source cannot open (OSError) becomes a warning of its result, and so does
+    any other exception of its `read`, the TypeError of a result that is not an
+    `(events, warnings)` pair included: a broken input or a broken trace source must not stop
+    the evaluation, and exit 2 stays for the arguments, the config and the names.
+    """
+    roots = [] if runs is None else [runs]
+    resolved = [(name, location, TS.trace_source_for(name)) for name, location in specs]
+    reads: list[TS.SourceRead] = []
+    for name, location, source in resolved:
+        if isinstance(source, TS.TraceFiles):
+            roots.append(Path(location))
+            continue
+        try:
+            reads.append(TS.read_from(source, location))
+        except OSError as exc:
+            reads.append(TS.SourceRead([], [f"cannot read {location} with {name}: {exc}"]))
+        except Exception as exc:
+            reads.append(TS.SourceRead([], [f"trace source {name} failed on {location}: {exc}"]))
+    return roots, reads
+
+
+def _external_runs(level: G.Graph) -> dict[str, int]:
+    """The number of external runs by the trace source name of their `task` node."""
+    counts: dict[str, int] = {}
+    for node in level.runs().values():
+        if isinstance(node.source, TS.Origin):
+            counts[node.source.name] = counts.get(node.source.name, 0) + 1
+    return counts
 
 
 def _evaluator_names(raw: str) -> list[str]:
@@ -96,7 +159,19 @@ def main(argv: list[str] | None = None) -> int:
     p = argparse.ArgumentParser(
         prog="harness2-evaluate", description=__doc__, formatter_class=C.HelpFormatter
     )
-    p.add_argument("--runs", required=True, metavar="DIR", help="directory of the task runs")
+    p.add_argument(
+        "--runs",
+        default=None,
+        metavar="DIR",
+        help="directory of the task runs; the same as --source trace=DIR",
+    )
+    p.add_argument(
+        "--source",
+        action="append",
+        default=[],
+        metavar="NAME=LOCATION",
+        help="read LOCATION with the trace source NAME; may be repeated",
+    )
     p.add_argument(
         "--evaluators",
         default="rules",
@@ -113,7 +188,10 @@ def main(argv: list[str] | None = None) -> int:
         "--out",
         default=None,
         metavar="DIR",
-        help="output directory; defaults to <runs>/evaluation",
+        help=(
+            "output directory; defaults to <runs>/evaluation, else <first source>/evaluation"
+            " (next to the source when it is a file)"
+        ),
     )
     p.add_argument(
         "--allow-scores",
@@ -122,19 +200,42 @@ def main(argv: list[str] | None = None) -> int:
     )
     args = p.parse_args(argv)
 
-    runs = Path(args.runs)
-    out = Path(args.out) if args.out else runs / "evaluation"
+    try:
+        specs = [_source_spec(raw) for raw in args.source]
+    except ValueError as exc:
+        print(f"error: {exc}", file=sys.stderr, flush=True)
+        return 2
+    if args.runs is None and not specs:
+        print("error: give --runs DIR or --source NAME=LOCATION", file=sys.stderr, flush=True)
+        return 2
+    runs = None if args.runs is None else Path(args.runs)
+    if args.out:
+        out = Path(args.out)
+    elif runs is not None:
+        out = runs / "evaluation"
+    else:
+        first = Path(specs[0][1])
+        out = (first.parent if first.is_file() else first) / "evaluation"
     try:
         config, allow_scores = _config(args)
+        roots, reads = _inputs(runs, specs)
     except (ValueError, TypeError) as exc:
         print(f"error: {exc}", file=sys.stderr, flush=True)
         return 2
 
-    paths = sorted(path for path in runs.rglob(G.TRACE_NAME) if path.is_file())
-    if not paths:
-        print(f"error: no {G.TRACE_NAME} under {runs}", file=sys.stderr, flush=True)
+    paths = TS.trace_paths(*roots)
+    level, summaries = G.load_runs(roots, sources=reads, include_judge=allow_scores)
+    external = _external_runs(level)
+    if not paths and not external:
+        where = ", ".join(str(root) for root in roots)
+        if reads:
+            message = f"no {G.TRACE_NAME} under {where or '(no --runs)'} and no trace source run"
+        else:
+            message = f"no {G.TRACE_NAME} under {where}"
+        for warning in level.warnings:
+            print(f"warning: {warning}", file=sys.stderr, flush=True)
+        print(f"error: {message}", file=sys.stderr, flush=True)
         return 2
-    level, summaries = G.load_runs(runs, include_judge=allow_scores)
     scores = _scores(level) if allow_scores else None
     request = EvalRequest(
         graph=level,
@@ -155,6 +256,7 @@ def main(argv: list[str] | None = None) -> int:
         warnings=list(level.warnings),
         traces=len(paths),
         runs=len(level.runs()),
+        sources=external,
     )
     findings_path = out / "findings.json"
     out.mkdir(parents=True, exist_ok=True)

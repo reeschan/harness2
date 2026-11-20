@@ -39,6 +39,14 @@ the same task in two experiments stays two findings.
 Every node is read once into an index by run and kind, so the checks do not walk the whole graph
 again for each run.
 
+Only harness2 runs are checked: a run whose TASK attrs have no `system`, or `system="harness2"`.
+The nodes of any other run (an external run that a trace source read) are left out of every
+check, the error count included, so another system's run never gets a rules finding.
+
+Registration lives in `harness2.evaluators`: importing that package registers `rules`, and the
+entry point `rules` of the group `harness2.evaluators` names `RulesEvaluator` for an installed
+package.
+
 Scores are never read: `request.scores` stays untouched, because the run decides whether the
 evaluation may see them.
 """
@@ -56,6 +64,7 @@ from ..core.graph import Graph, Node
 
 NAME = "rules"
 VIEWPOINT_NAMES = ("cost", "budget", "safety", "reproducibility")
+SYSTEM = "harness2"
 
 Index = Mapping[tuple[str, str], list[Node]]
 
@@ -87,11 +96,16 @@ class RulesEvaluator:
         return [evaluate.viewpoint(name) for name in VIEWPOINT_NAMES]
 
     def evaluate(self, request: EvalRequest) -> list[Finding]:
-        """Every check of the table, one finding per distinct problem; scores are not read."""
+        """Every check of the table, one finding per distinct problem; scores are not read.
+
+        Only the harness2 runs of the request are read; see `_external_runs`.
+        """
         findings: list[Finding] = []
         graph = request.graph
-        index = _node_index(graph)
-        runs = graph.runs()
+        all_runs = graph.runs()
+        external = _external_runs(all_runs)
+        runs = {run_id: task for run_id, task in all_runs.items() if run_id not in external}
+        index = _node_index(graph, external)
         for run_id, task in sorted(runs.items()):
             summary = request.summaries.get(task.source.parent)
             if not isinstance(summary, Mapping):
@@ -115,7 +129,7 @@ class RulesEvaluator:
                 self._budget_ledger(index, graph, run_id, path, task, summary, task_name)
             )
             findings.extend(self._cost(index, run_id, path, task, summary, task_name))
-        findings.extend(self._errors(graph))
+        findings.extend(self._errors(graph, runs, external))
         return findings
 
     # -- checks ---------------------------------------------------------------------------
@@ -421,9 +435,18 @@ class RulesEvaluator:
             )
         ]
 
-    def _errors(self, graph: Graph) -> list[Finding]:
-        """Error events and caught failures counted by `where` across the tasks of the request."""
-        failed = [node for node in graph.nodes.values() if _is_failure(node)]
+    def _errors(
+        self, graph: Graph, tasks: Mapping[str, Node], external: frozenset[str]
+    ) -> list[Finding]:
+        """Error events and caught failures counted by `where` across the harness2 tasks.
+
+        `tasks` are the harness2 runs by run id; the nodes of the `external` runs are skipped.
+        """
+        failed = [
+            node
+            for node in graph.nodes.values()
+            if node.run_id not in external and _is_failure(node)
+        ]
         mode_errors: set[tuple[str, str]] = set()
         for node in failed:
             if node.kind != trace.Kind.ERROR:
@@ -444,7 +467,6 @@ class RulesEvaluator:
                 continue
             where = node.attrs.get("where") or node.kind
             groups[str(where)].append(node)
-        tasks = graph.runs()
         findings = []
         for where in sorted(groups):
             nodes = groups[where]
@@ -485,10 +507,30 @@ class RulesEvaluator:
         )
 
 
-def _node_index(graph: Graph) -> dict[tuple[str, str], list[Node]]:
-    """Every node by run and kind, each list in start order; built once per request."""
+def _external_runs(runs: Mapping[str, Node]) -> frozenset[str]:
+    """The run ids whose TASK attrs name a `system` other than harness2.
+
+    A run without a `system` attr is a harness2 run, as every trace harness2 wrote before
+    trace sources existed has none.
+    """
+    return frozenset(
+        run_id
+        for run_id, task in runs.items()
+        if task.attrs.get("system") is not None and task.attrs.get("system") != SYSTEM
+    )
+
+
+def _node_index(
+    graph: Graph, external: frozenset[str] = frozenset()
+) -> dict[tuple[str, str], list[Node]]:
+    """Every node by run and kind, each list in start order; built once per request.
+
+    The nodes of the `external` runs are left out.
+    """
     index: dict[tuple[str, str], list[Node]] = defaultdict(list)
     for node in graph.nodes.values():
+        if node.run_id in external:
+            continue
         index[(node.run_id, node.kind)].append(node)
     for nodes in index.values():
         nodes.sort(key=lambda node: (node.start_ts or "", node.span_id))

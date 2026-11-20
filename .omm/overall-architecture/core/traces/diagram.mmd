@@ -1,0 +1,7 @@
+graph LR
+    trace["Trace Sinks and Tracer\nharness2/core/trace.py"]
+    trace-file["File Sink\nharness2/core/trace_file.py"]
+    trace-source["Trace Sources\nharness2/core/trace_source.py"]
+    trace -->|"the default sink writes trace.jsonl"| trace-file
+    trace-source -->|"events are TraceEvent, checked against trace.Kind"| trace
+    trace-source -->|"the built-in source 'trace' reads trace.jsonl"| trace-file

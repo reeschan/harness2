@@ -1,0 +1,15 @@
+created: 2026-11-20T05:36:42.928Z
+updated: 2026-11-20T05:36:48.676Z
+update_count: 2
+last_field: diagram
+kind: nested-class
+title: testing
+children:
+  - author-tests
+  - connector-contract
+  - evaluator-contract
+  - memory-contract
+  - model-contract
+  - trace-contract
+  - trace-source-contract
+parentPath: []

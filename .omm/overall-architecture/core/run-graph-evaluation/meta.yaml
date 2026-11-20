@@ -1,0 +1,12 @@
+created: 2026-11-20T05:34:29.095Z
+updated: 2026-11-20T05:34:34.360Z
+update_count: 2
+last_field: diagram
+kind: nested-class
+title: run-graph-evaluation
+children:
+  - evalgraph
+  - evaluate
+  - graph-builder
+parentPath:
+  - core

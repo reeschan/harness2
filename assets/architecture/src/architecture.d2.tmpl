@@ -56,7 +56,7 @@ cli: "CLI  ·  harness2-*" {
   run: "harness2\nrefinement sweep" {class: box}
   demo: "harness2-demo\nlocal, no credentials" {class: box}
   judge: "harness2-judge / -report\ngrade + summarize" {class: box}
-  evaluate: "harness2-evaluate\nfindings from traces" {class: box}
+  evaluate: "harness2-evaluate\nfindings from traces\n+ trace sources" {class: box}
 }
 
 core: "harness2.core  ·  the method (benchmark-independent)" {
@@ -109,7 +109,7 @@ core: "harness2.core  ·  the method (benchmark-independent)" {
       class: box
       width: 290
     }
-    evaluate: "evaluation  ·  rules (default)\nrun graph from trace.jsonl\nevaluators → aggregate\n→ findings.json" {
+    evaluate: "evaluation  ·  rules (default)\nrun graph from trace.jsonl\n+ trace source runs\nevaluators → aggregate\n→ findings.json" {
       class: box
       width: 270
     }
@@ -131,6 +131,11 @@ core: "harness2.core  ·  the method (benchmark-independent)" {
     }
     traceplug: "external trace sink\nentry point · module:Attr" {
       class: box
+      style.stroke-dash: 4
+    }
+    tracesrc: "trace source\nexternal system records\n→ trace events\nharness2.trace_sources\nentry point · module:Attr" {
+      class: box
+      width: 260
       style.stroke-dash: 4
     }
     evalplug: "external evaluator / rebutter\nentry point · module:Attr" {
@@ -283,6 +288,7 @@ core.outputs.library -> core.impls.plug: "HARNESS2_MEMORY_CONNECTOR\nname, entry
 core.outputs.routes -> core.impls.modelplug: "HARNESS2_MODEL_CONNECTOR\nname, entry point or module:Attr" {style.stroke-dash: 4}
 core.task -> core.outputs.trace: "events" {style.stroke-dash: 4}
 core.outputs.trace -> core.outputs.evaluate: "trace.jsonl" {style.stroke-dash: 4}
+core.impls.tracesrc -> core.outputs.evaluate: "--source name=location\nexternal runs" {style.stroke-dash: 4}
 core.outputs.evaluate -> core.impls.evalplug: "harness2.evaluators\nharness2.rebutters" {style.stroke-dash: 4}
 core.outputs.trace -> core.impls.traceplug: "HARNESS2_TRACE_SINK\nname, entry point or module:Attr" {style.stroke-dash: 4}
 

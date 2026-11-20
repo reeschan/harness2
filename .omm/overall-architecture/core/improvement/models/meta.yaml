@@ -1,0 +1,10 @@
+created: 2026-11-20T05:33:10.921Z
+updated: 2026-11-20T05:33:10.921Z
+update_count: 1
+last_field: description
+kind: nested-class
+title: models
+children: []
+parentPath:
+  - core
+  - improvement

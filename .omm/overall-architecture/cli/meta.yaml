@@ -1,0 +1,18 @@
+created: 2026-11-20T05:38:30.893Z
+updated: 2026-11-20T05:38:35.458Z
+update_count: 2
+last_field: diagram
+kind: nested-class
+title: cli
+children:
+  - bridge
+  - check
+  - common
+  - demo
+  - evaluate
+  - intake
+  - judge
+  - report
+  - run-sweep
+  - setup
+parentPath: []

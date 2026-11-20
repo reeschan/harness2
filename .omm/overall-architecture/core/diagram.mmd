@@ -1,0 +1,25 @@
+graph LR
+    scheduling["Scheduling\nschedule.py, recursion.py, ledger.py, runmark.py"]
+    improvement["Improvement\nproposer.py, prompts.py, context.py, models.py"]
+    selection["Selection\nselection.py"]
+    experience-library["Experience Library\nlibrary.py, memory.py, recall.py"]
+    tree["Component Tree\ntree.py"]
+    spec["Benchmark Seam\nspec.py"]
+    traces["Traces\ntrace.py, trace_file.py, trace_source.py"]
+    run-graph-evaluation["Run Graph and Evaluation\ngraph.py, evaluate.py, evalgraph.py"]
+    intake["Task Intake\nintake.py, intake_local.py, intake_report.py, normalize.py, worktree.py"]
+    judging["Judging and Reports\njudge.py, report.py"]
+    scheduling -->|"runs improver sessions for each stage"| improvement
+    scheduling -->|"picks the final output"| selection
+    scheduling -->|"reads and stores experience"| experience-library
+    scheduling -->|"emits task, mode and stage spans"| traces
+    scheduling -->|"calls the adapter and its BenchSpec"| spec
+    improvement -->|"builds the evidence tree, edits the harness"| tree
+    selection -->|"uses the improver channel"| improvement
+    experience-library -->|"copies adopted trees"| tree
+    spec -->|"names the SurfaceSpec"| tree
+    run-graph-evaluation -->|"reads trace.jsonl and trace sources"| traces
+    traces -->|"trace_source reuses the evaluator name lookup"| run-graph-evaluation
+    intake -->|"normalizes raw tasks into TaskSpec"| spec
+    intake -->|"reports status from task results"| scheduling
+    judging -->|"reads task results"| scheduling

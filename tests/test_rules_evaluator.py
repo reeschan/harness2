@@ -18,6 +18,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import tomllib
 import unittest
 from pathlib import Path
 
@@ -824,6 +825,105 @@ class ScoreTests(RulesTestCase):
         self.assertEqual(self.findings(runs, scores=_ExplodingScores()), [])
 
 
+def emit_external(system="orchestrator", task_id="external-1"):
+    """A run of another system that would trip every check if rules read it."""
+
+    def body():
+        with trace.span(trace.Kind.TASK, task_id=task_id, system=system, k=1, modes=["agg"]):
+            for _ in range(5):
+                trace.event(trace.Kind.MODEL_SWITCH, role="improver", to=None)
+            trace.event(trace.Kind.MODEL_FENCE, role="improver", fenced=False, model="m")
+            trace.event(trace.Kind.ERROR, where="base", message="failed")
+            if system not in (None, "harness2"):
+                trace.event(f"{system}.error", where="question", message="failed")
+            with trace.span(trace.Kind.STAGE, label="agg1", mode="agg") as stage:
+                stage.set(attempts=3, fell_back=True, error="no fenced runner")
+            try:
+                with trace.span(trace.Kind.SELECTION, mode="agg"):
+                    raise RuntimeError("boom")
+            except RuntimeError:
+                pass
+
+    return body
+
+
+def emit_error_with_system(where, task_id, **attrs):
+    """An error run whose TASK carries `attrs` (a `system`, for example)."""
+
+    def body():
+        with trace.span(trace.Kind.TASK, task_id=task_id, **attrs):
+            trace.event(trace.Kind.ERROR, where=where, message="failed")
+
+    return body
+
+
+class ExternalRunTests(RulesTestCase):
+    def test_an_external_run_gets_no_finding(self):
+        summary = make_summary()
+        summary["modes"]["agg"]["ledger"]["R"] = 3
+        summary["modes"]["agg"]["ledger"]["rollout_usd"] = 0.0
+        self.assertEqual(self.findings([("ext-1", emit_external(), summary)]), [])
+
+    def test_an_external_run_without_a_summary_gets_no_finding(self):
+        self.assertEqual(self.findings([("ext-1", emit_external(), {})]), [])
+
+    def test_external_errors_are_not_counted_with_harness2_errors(self):
+        findings = self.findings(
+            [
+                ("run-1", emit_error_with_system("base", "task-1"), {}),
+                ("ext-1", emit_error_with_system("base", "ext-1", system="orchestrator"), {}),
+            ]
+        )
+        self.assertEqual([finding.key for finding in findings], ["rules:errors:base"])
+        self.assertEqual(findings[0].severity, Severity.INFO)
+        self.assertIn("1 task", findings[0].claim)
+        self.assertEqual([item.run_id for item in findings[0].evidence], ["run-1"])
+
+    def test_no_evidence_points_at_an_external_run(self):
+        runs = [
+            ("run-1", emit_external(system=None, task_id="task-1"), {}),
+            ("ext-1", emit_external(), {}),
+        ]
+        findings = self.findings(runs)
+        self.assertTrue(findings)
+        for finding in findings:
+            for item in finding.evidence:
+                self.assertEqual(item.run_id, "run-1", finding.key)
+
+    def test_a_harness2_system_gets_the_same_findings_as_no_system(self):
+        def keys(system):
+            body = emit_external(system=system, task_id="task-1")
+            return sorted(finding.key for finding in self.findings([("run-1", body, {})]))
+
+        without = keys(None)
+        self.assertTrue(without)
+        self.assertEqual(keys("harness2"), without)
+        self.assertEqual(keys("orchestrator"), [])
+
+    def test_a_harness2_system_with_a_wrong_ledger_is_checked(self):
+        def body():
+            with trace.span(trace.Kind.TASK, task_id="task-1", system="harness2", k=1):
+                with trace.span(trace.Kind.MODE, mode="agg"):
+                    pass
+
+        summary = make_summary()
+        summary["modes"]["agg"]["ledger"]["R"] = 3
+        findings = self.findings([("run-1", body, summary)])
+        self.assertIn("budget", {finding.viewpoint for finding in findings})
+
+
+def run_python(code: str) -> subprocess.CompletedProcess:
+    """Run `code` in a fresh interpreter from the repository root."""
+    root = Path(__file__).resolve().parents[1]
+    return subprocess.run(
+        [sys.executable, "-c", code],
+        cwd=root,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+
 class RegistrationTests(unittest.TestCase):
     def test_evaluator_for_builds_rules(self):
         evaluator = evaluate.evaluator_for("rules", options={"max_switches": 1})
@@ -832,21 +932,48 @@ class RegistrationTests(unittest.TestCase):
         self.assertIn("rules", evaluate.names())
 
     def test_rules_can_be_imported_before_evaluate(self):
-        root = Path(__file__).resolve().parents[1]
         code = (
             "import harness2.evaluators.rules as rules\n"
             "from harness2.core import evaluate\n"
             "evaluator = evaluate.evaluator_for('rules')\n"
             "assert isinstance(evaluator, rules.RulesEvaluator)\n"
         )
-        result = subprocess.run(
-            [sys.executable, "-c", code],
-            cwd=root,
-            capture_output=True,
-            text=True,
-            check=False,
-        )
+        result = run_python(code)
         self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_importing_the_evaluators_package_registers_rules(self):
+        code = (
+            "import harness2.evaluators\n"
+            "from harness2.core import evaluate\n"
+            "from harness2.evaluators.rules import RulesEvaluator\n"
+            "assert 'rules' in evaluate._REGISTRY\n"
+            "evaluator = evaluate.evaluator_for('rules', options={'max_attempts': 5})\n"
+            "assert isinstance(evaluator, RulesEvaluator)\n"
+            "assert evaluator.max_attempts == 5\n"
+        )
+        result = run_python(code)
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_core_alone_registers_nothing(self):
+        code = (
+            "import sys\n"
+            "from harness2.core import evaluate, evalgraph\n"
+            "assert 'rules' not in evaluate._REGISTRY, evaluate._REGISTRY\n"
+            "assert 'harness2.evaluators' not in sys.modules\n"
+        )
+        result = run_python(code)
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_the_entry_point_builds_rules(self):
+        root = Path(__file__).resolve().parents[1]
+        with open(root / "pyproject.toml", "rb") as handle:
+            project = tomllib.load(handle)
+        entry_points = project["project"]["entry-points"][evaluate.ENTRY_POINT_GROUP]
+        self.assertIn("rules", entry_points)
+        factory = evaluate.resolve_factory(entry_points["rules"])
+        evaluator = factory(max_switches=2)
+        self.assertIsInstance(evaluator, RulesEvaluator)
+        self.assertEqual(evaluator.max_switches, 2)
 
 
 class RulesEvaluatorContractTest(EvaluatorContractTests, unittest.TestCase):

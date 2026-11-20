@@ -13,6 +13,10 @@ The code is in `harness2/core/trace.py` (the event, the sink contract, the regis
 per-run `Tracer`) and `harness2/core/trace_file.py` (the default `file` sink, which writes
 `trace.jsonl` and reads it back).
 
+The same event shape also carries the runs of other systems. A trace source reads another
+system's records as trace events for the evaluation; those runs are external runs and follow
+the rules in [External runs](#external-runs).
+
 ## Overview
 
 A task run opens a tracer for its directory, makes it current, and emits events through the
@@ -85,9 +89,10 @@ and has no `phase`; it has its own `span_id` but no second event.
 
 The kinds are constants on `trace.Kind`; never write the string values by hand. Kinds that
 start with `judge.` are reserved for the grading side (see below) and are not emitted by the
-method side. The attributes column lists what harness2 writes on the start event of a span and
-on a point event; every span's end event also has `status` and `dur_s`, and `error` when it
-failed.
+method side. These are the built-in kinds: they belong to harness2 runs, and an external run
+uses only `task` among them (see [External runs](#external-runs)). The attributes column lists
+what harness2 writes on the start event of a span and on a point event; every span's end event
+also has `status` and `dur_s`, and `error` when it failed.
 
 | Kind | Value | Shape | Attributes |
 |---|---|---|---|
@@ -354,6 +359,58 @@ tracer.close()
 # sink.events is the TASK start event, the COST event and the TASK end event, in that order.
 ```
 
+## External runs
+
+A system is the program whose runs a trace describes. harness2 is one system, and a run from any
+other system is an external run. Its events do not come from a `Tracer` or a sink: a trace
+source reads the other system's records where they are and hands the events to the run graph of
+`harness2-evaluate` (see [Trace sources](EVALUATION.md#trace-sources)). The events have the same
+six fields and the same span shape as above, a start and an end event sharing a `span_id` and a
+point event without `phase`, and `parent_id` links them into a tree. On top of that, an external
+run keeps these rules:
+
+- **The system on the root.** Each run has one root `task` span (`parent_id: null`), and its
+  attrs name the system in `system`, a non-empty string such as `"orchestrator"`. The name
+  `harness2` is not allowed: only the traces harness2 writes may name it. The `system` may sit on
+  the start or the end event of the span.
+- **The namespace.** Every other kind is `<system>.<kind>`, with the run's system as the prefix
+  and a non-empty rest, for example `orchestrator.step` or `orchestrator.question.asked`. Two
+  systems can then use the same word for different things without mixing.
+- **No built-in kinds.** The kinds of `trace.Kind` other than `task` (`mode`, `rollout`, `stage`,
+  `cost`, `error` and the rest) and the `judge.` kinds belong to harness2 runs only. An external
+  run that needs a similar event names it in its own namespace, for example `orchestrator.error`.
+- **The origin.** Each event carries where it was read from, as an `Origin` with the trace
+  source's name, the file and the 1-based line of the original record. The run graph keeps the
+  origin of a node's first event as `Node.source`, so the evidence of a finding (`run_id`,
+  `span_id`) leads to the node and from there to the trace source, the file and the line.
+- **No `summary.json`.** An external run has no summary: it is not in the summaries that the
+  run graph returns, and `EvalRequest.summary(run_id)` returns `None` for it. A ledger, a cost
+  total and the other contents of `summary.json` are harness2's alone.
+
+An event that breaks a rule is skipped with one warning, which names the trace source, the file,
+the line, the kind and the span; the evaluation goes on. A `task` without `system` (or naming
+`harness2`) is skipped, and so is every other event of that run, because it has no root to
+belong to. The warnings go to `findings.json` under `warnings` and to standard error.
+
+A run of `orchestrator`, as the events a trace source returns (each with its origin):
+
+```json
+{"run_id": "r1", "span_id": "s1", "parent_id": null, "kind": "task", "ts": "2026-01-01T00:00:00+00:00", "attrs": {"phase": "start", "system": "orchestrator"}}
+{"run_id": "r1", "span_id": "s2", "parent_id": "s1", "kind": "orchestrator.question.asked", "ts": "2026-01-01T00:00:05+00:00", "attrs": {"step": "design"}}
+{"run_id": "r1", "span_id": "s1", "parent_id": null, "kind": "task", "ts": "2026-01-01T00:01:00+00:00", "attrs": {"phase": "end", "status": "ok", "dur_s": 60.0}}
+```
+
+A harness2 run is one whose `task` names no `system`, as every `trace.jsonl` harness2 writes,
+or names `harness2`. The rules above are not applied to `trace.jsonl` files read through
+`--runs` (or the built-in trace source `trace`), so a trace written before trace sources existed
+still reads as before. A `trace.jsonl` that another program wrote with a `task` naming its own
+system is still an external run to the evaluators: the bundled `rules` evaluator checks harness2
+runs only.
+
+The bodies rule of [Keeping bodies out](#keeping-bodies-out) is harness2's promise about its own
+traces. A trace source does not pass through the `Tracer`, so nothing hashes its long strings;
+the trace source decides what of the original record it puts in `attrs`.
+
 ## Troubleshooting
 
 - **No `trace.jsonl`.** Check `HARNESS2_TRACE`: only `0` turns tracing off. If it is on, read
@@ -379,6 +436,10 @@ tracer.close()
 - `harness2/core/trace.py`: `TraceEvent`, `Kind`, `Tracer`, the sink registry and `digest`.
 - `harness2/core/trace_file.py`: the `file` sink and `read`.
 - `harness2/testing/trace_contract.py`: the contract checks and `RecordingSink`.
+- `harness2/core/trace_source.py`: the trace sources, `Origin` and the external run check.
+- [Evaluation](EVALUATION.md#trace-sources): how a trace source is chosen, written and tested,
+  and how its runs are evaluated.
 - [Model connectors](MODEL_CONNECTORS.md): the same name lookup and factory pattern, for the
   models of the executor and the improver.
 - `docs/specs/trace-port.md`: the design note this port follows.
+- `docs/specs/trace-sources.md`: the design note of trace sources and external runs.

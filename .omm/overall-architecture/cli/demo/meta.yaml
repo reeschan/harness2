@@ -1,0 +1,9 @@
+created: 2026-11-20T05:39:09.005Z
+updated: 2026-11-20T05:39:09.005Z
+update_count: 1
+last_field: description
+kind: nested-class
+title: demo
+children: []
+parentPath:
+  - cli

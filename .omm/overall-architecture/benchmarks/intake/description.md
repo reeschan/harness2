@@ -1,0 +1,1 @@
+`harness2/benchmarks/intake.py`: `IntakeAdapter`, tasks from a task connector seen as one benchmark: ingest, normalize, store specs, delegate rollouts to a `Launcher`, and score through the connector's judge (`run_intake`).

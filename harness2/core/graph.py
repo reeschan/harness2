@@ -14,12 +14,20 @@
 
 """The graph of one or more task runs: what happened and what contained what.
 
-`build(paths)` reads `trace.jsonl` files with `harness2.core.trace_file.read` and turns
-them into a `Graph`. A span is two events sharing a `span_id` (a start and an end) and
-becomes one `Node`; a point event is a node of its own. The node's `attrs` combine the
-start and end attrs, with the end winning, and drop `phase`; `status` and `dur_s` come
-from the end event, so a point event has neither. `parent_id` becomes an `Edge` from the
-parent node to the child, with `kind="contains"`.
+`build(paths, sources=...)` reads `trace.jsonl` files with `harness2.core.trace_file.read`,
+adds the events the trace sources read (`harness2.core.trace_source`), and turns them into a
+`Graph`. A span is two events sharing a `span_id` (a start and an end) and becomes one `Node`;
+a point event is a node of its own. The node's `attrs` combine the start and end attrs, with
+the end winning, and drop `phase`; `status` and `dur_s` come from the end event, so a point
+event has neither. `parent_id` becomes an `Edge` from the parent node to the child, with
+`kind="contains"`.
+
+A node's `source` says where it came from: the `trace.jsonl` path for a node of a trace, and
+the `trace_source.Origin` (the trace source's name, the file and the line of its first event)
+for a node of an external run. The events of a trace source pass `trace_source.check` first,
+so an event that breaks the external run rules is skipped with a warning. The trace files
+together are one input and each trace source result is another; when a `(run_id, span_id)`
+comes from two inputs, the later input's events of that span are dropped with a warning.
 
 Nothing here knows the kinds of harness2's work beyond the `task` root: `roots()` and
 `runs()` find `trace.Kind.TASK`, and every other query takes the kinds the caller asks
@@ -30,18 +38,20 @@ A node whose `parent_id` names a span that is not in the graph (a missing event,
 judge parent left out) stays a root and its key goes into `warnings`; reading never
 fails. `subgraph(kinds=..., run_ids=...)` cuts the graph down and relinks every kept
 node to its nearest kept ancestor, so the result is still a forest of `contains` edges.
-`load_runs(root)` builds the graph of every `trace.jsonl` under `root` and reads the
-`summary.json` of each task run directory next to it.
+`load_runs(root, sources=...)` builds the graph of every `trace.jsonl` under `root` (one
+directory or several) and the trace source results, and reads the `summary.json` of each task
+run directory next to a trace. An external run has no summary.
 """
 
 from __future__ import annotations
 
 import json
+import os
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, Iterable
 
-from . import trace, trace_file
+from . import trace, trace_file, trace_source
 
 CONTAINS = "contains"
 TRACE_NAME = trace_file.FILE_NAME
@@ -50,7 +60,11 @@ SUMMARY_NAME = "summary.json"
 
 @dataclass
 class Node:
-    """One span or point event: its identity, what it is, when it ran and its attrs."""
+    """One span or point event: its identity, what it is, when it ran and its attrs.
+
+    `source` is the `trace.jsonl` path of a trace's node and the `trace_source.Origin` of an
+    external run's node.
+    """
 
     key: tuple[str, str]
     kind: str
@@ -62,7 +76,7 @@ class Node:
     end_ts: str | None
     status: str | None
     dur_s: float | None
-    source: Path
+    source: Path | trace_source.Origin
 
 
 @dataclass(frozen=True)
@@ -201,8 +215,13 @@ class Graph:
         return None
 
 
-def build(paths: Iterable[Path], *, include_judge: bool = False) -> Graph:
-    """The graph of the events in these `trace.jsonl` files.
+def build(
+    paths: Iterable[Path] = (),
+    *,
+    sources: Iterable[trace_source.SourceRead | tuple[Iterable[Any], Iterable[str]]] = (),
+    include_judge: bool = False,
+) -> Graph:
+    """The graph of the events in these `trace.jsonl` files and these trace source results.
 
     A span's start and end events become one node: the attrs are merged with the end event
     winning, `phase` is dropped, and `status` and `dur_s` are taken from the end. A point
@@ -210,8 +229,14 @@ def build(paths: Iterable[Path], *, include_judge: bool = False) -> Graph:
     that name a node that is not in the graph leave the child a root and add a warning.
     A trace that cannot be read is skipped with a warning. Kinds starting with
     `trace.JUDGE_PREFIX` are read only when `include_judge` is true.
+
+    Each item of `sources` is what one trace source read (`trace_source.read_from`): its
+    warnings are added, its events pass `trace_source.check`, and each node keeps the
+    `Origin` of its first event as `source`. The trace files are one input and each item of
+    `sources` another; a span already read from an earlier input is dropped with a warning.
     """
     graph = Graph()
+    owners: dict[tuple[str, str], int] = {}
     for raw in paths:
         path = Path(raw)
         try:
@@ -222,43 +247,76 @@ def build(paths: Iterable[Path], *, include_judge: bool = False) -> Graph:
         for event in events:
             if not include_judge and event.kind.startswith(trace.JUDGE_PREFIX):
                 continue
+            _add(graph, owners, event, path, 0)
+    for index, result in enumerate(sources, start=1):
+        events, warnings = result
+        graph.warnings.extend(str(warning) for warning in warnings)
+        kept, problems = trace_source.check(events)
+        graph.warnings.extend(problems)
+        dropped: set[tuple[str, str]] = set()
+        for item in kept:
+            event = item.event
+            if not include_judge and event.kind.startswith(trace.JUDGE_PREFIX):
+                continue
             key = (event.run_id, event.span_id)
-            node = graph.nodes.get(key)
-            if node is None:
-                node = Node(
-                    key=key,
-                    kind=event.kind,
-                    run_id=event.run_id,
-                    span_id=event.span_id,
-                    parent=_parent_key(event),
-                    attrs={},
-                    start_ts=None,
-                    end_ts=None,
-                    status=None,
-                    dur_s=None,
-                    source=path,
-                )
-                graph.nodes[key] = node
-            elif node.parent is None:
-                node.parent = _parent_key(event)
-            phase = event.attrs.get("phase")
-            ended = node.end_ts is not None
-            if phase == "end":
-                node.end_ts = event.ts
-                node.status = event.attrs.get("status")
-                node.dur_s = event.attrs.get("dur_s")
-            elif node.start_ts is None:
-                node.start_ts = event.ts
-            for name, value in event.attrs.items():
-                if name == "phase":
-                    continue
-                if phase != "end" and ended:
-                    node.attrs.setdefault(name, value)
-                else:
-                    node.attrs[name] = value
+            owner = owners.get(key)
+            if owner is not None and owner != index:
+                if key not in dropped:
+                    dropped.add(key)
+                    graph.warnings.append(
+                        f"duplicate span {key[0]}/{key[1]} at {item.origin}: already read from "
+                        f"{graph.nodes[key].source}; dropped"
+                    )
+                continue
+            _add(graph, owners, event, item.origin, index)
     graph.edges = _edges(graph)
     graph._reindex()
     return graph
+
+
+def _add(
+    graph: Graph,
+    owners: dict[tuple[str, str], int],
+    event: trace.TraceEvent,
+    source: Path | trace_source.Origin,
+    owner: int,
+) -> None:
+    """Merge one event into its node, creating the node (owned by input `owner`) if needed."""
+    key = (event.run_id, event.span_id)
+    node = graph.nodes.get(key)
+    if node is None:
+        node = Node(
+            key=key,
+            kind=event.kind,
+            run_id=event.run_id,
+            span_id=event.span_id,
+            parent=_parent_key(event),
+            attrs={},
+            start_ts=None,
+            end_ts=None,
+            status=None,
+            dur_s=None,
+            source=source,
+        )
+        graph.nodes[key] = node
+        owners[key] = owner
+    elif node.parent is None:
+        node.parent = _parent_key(event)
+    phase = event.attrs.get("phase")
+    ended = node.end_ts is not None
+    if phase == "end":
+        node.end_ts = event.ts
+        node.status = event.attrs.get("status")
+        node.dur_s = event.attrs.get("dur_s")
+    elif node.start_ts is None:
+        node.start_ts = event.ts
+    for name, value in event.attrs.items():
+        if name == "phase":
+            continue
+        if phase != "end" and ended:
+            node.attrs.setdefault(name, value)
+        else:
+            node.attrs[name] = value
 
 
 def _parent_key(event: trace.TraceEvent) -> tuple[str, str] | None:
@@ -286,16 +344,21 @@ def _edges(graph: Graph) -> list[Edge]:
     return edges
 
 
-def load_runs(root: Path, *, include_judge: bool = False) -> tuple[Graph, dict[Path, dict]]:
-    """The graph of every `trace.jsonl` under `root` and the summaries next to them.
+def load_runs(
+    root: Path | str | Iterable[Path | str] | None = None,
+    *,
+    sources: Iterable[trace_source.SourceRead | tuple[Iterable[Any], Iterable[str]]] = (),
+    include_judge: bool = False,
+) -> tuple[Graph, dict[Path, dict]]:
+    """The graph of every `trace.jsonl` under `root` and the sources, and the summaries.
 
-    The summaries are keyed by the task run directory; a directory without a
-    `summary.json` is left out. A summary that cannot be read or is not a JSON object
-    is left out and adds a graph warning.
+    `root` is one directory, several, or None for none; `sources` are trace source results
+    as in `build`. The summaries are keyed by the task run directory of a trace; a directory
+    without a `summary.json` is left out, and so is every external run. A summary that cannot
+    be read or is not a JSON object is left out and adds a graph warning.
     """
-    base = Path(root)
-    paths = sorted(path for path in base.rglob(TRACE_NAME) if path.is_file())
-    graph = build(paths, include_judge=include_judge)
+    paths = trace_source.trace_paths(*_roots(root))
+    graph = build(paths, sources=sources, include_judge=include_judge)
     summaries: dict[Path, dict] = {}
     for path in paths:
         summary_path = path.parent / SUMMARY_NAME
@@ -311,3 +374,12 @@ def load_runs(root: Path, *, include_judge: bool = False) -> tuple[Graph, dict[P
             continue
         summaries[path.parent] = summary
     return graph, summaries
+
+
+def _roots(root: Path | str | Iterable[Path | str] | None) -> list[Path]:
+    """`root` as a list of directories: one path, several, or none for None."""
+    if root is None:
+        return []
+    if isinstance(root, (str, os.PathLike)):
+        return [Path(root)]
+    return [Path(item) for item in root]

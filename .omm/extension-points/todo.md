@@ -1,0 +1,1 @@
+- Add a rebutter contract check if third-party rebutters become common.

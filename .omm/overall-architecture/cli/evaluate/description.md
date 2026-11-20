@@ -1,0 +1,1 @@
+`harness2/cli/evaluate.py` (`harness2-evaluate`): reads every `trace.jsonl` under `--runs` and the records each `--source <name>=<location>` names through that trace source into one run graph, runs the evaluation graph and writes the findings, warnings and counts as files.
